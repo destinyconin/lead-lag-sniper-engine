@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# SQLite Databases & Local Secrets
+*.db
+*.db-shm
+*.db-wal
+.env
+
+# Node / Frontend
+frontend/node_modules/
+node_modules/
+*.log
+
+# Recorded Tick Parquet Files
+data/*.parquet
+
