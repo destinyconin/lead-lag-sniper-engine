@@ -202,7 +202,7 @@ class BidirectionalSniperEngine:
                     t_mono = now_m - i * 45.0
                     m_state.on_follower_tick(f_bbo[0], f_bbo[1], f_bbo[2], f_bbo[3], now_mono=t_mono)
                     m_state.on_leader_tick(l_bbo[0], l_bbo[1], l_bbo[2], l_bbo[3], cfg, is_locked=False, now_mono=t_mono)
-                return
+            return
 
         base_px = get_default_base_price(sym)
         now_m = mono_ms()
@@ -946,6 +946,9 @@ class BidirectionalSniperEngine:
                 else 0.0
             )
 
+            if f_tick and 0 < f_tick.mid < 0.0005 and cfg.price_precision < 8:
+                cfg.price_precision = 8
+
             symbols_telemetry[sym] = {
                 "symbol": sym,
                 "state": self.symbol_states.get(sym, SniperState.IDLE).value,
@@ -964,6 +967,8 @@ class BidirectionalSniperEngine:
                 "live_spread_bps": round(live_spread_bps, 2),
                 "estimated_beta": round(m.estimated_beta, 3),
                 "volatility_sigma_bps": round((m.jump_var_ema ** 0.5) * 10000.0, 2),
+                "instant_jump_pct": round(m.last_instant_jump * 100.0, 3),
+                "max_jump_seen_pct": round(m.max_jump_seen * 100.0, 3),
             }
             radar_data[sym] = list(m.radar_series)[-90:]
 

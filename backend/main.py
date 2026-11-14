@@ -274,10 +274,12 @@ async def get_risk():
 async def update_risk(cfg: GlobalRiskConfig):
     prev_kill = engine.risk_config.kill_switch_active
     prev_mode = engine.risk_config.trading_mode
+    target_mode = cfg.trading_mode
     engine.risk_config = cfg
 
-    if cfg.trading_mode != prev_mode:
-        await engine.switch_trading_mode(cfg.trading_mode)
+    if target_mode != prev_mode:
+        engine.risk_config.trading_mode = prev_mode
+        await engine.switch_trading_mode(target_mode)
     else:
         if cfg.trading_mode == "LIVE":
             engine.gateway.feed_mode = "REAL_WS"

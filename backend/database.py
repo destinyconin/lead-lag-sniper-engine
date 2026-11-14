@@ -283,7 +283,7 @@ class AsyncDatabaseManager:
                 has_sec = bool(dec_secret)
                 has_pass = bool(dec_pass)
                 has_any = has_key or has_sec or has_pass
-                has_all = has_key and has_sec and (has_pass if needs_passphrase else True)
+                has_all = has_key and has_sec
 
                 d["api_key"] = raw_key
                 d["api_key_masked"] = vault.mask(raw_key)
@@ -308,8 +308,6 @@ class AsyncDatabaseManager:
                         missing.append("API Key")
                     if not has_sec:
                         missing.append("API Secret")
-                    if needs_passphrase and not has_pass:
-                        missing.append("API 口令 (Passphrase)")
                     d["auth_status"] = "CONFIG_INCOMPLETE"
                     d["auth_message"] = f"配置不完整：缺少 {', '.join(missing)}，请补充完整后点击「验证并保存」"
                 else:

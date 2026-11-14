@@ -111,6 +111,8 @@ class SymbolMathState:
         self.estimated_beta: float = 0.88
         self.leader_info_share: float = 0.78  # > 0.5 means Leader leads Follower
         self._pending_leader_jump: Optional[Tuple[float, float, float]] = None  # (mono_ts, l_jump, f_mid_at_signal)
+        self.last_instant_jump: float = 0.0
+        self.max_jump_seen: float = 0.0
 
         # Chart history for dual-exchange millisecond alignment radar (last 180 points)
         self.radar_series: deque[dict] = deque(maxlen=180)
@@ -129,6 +131,12 @@ class SymbolMathState:
         self.last_basis_update_mono = 0.0
         self.basis_frozen = False
         self._pending_leader_jump = None
+        self.jump_var_ema = (0.0012) ** 2
+        self.cov_lf_ema = 0.0000088
+        self.var_l_ema = 0.0000100
+        self.estimated_beta = 0.88
+        self.last_instant_jump = 0.0
+        self.max_jump_seen = 0.0
         self.radar_series.clear()
         self._last_radar_sample_ms = 0.0
 
@@ -166,13 +174,14 @@ class SymbolMathState:
         if self._pending_leader_jump is not None:
             sig_ts, l_ret, f_mid_0 = self._pending_leader_jump
             if now_mono - sig_ts >= 350.0:  # Measure Follower convergence 350ms after Leader jump
-                if f_mid_0 > 0 and abs(l_ret) > 1e-5:
+                if f_mid_0 > 0 and abs(l_ret) > 1e-4:
                     f_ret = (mid - f_mid_0) / f_mid_0
-                    self.cov_lf_ema = 0.96 * self.cov_lf_ema + 0.04 * (l_ret * f_ret)
-                    self.var_l_ema = 0.96 * self.var_l_ema + 0.04 * (l_ret * l_ret)
-                    if self.var_l_ema > 1e-10:
-                        raw_beta = self.cov_lf_ema / self.var_l_ema
-                        self.estimated_beta = max(0.45, min(1.15, raw_beta))
+                    if l_ret * f_ret > 0:
+                        self.cov_lf_ema = 0.96 * self.cov_lf_ema + 0.04 * (l_ret * f_ret)
+                        self.var_l_ema = 0.96 * self.var_l_ema + 0.04 * (l_ret * l_ret)
+                        if self.var_l_ema > 1e-10:
+                            raw_beta = self.cov_lf_ema / self.var_l_ema
+                            self.estimated_beta = max(0.80, min(1.05, raw_beta))
                 self._pending_leader_jump = None
 
         return sample
@@ -212,10 +221,22 @@ class SymbolMathState:
         past_leader = self.get_tick_at_or_before(self.leader_ts, self.leader_ticks, now_mono - cfg.window_ms)
         instant_jump = 0.0
         if past_leader and past_leader.mid > 0:
-            instant_jump = (mid - past_leader.mid) / past_leader.mid
-            # Update rolling jump variance (clamped so extreme outliers don't blow up sigma)
-            clamped_jump = max(-0.015, min(0.015, instant_jump))
-            self.jump_var_ema = 0.995 * self.jump_var_ema + 0.005 * (clamped_jump ** 2)
+            raw_jump = (mid - past_leader.mid) / past_leader.mid
+            if abs(raw_jump) > 0.12:
+                # Guard against synthetic->real price scale transition (>12% in <500ms)
+                self.leader_ts = [now_mono]
+                self.leader_ticks = [sample]
+                self.log_basis_ema = None
+                self.last_instant_jump = 0.0
+                self.max_jump_seen = 0.0
+            else:
+                instant_jump = raw_jump
+                self.last_instant_jump = instant_jump
+                if abs(instant_jump) > self.max_jump_seen:
+                    self.max_jump_seen = abs(instant_jump)
+                # Update rolling jump variance (clamped so extreme outliers don't blow up sigma)
+                clamped_jump = max(-0.015, min(0.015, instant_jump))
+                self.jump_var_ema = 0.995 * self.jump_var_ema + 0.005 * (clamped_jump ** 2)
 
         # Update time-decayed proportional log-basis (Fixes #5, #6, #7)
         f_tick = self.latest_follower

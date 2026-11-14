@@ -965,9 +965,12 @@ export default function App() {
                 const t = snapshot.telemetry?.[s.symbol] || {};
                 const isSelected = s.symbol === selectedSymbol;
                 const stateKey = t.state || 'IDLE';
-                const prec = s.price_precision ?? 4;
+                const rawPrec = s.price_precision ?? 4;
+                const prec = t.follower_mid && t.follower_mid < 0.0005 ? Math.max(8, rawPrec) : rawPrec;
                 const pushGapMs = t.follower_age_ms ?? 15;
                 const isStale = pushGapMs > (s.max_book_staleness_ms || 600);
+                const maxJumpPct = t.max_jump_seen_pct ?? 0;
+                const targetJumpPct = (s.min_jump_pct ?? 0.006) * 100;
 
                 return (
                   <div
@@ -1014,8 +1017,10 @@ export default function App() {
                     </div>
 
                     <div className="mt-2.5 pt-2 border-t border-line flex items-center justify-between text-[11px] font-mono text-dim">
-                      <span title="过去30秒主从交易所滚动对数基差">常驻基差: {t.basis_bps ?? 0} 基点</span>
-                      <span title="从所相对主所脉冲的跟随收敛系数">收敛系数 β: {t.estimated_beta ?? s.beta_coeff}</span>
+                      <span title="过去30秒主从交易所滚动对数基差">基差: {t.basis_bps ?? 0}bp</span>
+                      <span title="运行至今捕获到的最大150ms脉冲幅度 / 设定触发阈值">
+                        最高脉冲: {maxJumpPct.toFixed(2)}%/{targetJumpPct.toFixed(2)}%
+                      </span>
                       <span
                         title="距离上一次收到从所盘口推送的时间间隔（用于检测断流或卡顿，超过600ms自动拒单保护）"
                         className={
@@ -1024,7 +1029,7 @@ export default function App() {
                             : 'text-emerald-600 dark:text-emerald-400'
                         }
                       >
-                        行情延迟: {pushGapMs}ms ({isStale ? '超时' : '实时'})
+                        延迟: {pushGapMs}ms
                       </span>
                     </div>
                   </div>
@@ -1782,23 +1787,25 @@ export default function App() {
                           </div>
                           <div>
                             <div className="flex items-center justify-between mb-0.5">
-                              <label className="text-[11px] text-dim">API 口令 (Passphrase)</label>
+                              <label className="text-[11px] text-dim" title="欧易App创建API时您自己设置的密码（查看凭证页不会显示）">
+                                API 密码 (Passphrase)
+                              </label>
                               <span
                                 className={`text-[10px] font-mono ${
                                   ex.has_passphrase
                                     ? 'text-emerald-600 dark:text-emerald-400 font-semibold'
-                                    : needsPass && isError
-                                    ? 'text-rose-600 dark:text-rose-400 font-semibold'
+                                    : needsPass
+                                    ? 'text-amber-600 dark:text-amber-400 font-semibold'
                                     : 'text-dim'
                                 }`}
                               >
-                                {ex.has_passphrase ? '已加密保存' : needsPass ? '未填写(必填)' : '选填'}
+                                {ex.has_passphrase ? '已加密保存' : needsPass ? '未填写(欧易必填)' : '选填'}
                               </span>
                             </div>
                             <input
                               type="password"
                               value={ex.passphrase || ''}
-                              placeholder={ex.has_passphrase ? '已加密保存 (留空保持不变)' : 'OKX/Bitget API口令'}
+                              placeholder={ex.has_passphrase ? '已加密保存 (留空保持不变)' : '创建API时您自己设的密码(欧易必填)'}
                               onChange={(e) => {
                                 const next = [...exchanges];
                                 next[idx] = { ...ex, passphrase: e.target.value };

@@ -104,10 +104,23 @@ def get_default_base_price(symbol: str) -> float:
     return round(0.5 + (h % 5000) / 100.0, 4)
 
 
+BINANCE_1000X_BASES = {"PEPE", "SHIB", "BONK", "FLOKI", "SATS", "RATS", "LUNC", "XEC", "CAT", "CHEEMS"}
+
+
 def to_binance_stream_sym(unified_sym: str) -> str:
-    """Converts 'XRP/USDT:USDT' -> 'xrpusdt'."""
+    """Converts 'XRP/USDT:USDT' -> 'xrpusdt', and 'PEPE/USDT:USDT' -> '1000pepeusdt'."""
     base_quote = unified_sym.split(":")[0]
-    return base_quote.replace("/", "").lower()
+    base = base_quote.split("/")[0].upper()
+    raw = base_quote.replace("/", "").lower()
+    if base in BINANCE_1000X_BASES and not raw.startswith("1000"):
+        return f"1000{raw}"
+    return raw
+
+
+def get_binance_price_divisor(unified_sym: str) -> float:
+    """Returns 1000.0 for symbols quoted as 1000X on Binance USDM vs 1X on OKX."""
+    base = unified_sym.split("/")[0].upper()
+    return 1000.0 if base in BINANCE_1000X_BASES else 1.0
 
 
 def to_okx_inst_id(unified_sym: str) -> str:
@@ -249,10 +262,11 @@ class MarketDataGateway:
                         raw_s = r.get("symbol")
                         u_sym = bn_map.get(raw_s)
                         if u_sym and r.get("bidPrice") and r.get("askPrice"):
-                            bid = float(r["bidPrice"])
-                            ask = float(r["askPrice"])
-                            bid_q = float(r.get("bidQty") or 100.0)
-                            ask_q = float(r.get("askQty") or 100.0)
+                            div = get_binance_price_divisor(u_sym)
+                            bid = float(r["bidPrice"]) / div
+                            ask = float(r["askPrice"]) / div
+                            bid_q = float(r.get("bidQty") or 100.0) * div
+                            ask_q = float(r.get("askQty") or 100.0) * div
                             if bid > 0 and ask > 0:
                                 self.real_leader_bbo[u_sym] = (bid, ask, bid_q, ask_q)
                                 if self.feed_mode == "REAL_WS" or emit_immediately:
@@ -354,18 +368,20 @@ class MarketDataGateway:
                             continue
 
                         if event_type == "bookTicker":
-                            bid = float(data["b"])
-                            ask = float(data["a"])
-                            bid_q = float(data["B"])
-                            ask_q = float(data["A"])
+                            div = get_binance_price_divisor(unified_sym)
+                            bid = float(data["b"]) / div
+                            ask = float(data["a"]) / div
+                            bid_q = float(data["B"]) * div
+                            ask_q = float(data["A"]) * div
                             self.real_leader_bbo[unified_sym] = (bid, ask, bid_q, ask_q)
                             if self.feed_mode != "SIMULATOR":
                                 self._msg_counts["binanceusdm"] += 1
                                 self._on_leader_bbo(unified_sym, bid, ask, bid_q, ask_q)
                         elif event_type == "aggTrade":
                             if self.feed_mode != "SIMULATOR":
-                                px = float(data["p"])
-                                qty = float(data["q"])
+                                div = get_binance_price_divisor(unified_sym)
+                                px = float(data["p"]) / div
+                                qty = float(data["q"]) * div
                                 side = "sell" if data.get("m") else "buy"
                                 self._on_leader_trade(unified_sym, side, px, qty)
             except Exception as e:

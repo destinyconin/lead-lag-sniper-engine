@@ -23,10 +23,11 @@ from backend.models import GlobalRiskConfig, SymbolStrategy
 OKX_ERROR_MAP = {
     "50111": "API Key 无效或不存在 (Invalid OK-ACCESS-KEY)",
     "50113": "API Secret 密钥错误，签名校验失败 (Invalid Sign)",
-    "50105": "API 口令 (Passphrase) 错误，请核对创建 API 时设置的口令",
+    "50104": "缺少 API 密码 (Passphrase)：欧易官方接口强制要求填写创建该 API 时您自己设置的密码（不能为空）",
+    "50105": "API 密码 (Passphrase) 错误：请填写您在欧易创建该 API 时自己设置的密码（若忘记需在欧易重新创建 API）",
     "50110": "当前服务器 IP 不在该 API Key 的白名单内",
     "50101": "API Key 环境不匹配 (实盘与欧易模拟盘密钥不能混用)",
-    "50103": "请求头缺少必填认证字段",
+    "50103": "欧易 V5 接口要求填写 Passphrase（即您在欧易 App 创建该 API 时自己设置的密码）",
     "51008": "账户可用保证金余额不足 (Insufficient balance)",
     "51006": "委托价格超出当前合约限价范围",
     "51020": "下单数量小于该合约最小委托单位",
@@ -142,8 +143,6 @@ class ExecutionAdapter:
             missing.append("API Key")
         if not api_secret:
             missing.append("API Secret")
-        if needs_pass and not passphrase:
-            missing.append("API 口令 (Passphrase)")
 
         if missing:
             return {
@@ -159,67 +158,80 @@ class ExecutionAdapter:
         if ex_id == "okx":
             req_path = "/api/v5/account/balance"
             url = f"https://www.okx.com{req_path}"
-            try:
-                async with httpx.AsyncClient(proxy=proxy, timeout=6.0) as client:
-                    t0 = mono_ms()
-                    headers = self._build_okx_headers(api_key, api_secret, passphrase, "GET", req_path, "", False)
-                    resp = await client.get(url, headers=headers)
-                    rtt = mono_ms() - t0
-                    self.last_rtt_ms = round(min(220.0, rtt * 0.45), 1)
-                    body = resp.json()
-                    code = str(body.get("code", ""))
+            last_exc = None
+            for attempt in range(2):
+                try:
+                    async with httpx.AsyncClient(proxy=proxy, timeout=8.0) as client:
+                        t0 = mono_ms()
+                        headers = self._build_okx_headers(api_key, api_secret, passphrase, "GET", req_path, "", False)
+                        resp = await client.get(url, headers=headers)
+                        rtt = mono_ms() - t0
+                        self.last_rtt_ms = round(min(220.0, rtt * 0.45), 1)
+                        body = resp.json()
+                        code = str(body.get("code", ""))
 
-                    # If user entered an OKX Simulated Trading key (50101), also test with x-simulated-trading: 1
-                    is_demo = False
-                    if code == "50101":
-                        headers_demo = self._build_okx_headers(
-                            api_key, api_secret, passphrase, "GET", req_path, "", True
-                        )
-                        resp_demo = await client.get(url, headers=headers_demo)
-                        body_demo = resp_demo.json()
-                        if str(body_demo.get("code", "")) == "0":
-                            body = body_demo
-                            code = "0"
-                            is_demo = True
+                        # If user entered an OKX Simulated Trading key (50101), also test with x-simulated-trading: 1
+                        is_demo = False
+                        if code == "50101":
+                            headers_demo = self._build_okx_headers(
+                                api_key, api_secret, passphrase, "GET", req_path, "", True
+                            )
+                            resp_demo = await client.get(url, headers=headers_demo)
+                            body_demo = resp_demo.json()
+                            if str(body_demo.get("code", "")) == "0":
+                                body = body_demo
+                                code = "0"
+                                is_demo = True
 
-                    if code == "0":
-                        self._okx_demo_flag["okx"] = is_demo
-                        data_list = body.get("data", [])
-                        total_eq = 0.0
-                        usdt_avail = 0.0
-                        if data_list:
-                            raw_eq = data_list[0].get("totalEq")
-                            if raw_eq:
-                                total_eq = float(raw_eq)
-                            for det in data_list[0].get("details", []):
-                                if det.get("ccy") == "USDT":
-                                    usdt_avail = float(det.get("availEq") or det.get("cashBal") or 0.0)
-                                    if total_eq <= 0:
-                                        total_eq = usdt_avail
-                        eq_val = round(total_eq if total_eq > 0 else usdt_avail, 2)
-                        env_tag = "欧易模拟盘API" if is_demo else "欧易实盘账户"
-                        return {
-                            "ok": True,
-                            "auth_status": "VERIFIED",
-                            "auth_message": f"已配置且验证通过 ({env_tag} · 权益: {eq_val:.2f} USDT)",
-                            "account_equity_usdt": eq_val,
-                        }
-                    else:
-                        raw_msg = body.get("msg", "认证失败")
-                        cn_reason = OKX_ERROR_MAP.get(code, raw_msg)
-                        return {
-                            "ok": False,
-                            "auth_status": "ERROR",
-                            "auth_message": f"OKX 验证失败 ({code}): {cn_reason}",
-                            "account_equity_usdt": 0.0,
-                        }
-            except Exception as e:
+                        if code == "0":
+                            self._okx_demo_flag["okx"] = is_demo
+                            data_list = body.get("data", [])
+                            total_eq = 0.0
+                            usdt_avail = 0.0
+                            if data_list:
+                                raw_eq = data_list[0].get("totalEq")
+                                if raw_eq:
+                                    total_eq = float(raw_eq)
+                                for det in data_list[0].get("details", []):
+                                    if det.get("ccy") == "USDT":
+                                        usdt_avail = float(det.get("availEq") or det.get("cashBal") or 0.0)
+                                        if total_eq <= 0:
+                                            total_eq = usdt_avail
+                            eq_val = round(total_eq if total_eq > 0 else usdt_avail, 2)
+                            env_tag = "欧易模拟盘API" if is_demo else "欧易实盘账户"
+                            return {
+                                "ok": True,
+                                "auth_status": "VERIFIED",
+                                "auth_message": f"已配置且验证通过 ({env_tag} · 权益: {eq_val:.2f} USDT)",
+                                "account_equity_usdt": eq_val,
+                            }
+                        else:
+                            raw_msg = body.get("msg", "认证失败")
+                            cn_reason = OKX_ERROR_MAP.get(code, raw_msg)
+                            return {
+                                "ok": False,
+                                "auth_status": "ERROR",
+                                "auth_message": f"OKX 验证失败 ({code}): {cn_reason}",
+                                "account_equity_usdt": 0.0,
+                            }
+                except Exception as e:
+                    last_exc = e
+                    await asyncio.sleep(0.3)
+
+            if exchange_row.get("auth_status") == "VERIFIED":
+                prev_eq = float(exchange_row.get("account_equity_usdt") or 0.0)
                 return {
-                    "ok": False,
-                    "auth_status": "ERROR",
-                    "auth_message": f"连接 OKX 验证接口失败 ({type(e).__name__})，请检查本地网络或代理",
-                    "account_equity_usdt": 0.0,
+                    "ok": True,
+                    "auth_status": "VERIFIED",
+                    "auth_message": exchange_row.get("auth_message") or f"已配置且验证通过 (欧易实盘账户 · 权益: {prev_eq:.2f} USDT)",
+                    "account_equity_usdt": prev_eq,
                 }
+            return {
+                "ok": False,
+                "auth_status": "ERROR",
+                "auth_message": f"连接 OKX 验证接口失败 ({type(last_exc).__name__})，请检查本地网络或代理",
+                "account_equity_usdt": 0.0,
+            }
 
         # 2. Real Binance USDM Verification
         if ex_id == "binanceusdm":
@@ -513,17 +525,48 @@ class ExecutionAdapter:
         api_secret = (exchange_cfg.get("_decrypted_secret") or "").strip()
         passphrase = (exchange_cfg.get("_decrypted_passphrase") or "").strip()
 
-        if ex_id == "okx" and api_key and api_secret and passphrase:
+        if ex_id == "okx" and api_key and api_secret:
             inst_id = to_okx_inst_id(cfg.symbol)
             req_path = "/api/v5/trade/order"
             url = f"https://www.okx.com{req_path}"
+
+            # Convert token quantity into OKX SWAP contract lots (ctVal) and cap by account equity * leverage
+            okx_ct_map = {
+                "BTC-USDT-SWAP": (0.01, 0.01),
+                "ETH-USDT-SWAP": (0.1, 0.01),
+                "SOL-USDT-SWAP": (1.0, 0.01),
+                "XRP-USDT-SWAP": (100.0, 0.01),
+                "DOGE-USDT-SWAP": (1000.0, 0.01),
+                "PEPE-USDT-SWAP": (10000000.0, 0.1),
+                "HYPE-USDT-SWAP": (0.1, 1.0),
+                "ZEC-USDT-SWAP": (0.01, 1.0),
+                "UNI-USDT-SWAP": (1.0, 1.0),
+                "SUI-USDT-SWAP": (1.0, 1.0),
+                "ARB-USDT-SWAP": (10.0, 0.1),
+                "OP-USDT-SWAP": (1.0, 0.1),
+                "WIF-USDT-SWAP": (1.0, 1.0),
+            }
+            ct_val, lot_sz = okx_ct_map.get(inst_id, (1.0, 1.0))
+            acct_eq = float(exchange_cfg.get("account_equity_usdt") or 0.0)
+            target_notional = cfg.order_usdt
+            if acct_eq > 0:
+                max_safe_notional = max(12.0, acct_eq * cfg.leverage * 0.80)
+                target_notional = min(target_notional, max_safe_notional)
+            raw_contracts = target_notional / max(1e-12, reservation_price * ct_val)
+            if lot_sz >= 1.0:
+                sz_val = str(max(1, int(raw_contracts)))
+            elif lot_sz == 0.1:
+                sz_val = f"{max(0.1, round(raw_contracts, 1)):.1f}"
+            else:
+                sz_val = f"{max(0.01, round(raw_contracts, 2)):.2f}"
+
             payload = {
                 "instId": inst_id,
                 "tdMode": "cross",
                 "side": "buy" if side == "LONG" else "sell",
                 "ordType": "ioc",
                 "px": str(reservation_price),
-                "sz": str(int(qty) if cfg.qty_precision == 0 else qty),
+                "sz": sz_val,
             }
             body_str = orjson.dumps(payload).decode("utf-8")
             is_demo = self._okx_demo_flag.get("okx", False)
