@@ -89,3 +89,81 @@ class PulseInjectionRequest(BaseModel):
     jump_pct: float = Field(default=0.0085, description="Simulated Leader jump magnitude, e.g., 0.0085 = +0.85%")
     follower_scenario: Literal["CONVERGE_TP", "REVERSAL_SL", "HARD_SL", "TIMEOUT", "MM_WITHDRAW_MISS"] = "CONVERGE_TP"
 
+
+# ==================== User, Membership & Admin Models ====================
+
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=32)
+    password: str = Field(..., min_length=6, max_length=64)
+    email: str = Field(default="")
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str = Field(..., min_length=6, max_length=64)
+
+
+class PurchaseMembershipRequest(BaseModel):
+    plan_id: int
+    pay_method: Literal["INSTANT_PAY", "USDT_TRC20", "USDT_ERC20", "ALIPAY_WECHAT"] = "INSTANT_PAY"
+    tx_hash: str = ""
+    auto_confirm: bool = True
+
+
+class RedeemVipCodeRequest(BaseModel):
+    code: str
+
+
+class AdminCreateUserRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=32)
+    password: str = Field(..., min_length=6, max_length=64)
+    email: str = ""
+    role: Literal["user", "admin"] = "user"
+    vip_days: int = 0
+    vip_tier: str = "NONE"
+
+
+class AdminUpdateUserRequest(BaseModel):
+    user_id: int
+    email: Optional[str] = None
+    role: Optional[Literal["user", "admin"]] = None
+    is_active: Optional[bool] = None
+    new_password: Optional[str] = None
+
+
+class AdminGrantVipRequest(BaseModel):
+    user_id: int
+    add_days: int = Field(..., description="Days to add (positive to extend, 0 or negative to revoke)")
+    vip_tier: str = "专业版会员"
+    revoke: bool = False
+
+
+class AdminMembershipPlanModel(BaseModel):
+    id: Optional[int] = None
+    plan_code: str
+    name: str
+    duration_days: int = Field(..., gt=0)
+    price_usdt: float = Field(..., ge=0)
+    original_price_usdt: float = Field(..., ge=0)
+    badge_text: str = ""
+    features: list[str] = []
+    is_enabled: bool = True
+    sort_order: int = 1
+
+
+class AdminGenerateVipCodesRequest(BaseModel):
+    plan_name: str = "季度旗舰版会员"
+    duration_days: int = Field(default=90, gt=0)
+    count: int = Field(default=5, ge=1, le=50)
+
+
+class AdminAuditOrderRequest(BaseModel):
+    order_id: int
+    action: Literal["APPROVE", "REJECT"] = "APPROVE"
+
+

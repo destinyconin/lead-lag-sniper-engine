@@ -7,7 +7,9 @@ import {
   BarChart2,
   Check,
   Cpu,
+  CreditCard,
   Lock,
+  LogOut,
   Moon,
   Plus,
   Power,
@@ -19,10 +21,13 @@ import {
   Sun,
   Terminal,
   Trash2,
+  User,
+  Users,
   Wifi,
 } from 'lucide-react';
 import RadarChart from './components/RadarChart';
 import EquityChart from './components/EquityChart';
+import { AuthModal, MembershipCenterView, AdminSystemView } from './components/UserMembershipViews';
 
 const STATE_PIPELINE = [
   { key: 'IDLE', step: '01', label: '空闲监控', desc: '监听价差脉冲' },
@@ -170,10 +175,89 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const [logFilter, setLogFilter] = useState('ALL');
 
+  // User Auth & Membership State
+  const [authToken, setAuthToken] = useState(() => localStorage.getItem('sniper_auth_token') || '');
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [authModalMode, setAuthModalMode] = useState('login');
+
   const showToast = useCallback((msg, type = 'info') => {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 3400);
   }, []);
+
+  const authHeaders = useMemo(() => {
+    return authToken ? { Authorization: `Bearer ${authToken}` } : {};
+  }, [authToken]);
+
+  const openAuthModal = useCallback((mode = 'login') => {
+    setAuthModalMode(mode);
+    setAuthModalOpen(true);
+  }, []);
+
+  const refreshCurrentUser = useCallback(async (tokenOverride) => {
+    const tk = tokenOverride !== undefined ? tokenOverride : authToken;
+    if (!tk) {
+      setCurrentUser(null);
+      return null;
+    }
+    try {
+      const res = await fetch('/api/auth/me', {
+        headers: { Authorization: `Bearer ${tk}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.authenticated && data.user) {
+          setCurrentUser(data.user);
+          return data.user;
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+    setCurrentUser(null);
+    setAuthToken('');
+    localStorage.removeItem('sniper_auth_token');
+    return null;
+  }, [authToken]);
+
+  useEffect(() => {
+    refreshCurrentUser();
+  }, [refreshCurrentUser]);
+
+  const handleAuthSuccess = useCallback(
+    (token, user, message) => {
+      setAuthToken(token);
+      localStorage.setItem('sniper_auth_token', token);
+      setCurrentUser(user);
+      showToast(message || `欢迎登录，${user.username}`, 'success');
+    },
+    [showToast]
+  );
+
+  const handleLogout = useCallback(async () => {
+    setAuthToken('');
+    localStorage.removeItem('sniper_auth_token');
+    setCurrentUser(null);
+    if (activeTab === 'admin' || activeTab === 'exchanges') {
+      setActiveTab('radar');
+    }
+    // Unauthenticated guests cannot see LIVE mode; ensure engine switches back to SHADOW
+    if (snapshot.risk?.trading_mode === 'LIVE') {
+      const shadowRisk = { ...(riskForm || snapshot.risk), trading_mode: 'SHADOW' };
+      setRiskForm(shadowRisk);
+      const res = await fetch('/api/risk/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(shadowRisk),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.snapshot) setSnapshot(data.snapshot);
+      }
+    }
+    showToast('您已安全退出账号，实盘系统已隐藏（仅展示影子模拟盘）', 'info');
+  }, [activeTab, riskForm, snapshot.risk, showToast]);
 
   const fetchInitialData = useCallback(async () => {
     try {
@@ -260,37 +344,70 @@ export default function App() {
   };
 
   const handleModeToggle = async (newMode) => {
+    if (newMode === 'LIVE' && !currentUser) {
+      showToast('注册并登录账号后才能看到实盘系统', 'error');
+      openAuthModal('register');
+      return;
+    }
     const updated = { ...(riskForm || snapshot.risk), trading_mode: newMode };
     setRiskForm(updated);
     const res = await fetch('/api/risk/update', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders },
       body: JSON.stringify(updated),
     });
-    if (res.ok) {
-      const data = await res.json();
-      if (data.snapshot) {
-        setSnapshot(data.snapshot);
-      } else {
-        const statRes = await fetch('/api/stats').then((r) => r.json());
-        if (statRes.stats) setSnapshot(statRes);
-      }
-      const exRes = await fetch('/api/exchanges').then((r) => r.json());
-      if (exRes.exchanges) setExchanges(exRes.exchanges);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      showToast(err.detail || '切换通道失败', 'error');
+      return;
     }
-    showToast(
-      newMode === 'SHADOW'
-        ? '已切换至「影子模拟盘」：使用高频脉冲仿真流与延迟模拟撮合'
-        : '已切换至「实盘通道」：已载入 Binance 与 OKX 真实盘口价格及独立实盘账本',
-      'success'
-    );
+    const data = await res.json();
+    if (data.snapshot) {
+      setSnapshot(data.snapshot);
+    } else {
+      const statRes = await fetch('/api/stats').then((r) => r.json());
+      if (statRes.stats) setSnapshot(statRes);
+    }
+    const exRes = await fetch('/api/exchanges').then((r) => r.json());
+    if (exRes.exchanges) setExchanges(exRes.exchanges);
+
+    if (newMode === 'SHADOW') {
+      showToast('已切换至「影子模拟盘」：使用高频脉冲仿真流与延迟模拟撮合', 'success');
+    } else if (currentUser?.can_use_live) {
+      showToast('已切换至「实盘通道」：VIP 会员已生效，已载入真实盘口价格与实盘执行器', 'success');
+    } else {
+      showToast(
+        '已进入「实盘通道」预览真实行情：开通 VIP 会员后即可绑定 API 并启动实盘自动交易',
+        'info'
+      );
+    }
   };
 
   const handleStartTrading = async () => {
-    const res = await fetch('/api/trading/start', { method: 'POST' });
+    if (snapshot.risk?.trading_mode === 'LIVE') {
+      if (!currentUser) {
+        showToast('请先注册并登录账号', 'error');
+        openAuthModal('login');
+        return;
+      }
+      if (!currentUser.can_use_live) {
+        showToast('注册用户开通 VIP 会员后才可以使用实盘交易系统，请先开通会员', 'error');
+        setActiveTab('membership');
+        return;
+      }
+    }
+    const res = await fetch('/api/trading/start', {
+      method: 'POST',
+      headers: { ...authHeaders },
+    });
     if (res.ok) {
       const data = await res.json();
       if (data.snapshot) setSnapshot(data.snapshot);
+      if (data.require_vip) {
+        showToast(data.message, 'error');
+        setActiveTab('membership');
+        return;
+      }
       const exRes = await fetch('/api/exchanges').then((r) => r.json());
       if (exRes.exchanges) setExchanges(exRes.exchanges);
       showToast(data.message, data.ok ? 'success' : 'error');
@@ -298,7 +415,7 @@ export default function App() {
   };
 
   const handleStopTrading = async () => {
-    const res = await fetch('/api/trading/stop', { method: 'POST' });
+    const res = await fetch('/api/trading/stop', { method: 'POST', headers: { ...authHeaders } });
     if (res.ok) {
       const data = await res.json();
       if (data.snapshot) setSnapshot(data.snapshot);
@@ -394,9 +511,19 @@ export default function App() {
   };
 
   const handleSaveExchange = async (ex) => {
+    if (!currentUser) {
+      showToast('请先注册并登录账号', 'error');
+      openAuthModal('login');
+      return;
+    }
+    if (!currentUser.can_use_live) {
+      showToast('注册用户开通 VIP 会员后才可绑定与使用实盘 API，请先开通会员', 'error');
+      setActiveTab('membership');
+      return;
+    }
     const res = await fetch('/api/exchanges/update', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders },
       body: JSON.stringify(ex),
     });
     if (res.ok) {
@@ -414,13 +541,22 @@ export default function App() {
       } else {
         showToast(`已更新 ${ex.display_name} 接口与费率配置`, 'success');
       }
+    } else {
+      const err = await res.json().catch(() => ({}));
+      showToast(err.detail || '保存失败，请确认已开通 VIP 会员', 'error');
     }
   };
 
   const handleVerifyExchange = async (exchangeId, displayName) => {
+    if (!currentUser?.can_use_live) {
+      showToast('注册用户开通 VIP 会员后才可验证实盘 API 通道，请先开通会员', 'error');
+      setActiveTab('membership');
+      return;
+    }
     showToast(`正在连接 ${displayName} 验证 API 密钥与账户权限...`, 'info');
     const res = await fetch(`/api/exchanges/verify?exchange_id=${encodeURIComponent(exchangeId)}`, {
       method: 'POST',
+      headers: { ...authHeaders },
     });
     if (res.ok) {
       const data = await res.json();
@@ -433,8 +569,14 @@ export default function App() {
   };
 
   const handleClearExchangeCredentials = async (exchangeId, displayName) => {
+    if (!currentUser?.can_use_live) {
+      showToast('注册用户开通 VIP 会员后才可操作实盘 API 配置', 'error');
+      setActiveTab('membership');
+      return;
+    }
     const res = await fetch(`/api/exchanges/clear-credentials?exchange_id=${encodeURIComponent(exchangeId)}`, {
       method: 'POST',
+      headers: { ...authHeaders },
     });
     if (res.ok) {
       const data = await res.json();
@@ -472,7 +614,7 @@ export default function App() {
     if (!riskForm) return;
     const res = await fetch('/api/risk/update', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders },
       body: JSON.stringify(riskForm),
     });
     if (res.ok) {
@@ -654,8 +796,8 @@ export default function App() {
               </button>
             </div>
 
-            {/* Mode Switcher */}
-            <div className="flex items-center rounded-lg surface-subtle p-0.5">
+            {/* Mode Switcher (Registered users only can see LIVE mode) */}
+            <div className="flex items-center rounded-lg surface-subtle p-0.5 border border-line">
               <button
                 onClick={() => handleModeToggle('SHADOW')}
                 className={`px-2.5 py-1 rounded-md text-xs font-medium transition ${
@@ -664,15 +806,88 @@ export default function App() {
               >
                 影子模拟盘
               </button>
-              <button
-                onClick={() => handleModeToggle('LIVE')}
-                className={`px-2.5 py-1 rounded-md text-xs font-medium transition ${
-                  isLiveMode ? 'bg-emerald-600 text-white shadow-sm' : 'text-dim hover:text-main'
-                }`}
-              >
-                实盘通道
-              </button>
+              {currentUser ? (
+                <button
+                  onClick={() => handleModeToggle('LIVE')}
+                  className={`px-2.5 py-1 rounded-md text-xs font-medium transition flex items-center gap-1 ${
+                    isLiveMode ? 'bg-emerald-600 text-white shadow-sm' : 'text-dim hover:text-main'
+                  }`}
+                  title={
+                    currentUser.can_use_live
+                      ? '切换至实盘交易通道'
+                      : '已注册用户可查看实盘行情，开通VIP会员后可启动实盘自动交易'
+                  }
+                >
+                  <span>实盘通道</span>
+                  {!currentUser.can_use_live && (
+                    <span className="text-[10px] px-1 rounded bg-amber-500/20 text-amber-500 font-semibold">
+                      需VIP交易
+                    </span>
+                  )}
+                </button>
+              ) : (
+                <button
+                  onClick={() => openAuthModal('register')}
+                  className="px-2.5 py-1 rounded-md text-xs font-medium text-amber-600 dark:text-amber-400 hover:bg-amber-500/10 transition flex items-center gap-1"
+                  title="注册并登录账号后才可查看实盘系统"
+                >
+                  <Lock className="w-3 h-3" strokeWidth={1.75} />
+                  <span>注册/登录看实盘</span>
+                </button>
+              )}
             </div>
+
+            {/* User Account & VIP Status Pill */}
+            {currentUser ? (
+              <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg surface-subtle border border-line">
+                <button
+                  onClick={() => setActiveTab('membership')}
+                  className="flex items-center gap-1.5 text-left hover:opacity-85 transition"
+                  title="点击进入会员中心"
+                >
+                  <User className="w-3.5 h-3.5 text-sky-500" strokeWidth={1.75} />
+                  <span className="font-mono font-semibold text-main">{currentUser.username}</span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                      currentUser.is_vip
+                        ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30'
+                        : 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30'
+                    }`}
+                  >
+                    {currentUser.is_vip ? currentUser.vip_label : '未开通会员'}
+                  </span>
+                </button>
+                <button
+                  onClick={() => openAuthModal('login')}
+                  className="px-1.5 py-0.5 rounded text-[10px] surface-card border border-line text-dim hover:text-main transition"
+                  title="切换其他账号"
+                >
+                  切换
+                </button>
+                <button
+                  onClick={handleLogout}
+                  className="p-1 rounded text-dim hover:text-rose-500 transition"
+                  title="退出当前账号"
+                >
+                  <LogOut className="w-3.5 h-3.5" strokeWidth={1.75} />
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => openAuthModal('login')}
+                  className="px-2.5 py-1.5 rounded-lg surface-subtle border border-line hover:border-sky-500/50 text-main font-medium transition"
+                >
+                  账号登录
+                </button>
+                <button
+                  onClick={() => openAuthModal('register')}
+                  className="px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-semibold transition shadow-sm"
+                >
+                  免费注册
+                </button>
+              </div>
+            )}
 
             {/* Light / Dark Mode Switcher */}
             <button
@@ -710,30 +925,44 @@ export default function App() {
 
         {/* Navigation & Pulse Simulation Bar */}
         <div className="max-w-[1600px] mx-auto mt-2.5 pt-2 border-t border-line flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-1">
+          <div className="flex flex-wrap items-center gap-1">
             {[
-              { id: 'radar', label: '实时脉冲雷达与狙击台', icon: Radar },
-              { id: 'watchlist', label: `监控合约与参数矩阵 (${strategies.length})`, icon: Sliders },
-              { id: 'exchanges', label: '交易所连接与全局风控', icon: Shield },
-              { id: 'analytics', label: '盈亏统计与实盘可靠性诊断', icon: BarChart2 },
-            ].map((tab) => {
-              const Icon = tab.icon;
-              const active = activeTab === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-                    active
-                      ? 'bg-sky-500/12 text-sky-600 dark:text-sky-400 border border-sky-500/30 font-semibold'
-                      : 'text-dim hover:text-main'
-                  }`}
-                >
-                  <Icon className="w-3.5 h-3.5" strokeWidth={1.75} />
-                  {tab.label}
-                </button>
-              );
-            })}
+              { id: 'radar', label: '实时脉冲雷达与狙击台', icon: Radar, visible: true },
+              { id: 'watchlist', label: `监控合约与参数矩阵 (${strategies.length})`, icon: Sliders, visible: true },
+              { id: 'exchanges', label: '实盘交易所连接与全局风控', icon: Shield, visible: Boolean(currentUser) },
+              { id: 'analytics', label: '盈亏统计与实盘可靠性诊断', icon: BarChart2, visible: true },
+              {
+                id: 'membership',
+                label: currentUser?.is_vip ? '会员中心 (VIP已开通)' : '购买会员 / 开通实盘',
+                icon: CreditCard,
+                visible: true,
+              },
+              {
+                id: 'admin',
+                label: '后台管理中心 (用户与会员)',
+                icon: Users,
+                visible: true,
+              },
+            ]
+              .filter((t) => t.visible)
+              .map((tab) => {
+                const Icon = tab.icon;
+                const active = activeTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    onClick={() => setActiveTab(tab.id)}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+                      active
+                        ? 'bg-sky-500/12 text-sky-600 dark:text-sky-400 border border-sky-500/30 font-semibold'
+                        : 'text-dim hover:text-main'
+                    }`}
+                  >
+                    <Icon className="w-3.5 h-3.5" strokeWidth={1.75} />
+                    {tab.label}
+                  </button>
+                );
+              })}
           </div>
 
           {/* Clean Line-Icon Pulse Test Bar (Disabled in LIVE mode to protect real data integrity) */}
@@ -781,8 +1010,41 @@ export default function App() {
         </div>
       </header>
 
+      {/* Auth Login / Register Modal */}
+      <AuthModal
+        isOpen={authModalOpen}
+        onClose={() => setAuthModalOpen(false)}
+        initialMode={authModalMode}
+        onAuthSuccess={handleAuthSuccess}
+        showToast={showToast}
+      />
+
       {/* ==================== MAIN WORKSPACE ==================== */}
       <main className="flex-1 max-w-[1600px] w-full mx-auto p-4 space-y-4">
+        {/* VIP REQUIREMENT BANNER WHEN LOGGED IN AS NON-VIP IN LIVE MODE */}
+        {isLiveMode && currentUser && !currentUser.can_use_live && (
+          <div className="surface-card rounded-xl p-4 border-2 border-amber-500/50 bg-amber-500/5 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-amber-500/15 text-amber-600 dark:text-amber-400">
+                <Lock className="w-5 h-5" strokeWidth={1.75} />
+              </div>
+              <div>
+                <div className="text-xs font-bold text-main">
+                  当前账号【{currentUser.username}】为普通注册用户（尚未开通 VIP 会员）
+                </div>
+                <p className="text-xs text-sub mt-0.5">
+                  您已解锁实盘通道查看权限，可实时观察 Binance 与 OKX 真实盘口价差脉冲；开通 VIP 会员后即可保存实盘 API 密钥并启动实盘自动交易。
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => setActiveTab('membership')}
+              className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold transition shadow-sm"
+            >
+              立即开通 VIP 会员解锁实盘交易
+            </button>
+          </div>
+        )}
         {/* TRADING EXECUTION & LIVE CHANNEL STATUS BANNER */}
         <div
           className={`surface-card rounded-xl p-3.5 border-l-4 flex flex-wrap items-center justify-between gap-3 ${
@@ -2156,6 +2418,32 @@ export default function App() {
               </div>
             </div>
           </div>
+        )}
+
+        {/* ==================== TAB 5: MEMBERSHIP PURCHASE & MEMBER CENTER ==================== */}
+        {activeTab === 'membership' && (
+          <MembershipCenterView
+            currentUser={currentUser}
+            authToken={authToken}
+            onUserUpdated={(updatedUser) => setCurrentUser(updatedUser)}
+            onOpenAuthModal={openAuthModal}
+            onSwitchToLive={() => {
+              handleModeToggle('LIVE');
+              setActiveTab('radar');
+            }}
+            showToast={showToast}
+          />
+        )}
+
+        {/* ==================== TAB 6: ADMIN USER & MEMBERSHIP MANAGEMENT ==================== */}
+        {activeTab === 'admin' && (
+          <AdminSystemView
+            currentUser={currentUser}
+            authToken={authToken}
+            onCurrentUserRefresh={() => refreshCurrentUser()}
+            onOpenAuthModal={openAuthModal}
+            showToast={showToast}
+          />
         )}
       </main>
     </div>
