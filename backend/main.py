@@ -136,7 +136,14 @@ async def get_exchanges():
                 "display_name": r["display_name"],
                 "role": r["role"],
                 "api_key_masked": r["api_key_masked"],
+                "has_api_key": r.get("has_api_key", False),
+                "has_api_secret": r.get("has_api_secret", False),
+                "has_passphrase": r.get("has_passphrase", False),
                 "has_credentials": r["has_credentials"],
+                "auth_status": r.get("auth_status", "UNCONFIGURED"),
+                "auth_message": r.get("auth_message", "未配置 API 密钥"),
+                "account_equity_usdt": r.get("account_equity_usdt", 0.0),
+                "last_verified_at": r.get("last_verified_at", ""),
                 "vip_level": r["vip_level"],
                 "taker_fee": float(r["taker_fee"]),
                 "maker_fee": float(r["maker_fee"]),
@@ -159,13 +166,19 @@ async def update_exchange(cfg: ExchangeConfigModel):
     db_manager.save_exchange_sync(cfg)
     for ex in db_manager.load_exchanges_sync():
         engine.exchanges[ex["exchange_id"]] = ex
-    engine.append_log(
-        "INFO",
-        "EXCHANGE",
-        f"[交易所配置] 已更新 {cfg.display_name} ({cfg.exchange_id}) | 角色: {'主所' if cfg.role == 'leader' else '从所'} | "
-        f"吃单费率: {cfg.taker_fee*100:.3f}% / 挂单费率: {cfg.maker_fee*100:.3f}%",
-    )
-    return await get_exchanges()
+
+    ver_res = await engine.verify_and_update_exchange(cfg.exchange_id)
+    ex_resp = await get_exchanges()
+    ex_resp["verify_result"] = ver_res
+    return ex_resp
+
+
+@app.post("/api/exchanges/verify")
+async def verify_exchange_api(exchange_id: str = Query(...)):
+    ver_res = await engine.verify_and_update_exchange(exchange_id)
+    ex_resp = await get_exchanges()
+    ex_resp["verify_result"] = ver_res
+    return ex_resp
 
 
 @app.post("/api/exchanges/fetch-fees")
@@ -254,31 +267,40 @@ async def update_risk(cfg: GlobalRiskConfig):
     prev_mode = engine.risk_config.trading_mode
     engine.risk_config = cfg
 
-    # If user switches to LIVE mode, automatically prefer REAL_WS unless explicitly overridden
-    if cfg.trading_mode == "LIVE" and prev_mode != "LIVE":
-        engine.gateway.feed_mode = "REAL_WS" if cfg.feed_source == "REAL_WS" else cfg.feed_source
-        _, follower_ex = engine.get_leader_And_follower_cfg()
-        has_creds = bool(follower_ex.get("has_credentials"))
-        engine.append_log(
-            "INFO" if has_creds else "WARN",
-            "LIVE_MODE",
-            f"[切换实盘通道] 已切换至实盘统计视图 | 从所 ({follower_ex.get('display_name')}) API密钥状态: "
-            f"{'已就绪' if has_creds else '未配置 (请前往交易所连接页录入 API Key 后方可执行实盘下单)'}",
-            mode="LIVE",
-        )
+    if cfg.trading_mode != prev_mode:
+        await engine.switch_trading_mode(cfg.trading_mode)
     else:
-        engine.gateway.feed_mode = cfg.feed_source
+        if cfg.trading_mode == "LIVE":
+            engine.gateway.feed_mode = "REAL_WS"
+        else:
+            engine.gateway.feed_mode = "SIMULATOR" if cfg.feed_source != "REAL_WS" else "REAL_WS"
 
     if cfg.kill_switch_active != prev_kill:
         await engine.trigger_kill_switch(cfg.kill_switch_active)
 
-    engine.append_log(
-        "INFO",
-        "RISK",
-        f"[风控配置更新] 通道={cfg.trading_mode} | 行情源={cfg.feed_source} | "
-        f"单日最大亏损={cfg.max_daily_loss_usdt}U | 连续止损上限={cfg.max_consecutive_losses}笔",
-    )
-    return {"status": "ok", "risk": engine.risk_config.model_dump()}
+    return {
+        "status": "ok",
+        "risk": engine.risk_config.model_dump(),
+        "snapshot": engine.build_dashboard_snapshot(),
+    }
+
+
+@app.post("/api/trading/start")
+async def start_trading():
+    res = await engine.set_trading_active(True)
+    return {
+        **res,
+        "snapshot": engine.build_dashboard_snapshot(),
+    }
+
+
+@app.post("/api/trading/stop")
+async def stop_trading():
+    res = await engine.set_trading_active(False)
+    return {
+        **res,
+        "snapshot": engine.build_dashboard_snapshot(),
+    }
 
 
 @app.post("/api/risk/kill-switch")

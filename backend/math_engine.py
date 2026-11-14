@@ -116,6 +116,22 @@ class SymbolMathState:
         self.radar_series: deque[dict] = deque(maxlen=180)
         self._last_radar_sample_ms: float = 0.0
 
+    def reset_ticks(self):
+        """Clears all buffered ticks and chart series when switching between Simulator (SHADOW) and Real Exchange (LIVE)."""
+        self.leader_ts.clear()
+        self.leader_ticks.clear()
+        self.follower_ts.clear()
+        self.follower_ticks.clear()
+        self.leader_trades.clear()
+        self.latest_leader = None
+        self.latest_follower = None
+        self.log_basis_ema = None
+        self.last_basis_update_mono = 0.0
+        self.basis_frozen = False
+        self._pending_leader_jump = None
+        self.radar_series.clear()
+        self._last_radar_sample_ms = 0.0
+
     @staticmethod
     def compute_microprice(bid: float, ask: float, bid_qty: float, ask_qty: float) -> float:
         total_qty = bid_qty + ask_qty

@@ -268,15 +268,42 @@ export default function App() {
       body: JSON.stringify(updated),
     });
     if (res.ok) {
-      const statRes = await fetch('/api/stats').then((r) => r.json());
-      if (statRes.stats) setSnapshot(statRes);
+      const data = await res.json();
+      if (data.snapshot) {
+        setSnapshot(data.snapshot);
+      } else {
+        const statRes = await fetch('/api/stats').then((r) => r.json());
+        if (statRes.stats) setSnapshot(statRes);
+      }
+      const exRes = await fetch('/api/exchanges').then((r) => r.json());
+      if (exRes.exchanges) setExchanges(exRes.exchanges);
     }
     showToast(
       newMode === 'SHADOW'
-        ? '已切换至「影子模拟盘」：使用带延迟分布与逆向选择的模拟撮合数据'
-        : '已切换至「实盘通道」：已隔离模拟盘数据，仅统计与展示真实实盘交易记录',
+        ? '已切换至「影子模拟盘」：使用高频脉冲仿真流与延迟模拟撮合'
+        : '已切换至「实盘通道」：已载入 Binance 与 OKX 真实盘口价格及独立实盘账本',
       'success'
     );
+  };
+
+  const handleStartTrading = async () => {
+    const res = await fetch('/api/trading/start', { method: 'POST' });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.snapshot) setSnapshot(data.snapshot);
+      const exRes = await fetch('/api/exchanges').then((r) => r.json());
+      if (exRes.exchanges) setExchanges(exRes.exchanges);
+      showToast(data.message, data.ok ? 'success' : 'error');
+    }
+  };
+
+  const handleStopTrading = async () => {
+    const res = await fetch('/api/trading/stop', { method: 'POST' });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.snapshot) setSnapshot(data.snapshot);
+      showToast(data.message, 'info');
+    }
   };
 
   const handleInjectPulse = async (side, jump_pct, follower_scenario, labelText) => {
@@ -375,7 +402,33 @@ export default function App() {
     if (res.ok) {
       const data = await res.json();
       setExchanges(data.exchanges);
-      showToast(`已更新 ${ex.display_name} 接口与费率配置`, 'success');
+      const ver = data.verify_result;
+      if (ver) {
+        if (ver.ok) {
+          showToast(`${ex.display_name}: ${ver.auth_message}`, 'success');
+        } else if (ver.auth_status !== 'UNCONFIGURED') {
+          showToast(`${ex.display_name}: ${ver.auth_message}`, 'error');
+        } else {
+          showToast(`已更新 ${ex.display_name} 费率与角色配置`, 'info');
+        }
+      } else {
+        showToast(`已更新 ${ex.display_name} 接口与费率配置`, 'success');
+      }
+    }
+  };
+
+  const handleVerifyExchange = async (exchangeId, displayName) => {
+    showToast(`正在连接 ${displayName} 验证 API 密钥与账户权限...`, 'info');
+    const res = await fetch(`/api/exchanges/verify?exchange_id=${encodeURIComponent(exchangeId)}`, {
+      method: 'POST',
+    });
+    if (res.ok) {
+      const data = await res.json();
+      setExchanges(data.exchanges);
+      const ver = data.verify_result;
+      if (ver) {
+        showToast(`${displayName}: ${ver.auth_message}`, ver.ok ? 'success' : 'error');
+      }
     }
   };
 
@@ -423,8 +476,16 @@ export default function App() {
   const stats = snapshot.stats || {};
   const realityGap = snapshot.reality_gap || {};
   const liveStatus = snapshot.live_status || {};
+  const tradingControl = snapshot.trading_control || {
+    trading_active: !snapshot.risk?.kill_switch_active,
+    status_code: 'TRADING_ACTIVE',
+    status_label: '自动交易运行中',
+    status_detail: '正在毫秒级监听主从所价差脉冲',
+    scan_ticks_count: 0,
+  };
   const isKillActive = snapshot.risk?.kill_switch_active;
   const isLiveMode = snapshot.risk?.trading_mode === 'LIVE';
+  const isTradingActive = Boolean(tradingControl.trading_active);
 
   const filteredLogs = (snapshot.logs || []).filter((l) => {
     if (logFilter === 'ALL') return true;
@@ -515,6 +576,61 @@ export default function App() {
               <Wifi className="w-3.5 h-3.5 text-sky-500" strokeWidth={1.75} />
               <span className="text-dim">报单往返延迟:</span>
               <span className="font-semibold text-main">{snapshot.last_order_rtt_ms} ms</span>
+            </div>
+
+            {/* Real-Time Trading Execution Status Pill */}
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border font-medium ${
+                isTradingActive
+                  ? 'bg-emerald-500/12 border-emerald-500/35 text-emerald-600 dark:text-emerald-400'
+                  : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
+                  ? 'bg-rose-500/12 border-rose-500/35 text-rose-600 dark:text-rose-400'
+                  : 'bg-amber-500/12 border-amber-500/35 text-amber-600 dark:text-amber-400'
+              }`}
+              title={tradingControl.status_detail || ''}
+            >
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  isTradingActive
+                    ? 'bg-emerald-500 animate-ping'
+                    : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
+                    ? 'bg-rose-500'
+                    : 'bg-amber-500'
+                }`}
+              />
+              <span>{tradingControl.status_label || (isTradingActive ? '自动交易运行中' : '已停止待命')}</span>
+            </div>
+
+            {/* Start / Stop Trading Controls */}
+            <div className="flex items-center rounded-lg surface-subtle p-0.5 border border-line">
+              <button
+                onClick={handleStartTrading}
+                className={`px-2.5 py-1 rounded-md text-xs font-semibold transition flex items-center gap-1 ${
+                  isTradingActive
+                    ? 'bg-emerald-600 text-white shadow-sm'
+                    : 'text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/15'
+                }`}
+                title="验证执行端状态并启动毫秒级自动狙击交易"
+              >
+                <svg className="w-3 h-3" viewBox="0 0 24 24" fill="currentColor">
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+                <span>开始交易</span>
+              </button>
+              <button
+                onClick={handleStopTrading}
+                className={`px-2.5 py-1 rounded-md text-xs font-semibold transition flex items-center gap-1 ${
+                  !isTradingActive
+                    ? 'bg-slate-600 text-white shadow-sm'
+                    : 'text-rose-600 dark:text-rose-400 hover:bg-rose-500/15'
+                }`}
+                title="停止发送新订单，仅保留实时行情监控"
+              >
+                <svg className="w-3 h-3" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="5" y="5" width="14" height="14" rx="2" />
+                </svg>
+                <span>停止交易</span>
+              </button>
             </div>
 
             {/* Mode Switcher */}
@@ -646,38 +762,112 @@ export default function App() {
 
       {/* ==================== MAIN WORKSPACE ==================== */}
       <main className="flex-1 max-w-[1600px] w-full mx-auto p-4 space-y-4">
-        {/* LIVE MODE STATUS BANNER (Only shown when in LIVE mode) */}
-        {isLiveMode && (
-          <div className="surface-card rounded-xl p-3.5 border-l-4 border-l-emerald-500 flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
-                <Shield className="w-5 h-5" strokeWidth={1.75} />
-              </div>
-              <div>
-                <div className="text-xs font-semibold text-main flex items-center gap-2">
-                  <span>实盘交易通道独立核算视图</span>
-                  <span className="px-2 py-0.5 rounded text-[11px] bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
-                    模拟盘数据已完全隔离
-                  </span>
-                </div>
-                <p className="text-xs text-dim mt-0.5">
-                  主信号源: {liveStatus.leader_exchange_name} ({liveStatus.binance_ws_connected ? '原生WS已连接' : '本地网络受限/重连中'}) ·
-                  执行所: {liveStatus.follower_exchange_name} ({liveStatus.okx_ws_connected ? '原生WS已连接' : '本地网络受限/重连中'}) ·
-                  实盘 API 密钥: {liveStatus.follower_has_api_key ? '已配置就绪' : '未配置 (当前处于只读行情观察态，不会发出实盘订单)'}
-                </p>
-              </div>
+        {/* TRADING EXECUTION & LIVE CHANNEL STATUS BANNER */}
+        <div
+          className={`surface-card rounded-xl p-3.5 border-l-4 flex flex-wrap items-center justify-between gap-3 ${
+            isTradingActive
+              ? 'border-l-emerald-500'
+              : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
+              ? 'border-l-rose-500'
+              : 'border-l-amber-500'
+          }`}
+        >
+          <div className="flex items-center gap-3">
+            <div
+              className={`p-2 rounded-lg ${
+                isTradingActive
+                  ? 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400'
+                  : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
+                  ? 'bg-rose-500/12 text-rose-600 dark:text-rose-400'
+                  : 'bg-amber-500/12 text-amber-600 dark:text-amber-400'
+              }`}
+            >
+              <Shield className="w-5 h-5" strokeWidth={1.75} />
             </div>
+            <div>
+              <div className="text-xs font-semibold text-main flex flex-wrap items-center gap-2">
+                <span>
+                  {isLiveMode ? '实盘交易通道运行控制台' : '影子模拟盘交易控制台'} —{' '}
+                  {tradingControl.status_label || (isTradingActive ? '自动交易运行中' : '已停止待命')}
+                </span>
+                <span
+                  className={`px-2 py-0.5 rounded text-[11px] font-semibold border ${
+                    isTradingActive
+                      ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30'
+                      : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
+                      ? 'bg-rose-500/15 text-rose-600 dark:text-rose-400 border-rose-500/30'
+                      : 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/30'
+                  }`}
+                >
+                  {isTradingActive ? '正在自动监控脉冲并执行抢单' : '当前仅监听行情 · 不发送新订单'}
+                </span>
+                {isLiveMode && (
+                  <span className="px-2 py-0.5 rounded text-[11px] bg-sky-500/12 text-sky-600 dark:text-sky-400 border border-sky-500/25">
+                    真实 Binance & OKX 盘口价格已接入
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-dim mt-1">
+                {isLiveMode ? (
+                  <>
+                    主信号源: <strong className="text-main">{liveStatus.leader_exchange_name}</strong> (
+                    {liveStatus.binance_ws_connected ? '真实盘口已连接' : '重连中'}) · 执行所:{' '}
+                    <strong className="text-main">{liveStatus.follower_exchange_name}</strong> (
+                    {liveStatus.okx_ws_connected ? '真实盘口已连接' : '重连中'}) · API 认证状态:{' '}
+                    <strong
+                      className={
+                        liveStatus.follower_auth_status === 'VERIFIED'
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : liveStatus.follower_auth_status === 'UNCONFIGURED'
+                          ? 'text-amber-600 dark:text-amber-400'
+                          : 'text-rose-600 dark:text-rose-400'
+                      }
+                    >
+                      {liveStatus.follower_auth_message || '未配置 API 密钥'}
+                    </strong>
+                  </>
+                ) : (
+                  <span>
+                    {tradingControl.status_detail || '正在使用高频脉冲仿真流进行策略模拟撮合'}
+                  </span>
+                )}
+              </p>
+            </div>
+          </div>
 
-            {!liveStatus.follower_has_api_key && (
+          <div className="flex flex-wrap items-center gap-2">
+            {!isTradingActive ? (
+              <button
+                onClick={handleStartTrading}
+                className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition flex items-center gap-1.5 shadow-sm"
+              >
+                <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+                <span>{isLiveMode ? '开始实盘自动交易' : '开始自动交易'}</span>
+              </button>
+            ) : (
+              <button
+                onClick={handleStopTrading}
+                className="px-3.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold transition flex items-center gap-1.5 shadow-sm"
+              >
+                <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="5" y="5" width="14" height="14" rx="2" />
+                </svg>
+                <span>停止自动交易</span>
+              </button>
+            )}
+
+            {isLiveMode && (
               <button
                 onClick={() => setActiveTab('exchanges')}
-                className="px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold transition"
+                className="px-3 py-1.5 rounded-lg surface-subtle hover:opacity-85 text-main border border-line text-xs font-medium transition"
               >
-                前往配置执行所 API Key
+                {liveStatus.follower_auth_status === 'VERIFIED' ? '查看/修改 API 配置' : '前往配置/修复执行端 API'}
               </button>
             )}
           </div>
-        )}
+        </div>
 
         {/* Top 6 KPI Summary Cards (Mode-Isolated) */}
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
@@ -1384,16 +1574,40 @@ export default function App() {
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
                 {exchanges.map((ex, idx) => {
                   const health = snapshot.exchange_health?.[ex.exchange_id] || {};
+                  const authStatus = ex.auth_status || 'UNCONFIGURED';
+                  const isVerified = authStatus === 'VERIFIED';
+                  const isError = authStatus === 'ERROR' || authStatus === 'CONFIG_INCOMPLETE';
+                  const needsPass = ex.exchange_id === 'okx' || ex.exchange_id === 'bitget';
+
                   return (
                     <div
                       key={ex.exchange_id}
                       className={`rounded-xl p-4 border transition surface-subtle ${
-                        ex.is_active ? 'border-line' : 'opacity-70'
+                        isVerified
+                          ? 'border-emerald-500/40'
+                          : isError
+                          ? 'border-rose-500/45'
+                          : ex.is_active
+                          ? 'border-line'
+                          : 'opacity-70'
                       }`}
                     >
-                      <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center justify-between mb-2.5">
                         <div>
-                          <div className="font-bold text-sm text-main">{ex.display_name}</div>
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-sm text-main">{ex.display_name}</span>
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-semibold border ${
+                                isVerified
+                                  ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30'
+                                  : isError
+                                  ? 'bg-rose-500/15 text-rose-600 dark:text-rose-400 border-rose-500/30'
+                                  : 'surface-card text-dim border-line'
+                              }`}
+                            >
+                              {isVerified ? '已配置 · 验证通过' : isError ? '配置错误 / 未完整' : '未配置密钥'}
+                            </span>
+                          </div>
                           <div className="text-[11px] font-mono text-dim mt-0.5">
                             订阅流: {health.mode || ex.stream_mode || 'BBO-TBT'} · 网络延迟:{' '}
                             <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
@@ -1418,6 +1632,33 @@ export default function App() {
                           <option value="leader">主所 (信号源)</option>
                           <option value="follower">从所 (执行端)</option>
                         </select>
+                      </div>
+
+                      {/* Real-Time API Verification Status Alert Box */}
+                      <div
+                        className={`mb-3 px-2.5 py-2 rounded-lg border text-[11px] flex items-start gap-2 ${
+                          isVerified
+                            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-300'
+                            : isError
+                            ? 'bg-rose-500/10 border-rose-500/35 text-rose-700 dark:text-rose-300'
+                            : 'surface-card border-line text-dim'
+                        }`}
+                      >
+                        {isVerified ? (
+                          <Check className="w-3.5 h-3.5 shrink-0 mt-0.5 text-emerald-500" strokeWidth={2} />
+                        ) : isError ? (
+                          <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-rose-500" strokeWidth={2} />
+                        ) : (
+                          <Lock className="w-3.5 h-3.5 shrink-0 mt-0.5 text-dim" strokeWidth={1.75} />
+                        )}
+                        <div className="leading-snug">
+                          <div className="font-medium">{ex.auth_message || '未配置 API 密钥'}</div>
+                          {ex.last_verified_at && (
+                            <div className="text-[10px] opacity-80 font-mono mt-0.5">
+                              最近校验时间: {ex.last_verified_at}
+                            </div>
+                          )}
+                        </div>
                       </div>
 
                       <div className="space-y-2.5 text-xs">
@@ -1453,12 +1694,24 @@ export default function App() {
                         </div>
 
                         <div>
-                          <label className="text-[11px] text-dim block mb-0.5">
-                            API Key ({ex.api_key_masked || '未配置'})
-                          </label>
+                          <div className="flex items-center justify-between mb-0.5">
+                            <label className="text-[11px] text-dim">API Key</label>
+                            <span
+                              className={`text-[10px] font-mono ${
+                                ex.has_api_key
+                                  ? 'text-emerald-600 dark:text-emerald-400 font-semibold'
+                                  : isError
+                                  ? 'text-rose-600 dark:text-rose-400 font-semibold'
+                                  : 'text-dim'
+                              }`}
+                            >
+                              {ex.has_api_key ? `已保存 (${ex.api_key_masked})` : '未填写 (必填)'}
+                            </span>
+                          </div>
                           <input
                             type="text"
-                            placeholder="仅授予交易权限，严禁开启提币权限"
+                            value={ex.api_key || ''}
+                            placeholder={ex.has_api_key ? `已存: ${ex.api_key_masked} (输入新值可覆盖)` : '请粘贴完整的 API Key'}
                             onChange={(e) => {
                               const next = [...exchanges];
                               next[idx] = { ...ex, api_key: e.target.value };
@@ -1470,10 +1723,24 @@ export default function App() {
 
                         <div className="grid grid-cols-2 gap-2">
                           <div>
-                            <label className="text-[11px] text-dim block mb-0.5">API Secret</label>
+                            <div className="flex items-center justify-between mb-0.5">
+                              <label className="text-[11px] text-dim">API Secret</label>
+                              <span
+                                className={`text-[10px] font-mono ${
+                                  ex.has_api_secret
+                                    ? 'text-emerald-600 dark:text-emerald-400 font-semibold'
+                                    : isError
+                                    ? 'text-rose-600 dark:text-rose-400 font-semibold'
+                                    : 'text-dim'
+                                }`}
+                              >
+                                {ex.has_api_secret ? '已加密保存' : '未填写'}
+                              </span>
+                            </div>
                             <input
                               type="password"
-                              placeholder="••••••••"
+                              value={ex.api_secret || ''}
+                              placeholder={ex.has_api_secret ? '已加密保存 (留空保持不变)' : '请输入 Secret'}
                               onChange={(e) => {
                                 const next = [...exchanges];
                                 next[idx] = { ...ex, api_secret: e.target.value };
@@ -1483,10 +1750,24 @@ export default function App() {
                             />
                           </div>
                           <div>
-                            <label className="text-[11px] text-dim block mb-0.5">API 口令 (Passphrase)</label>
+                            <div className="flex items-center justify-between mb-0.5">
+                              <label className="text-[11px] text-dim">API 口令 (Passphrase)</label>
+                              <span
+                                className={`text-[10px] font-mono ${
+                                  ex.has_passphrase
+                                    ? 'text-emerald-600 dark:text-emerald-400 font-semibold'
+                                    : needsPass && isError
+                                    ? 'text-rose-600 dark:text-rose-400 font-semibold'
+                                    : 'text-dim'
+                                }`}
+                              >
+                                {ex.has_passphrase ? '已加密保存' : needsPass ? '未填写(必填)' : '选填'}
+                              </span>
+                            </div>
                             <input
                               type="password"
-                              placeholder="••••••••"
+                              value={ex.passphrase || ''}
+                              placeholder={ex.has_passphrase ? '已加密保存 (留空保持不变)' : 'OKX/Bitget API口令'}
                               onChange={(e) => {
                                 const next = [...exchanges];
                                 next[idx] = { ...ex, passphrase: e.target.value };
@@ -1497,7 +1778,7 @@ export default function App() {
                           </div>
                         </div>
 
-                        <div className="pt-2 flex items-center justify-between gap-2">
+                        <div className="pt-2 flex flex-wrap items-center justify-between gap-2">
                           <label className="flex items-center gap-1.5 cursor-pointer">
                             <input
                               type="checkbox"
@@ -1515,15 +1796,21 @@ export default function App() {
                           <div className="flex items-center gap-1.5">
                             <button
                               onClick={() => handleAutoFetchVipFee(ex, 'VIP 1')}
-                              className="px-2.5 py-1 rounded surface-card hover:opacity-80 text-sub text-xs font-medium"
+                              className="px-2 py-1 rounded surface-card hover:opacity-80 text-sub text-xs font-medium border border-line"
                             >
                               同步费率
                             </button>
                             <button
-                              onClick={() => handleSaveExchange(ex)}
-                              className="px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs"
+                              onClick={() => handleVerifyExchange(ex.exchange_id, ex.display_name)}
+                              className="px-2.5 py-1 rounded surface-card hover:opacity-85 text-sky-600 dark:text-sky-400 border border-sky-500/30 font-medium text-xs"
                             >
-                              保存配置
+                              测试连接
+                            </button>
+                            <button
+                              onClick={() => handleSaveExchange(ex)}
+                              className="px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs shadow-sm"
+                            >
+                              验证并保存
                             </button>
                           </div>
                         </div>

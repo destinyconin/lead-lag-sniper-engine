@@ -74,6 +74,14 @@ class BidirectionalSniperEngine:
             "SHADOW": _create_empty_stats_bucket(),
             "LIVE": _create_empty_stats_bucket(),
         }
+        self.trading_active_by_mode: Dict[str, bool] = {
+            "SHADOW": True,
+            "LIVE": False,
+        }
+        self.scan_ticks_by_mode: Dict[str, int] = {
+            "SHADOW": 0,
+            "LIVE": 0,
+        }
         self._last_live_cred_warn_mono: float = 0.0
 
         self.executor = ExecutionAdapter(
@@ -136,16 +144,22 @@ class BidirectionalSniperEngine:
 
         self.gateway.set_symbols(list(self.strategies.keys()))
         await self.gateway.start()
+
+        # Verify any exchange that already has credentials on startup
+        for ex_id, ex_row in list(self.exchanges.items()):
+            if ex_row.get("has_api_key") or ex_row.get("has_api_secret") or ex_row.get("has_passphrase"):
+                await self.verify_and_update_exchange(ex_id)
+
         self.append_log(
             "INFO",
             "SYSTEM",
-            f"跨所价差脉冲高频狙击系统已启动 | 初始通道: 影子模拟盘 | 监控合约: {len(self.strategies)} 个",
+            f"跨所价差脉冲高频狙击系统已启动 | 初始通道: 影子模拟盘 (自动交易运行中) | 监控合约: {len(self.strategies)} 个",
             mode="SHADOW",
         )
         self.append_log(
             "INFO",
             "SYSTEM",
-            "实盘交易通道已就绪 | 切换至实盘后将仅展示真实交易所原生行情与实盘私有订单回报",
+            "实盘交易通道已就绪 | 已连接 Binance 与 OKX 真实盘口行情，验证 API Key 后点击「开始交易」即可启动实盘自动狙击",
             mode="LIVE",
         )
 
@@ -179,6 +193,17 @@ class BidirectionalSniperEngine:
             self.symbol_rolling_pnls[sym] = deque(maxlen=20)
 
     def _seed_initial_ticks(self, sym: str, cfg: SymbolStrategy, m_state: SymbolMathState):
+        if self.risk_config.trading_mode == "LIVE":
+            l_bbo = self.gateway.real_leader_bbo.get(sym)
+            f_bbo = self.gateway.real_follower_bbo.get(sym)
+            if l_bbo and f_bbo:
+                now_m = mono_ms()
+                for i in range(18, 0, -1):
+                    t_mono = now_m - i * 45.0
+                    m_state.on_follower_tick(f_bbo[0], f_bbo[1], f_bbo[2], f_bbo[3], now_mono=t_mono)
+                    m_state.on_leader_tick(l_bbo[0], l_bbo[1], l_bbo[2], l_bbo[3], cfg, is_locked=False, now_mono=t_mono)
+                return
+
         base_px = get_default_base_price(sym)
         now_m = mono_ms()
         half_sp = base_px * 0.00015
@@ -229,6 +254,117 @@ class BidirectionalSniperEngine:
         )
         return leader, follower
 
+    async def verify_and_update_exchange(self, exchange_id: str) -> Dict[str, Any]:
+        for ex in self.db.load_exchanges_sync():
+            self.exchanges[ex["exchange_id"]] = ex
+        ex_row = self.exchanges.get(exchange_id)
+        if not ex_row:
+            return {"ok": False, "auth_status": "ERROR", "auth_message": "交易所不存在", "account_equity_usdt": 0.0}
+
+        res = await self.executor.verify_exchange_credentials(ex_row)
+        self.db.update_exchange_auth_status_sync(
+            exchange_id=exchange_id,
+            auth_status=res["auth_status"],
+            auth_message=res["auth_message"],
+            account_equity_usdt=res.get("account_equity_usdt", 0.0),
+        )
+        for ex in self.db.load_exchanges_sync():
+            self.exchanges[ex["exchange_id"]] = ex
+
+        disp = ex_row.get("display_name", exchange_id)
+        if res["ok"]:
+            self.append_log("FILL", "AUTH", f"[API验证通过] {disp}: {res['auth_message']}", mode="LIVE")
+            self.append_log("INFO", "AUTH", f"[API验证通过] {disp}: {res['auth_message']}", mode="SHADOW")
+        elif res["auth_status"] != "UNCONFIGURED":
+            self.append_log("WARN", "AUTH", f"[API配置异常] {disp}: {res['auth_message']}", mode="LIVE")
+            self.append_log("WARN", "AUTH", f"[API配置异常] {disp}: {res['auth_message']}", mode="SHADOW")
+        return res
+
+    async def switch_trading_mode(self, new_mode: str):
+        prev_mode = self.risk_config.trading_mode
+        self.risk_config.trading_mode = new_mode
+
+        if new_mode == "LIVE":
+            self.gateway.feed_mode = "REAL_WS"
+            if prev_mode != "LIVE":
+                # Wipe simulated ticks so LIVE mode shows 100% real exchange prices immediately
+                for sym, m in self.math_states.items():
+                    m.reset_ticks()
+                await self.gateway.fetch_real_bbo_snapshot(emit_immediately=False)
+                for sym, cfg in self.strategies.items():
+                    m = self.math_states.get(sym)
+                    if m:
+                        self._seed_initial_ticks(sym, cfg, m)
+
+            _, follower_ex = self.get_leader_And_follower_cfg()
+            if follower_ex.get("has_api_key") or follower_ex.get("has_api_secret") or follower_ex.get("has_passphrase"):
+                await self.verify_and_update_exchange(follower_ex["exchange_id"])
+                _, follower_ex = self.get_leader_And_follower_cfg()
+
+            auth_st = follower_ex.get("auth_status", "UNCONFIGURED")
+            auth_msg = follower_ex.get("auth_message", "未配置 API 密钥")
+            if auth_st == "VERIFIED":
+                self.trading_active_by_mode["LIVE"] = True
+                self.append_log(
+                    "FILL",
+                    "LIVE_MODE",
+                    f"[切换实盘通道] 已载入 Binance & OKX 真实盘口价格 | 执行所 ({follower_ex.get('display_name')}) {auth_msg} -> 自动交易已就绪运行",
+                    mode="LIVE",
+                )
+            else:
+                self.trading_active_by_mode["LIVE"] = False
+                self.append_log(
+                    "WARN",
+                    "LIVE_MODE",
+                    f"[切换实盘通道] 已载入 Binance & OKX 真实盘口价格 | 执行所 ({follower_ex.get('display_name')}) 状态: {auth_msg}",
+                    mode="LIVE",
+                )
+        else:
+            self.gateway.feed_mode = "SIMULATOR" if self.risk_config.feed_source != "REAL_WS" else "REAL_WS"
+            if prev_mode == "LIVE" and self.gateway.feed_mode == "SIMULATOR":
+                for sym, m in self.math_states.items():
+                    m.reset_ticks()
+                for sym, cfg in self.strategies.items():
+                    m = self.math_states.get(sym)
+                    if m:
+                        self._seed_initial_ticks(sym, cfg, m)
+            self.append_log("INFO", "SHADOW_MODE", "[切换模拟盘] 已恢复高频脉冲模拟盘视图", mode="SHADOW")
+
+    async def set_trading_active(self, active: bool) -> Dict[str, Any]:
+        cur_mode = self.risk_config.trading_mode
+        if not active:
+            self.trading_active_by_mode[cur_mode] = False
+            mode_label = "实盘通道" if cur_mode == "LIVE" else "影子模拟盘"
+            msg = f"已停止{mode_label}自动交易（当前仅实时刷新行情，不会发送任何新订单）"
+            self.append_log("WARN", "CONTROL", f"[停止自动交易] {msg}", mode=cur_mode)
+            return {"ok": True, "trading_active": False, "message": msg}
+
+        if self.risk_config.kill_switch_active:
+            self.risk_config.kill_switch_active = False
+
+        if cur_mode == "SHADOW":
+            self.trading_active_by_mode["SHADOW"] = True
+            msg = "影子模拟盘自动狙击交易已启动，正在实时扫描价差脉冲"
+            self.append_log("INFO", "CONTROL", f"[开始自动交易] {msg}", mode="SHADOW")
+            return {"ok": True, "trading_active": True, "message": msg}
+
+        # LIVE mode: validate Follower credentials before allowing trading to start!
+        _, follower_ex = self.get_leader_And_follower_cfg()
+        ver_res = await self.verify_and_update_exchange(follower_ex["exchange_id"])
+        _, follower_ex = self.get_leader_And_follower_cfg()
+
+        if not ver_res.get("ok") or follower_ex.get("auth_status") != "VERIFIED":
+            self.trading_active_by_mode["LIVE"] = False
+            err_detail = follower_ex.get("auth_message") or "未配置有效的执行所 API 密钥"
+            msg = f"无法开始实盘交易：{follower_ex.get('display_name')} {err_detail}"
+            self.append_log("CRITICAL", "CONTROL", f"[实盘启动阻断] {msg}", mode="LIVE")
+            return {"ok": False, "trading_active": False, "message": msg}
+
+        self.trading_active_by_mode["LIVE"] = True
+        msg = f"实盘自动交易已启动！{follower_ex.get('display_name')} ({follower_ex.get('auth_message')})，正在毫秒级监听脉冲并自动抢单"
+        self.append_log("FILL", "CONTROL", f"[实盘交易启动] {msg}", mode="LIVE")
+        return {"ok": True, "trading_active": True, "message": msg}
+
     # ==================== High-Frequency Market Data Callbacks ====================
     def _handle_follower_bbo(self, sym: str, bid: float, ask: float, bid_qty: float, ask_qty: float):
         m_state = self.math_states.get(sym)
@@ -250,6 +386,9 @@ class BidirectionalSniperEngine:
         if not cfg or not m_state:
             return
 
+        cur_mode = self.risk_config.trading_mode
+        self.scan_ticks_by_mode[cur_mode] = self.scan_ticks_by_mode.get(cur_mode, 0) + 1
+
         state = self.symbol_states.get(sym, SniperState.IDLE)
         is_locked = state != SniperState.IDLE
         m_state.on_leader_tick(bid, ask, bid_qty, ask_qty, cfg, is_locked=is_locked)
@@ -263,18 +402,22 @@ class BidirectionalSniperEngine:
         if not cfg.is_running or self.risk_config.kill_switch_active:
             return
 
+        # Respect explicit Start / Stop Trading state
+        if not self.trading_active_by_mode.get(cur_mode, False):
+            return
+
         _, follower_ex = self.get_leader_And_follower_cfg()
 
-        # In LIVE mode, strictly require real exchange WS data AND valid Follower API credentials!
-        if self.risk_config.trading_mode == "LIVE":
-            if not follower_ex.get("has_credentials"):
+        # In LIVE mode, strictly require verified Follower API credentials!
+        if cur_mode == "LIVE":
+            if follower_ex.get("auth_status") != "VERIFIED":
                 now_m = mono_ms()
                 if now_m - self._last_live_cred_warn_mono > 15000.0:
                     self._last_live_cred_warn_mono = now_m
                     self.append_log(
                         "WARN",
                         "LIVE_AUTH",
-                        f"[实盘待命] 执行所 ({follower_ex.get('display_name', 'OKX')}) 尚未配置实盘 API Key/Secret，当前仅监听行情不发送实盘订单",
+                        f"[实盘待命] 执行所 ({follower_ex.get('display_name', 'OKX')}) 状态: {follower_ex.get('auth_message', '未验证')}，当前仅更新真实行情不发单",
                         mode="LIVE",
                     )
                 return
@@ -821,14 +964,65 @@ class BidirectionalSniperEngine:
 
         mode_positions = [p for p in self.active_positions.values() if p.get("mode", "SHADOW") == cur_mode]
 
+        user_started = bool(self.trading_active_by_mode.get(cur_mode, False))
+        f_auth_status = follower_ex.get("auth_status", "UNCONFIGURED")
+        f_auth_msg = follower_ex.get("auth_message", "未配置 API 密钥")
+        f_equity = float(follower_ex.get("account_equity_usdt") or 0.0)
+        running_contracts = sum(1 for c in self.strategies.values() if c.is_running)
+        scan_cnt = self.scan_ticks_by_mode.get(cur_mode, 0)
+
+        if self.risk_config.kill_switch_active:
+            eff_active = False
+            status_code = "KILL_SWITCH"
+            status_label = "已暂停：全局紧急熔断激活"
+            status_detail = "点击顶部「解除熔断恢复监控」或「开始交易」恢复自动抢单"
+        elif cur_mode == "LIVE" and f_auth_status != "VERIFIED":
+            eff_active = False
+            status_code = "AUTH_ERROR"
+            status_label = "无法交易：执行所 API 未就绪"
+            status_detail = f"{follower_ex.get('display_name', 'OKX')}: {f_auth_msg}"
+        elif not user_started:
+            eff_active = False
+            status_code = "STOPPED"
+            status_label = "已停止 (待命观察)"
+            status_detail = "当前仅实时刷新行情与价差，点击「开始交易」启动自动抢单"
+        elif cur_mode == "LIVE" and not (self.gateway.binance_connected and self.gateway.okx_connected):
+            eff_active = False
+            status_code = "WS_CONNECTING"
+            status_label = "等待实盘行情流就绪"
+            status_detail = "正在同步 Binance 与 OKX 实时盘口流..."
+        else:
+            eff_active = True
+            status_code = "TRADING_ACTIVE"
+            status_label = "自动交易运行中"
+            status_detail = (
+                f"正在毫秒级扫描 {running_contracts} 个合约 · 累计扫描 {scan_cnt:,} 次盘口"
+                + (f" · 账户权益 {f_equity:.2f} USDT" if cur_mode == "LIVE" and f_equity > 0 else "")
+            )
+
         return {
             "ts": wall_ms(),
             "trading_mode": cur_mode,
             "feed_source": self.gateway.active_source,
+            "trading_control": {
+                "trading_active": eff_active,
+                "user_started": user_started,
+                "status_code": status_code,
+                "status_label": status_label,
+                "status_detail": status_detail,
+                "scan_ticks_count": scan_cnt,
+                "monitored_running_count": running_contracts,
+                "follower_auth_status": f_auth_status,
+                "follower_auth_message": f_auth_msg,
+                "follower_equity_usdt": f_equity,
+            },
             "live_status": {
                 "binance_ws_connected": self.gateway.binance_connected,
                 "okx_ws_connected": self.gateway.okx_connected,
                 "follower_has_api_key": bool(follower_ex.get("has_credentials")),
+                "follower_auth_status": f_auth_status,
+                "follower_auth_message": f_auth_msg,
+                "follower_equity_usdt": f_equity,
                 "follower_exchange_name": follower_ex.get("display_name", "OKX Swap"),
                 "leader_exchange_name": leader_ex.get("display_name", "Binance USDM"),
                 "last_ws_error": self.gateway.last_ws_error,

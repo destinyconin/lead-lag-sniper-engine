@@ -32,7 +32,11 @@ CREATE TABLE IF NOT EXISTS exchanges (
     vip_level VARCHAR(32) DEFAULT 'VIP 0',
     taker_fee DECIMAL(8, 6) DEFAULT 0.0005,  -- 默认万5
     maker_fee DECIMAL(8, 6) DEFAULT 0.0002,  -- 默认万2
-    is_active BOOLEAN DEFAULT 1
+    is_active BOOLEAN DEFAULT 1,
+    auth_status VARCHAR(32) DEFAULT 'UNCONFIGURED',
+    auth_message TEXT DEFAULT '未配置 API 密钥',
+    account_equity_usdt DECIMAL(18, 4) DEFAULT 0.0,
+    last_verified_at TEXT DEFAULT ''
 );
 
 -- 2. 监控币种与策略参数表 (Section 五.2 + Section 1.3/3.1 扩展字段)
@@ -174,6 +178,17 @@ class AsyncDatabaseManager:
         try:
             conn.executescript(SCHEMA_SQL)
             cur = conn.cursor()
+            # Ensure new auth verification columns exist in older DB files
+            existing_cols = {row[1] for row in cur.execute("PRAGMA table_info(exchanges)").fetchall()}
+            if "auth_status" not in existing_cols:
+                cur.execute("ALTER TABLE exchanges ADD COLUMN auth_status VARCHAR(32) DEFAULT 'UNCONFIGURED'")
+            if "auth_message" not in existing_cols:
+                cur.execute("ALTER TABLE exchanges ADD COLUMN auth_message TEXT DEFAULT '未配置 API 密钥'")
+            if "account_equity_usdt" not in existing_cols:
+                cur.execute("ALTER TABLE exchanges ADD COLUMN account_equity_usdt DECIMAL(18, 4) DEFAULT 0.0")
+            if "last_verified_at" not in existing_cols:
+                cur.execute("ALTER TABLE exchanges ADD COLUMN last_verified_at TEXT DEFAULT ''")
+
             cur.execute("SELECT COUNT(*) FROM exchanges")
             if cur.fetchone()[0] == 0:
                 for ex_id, name, role, vip, taker, maker, active in DEFAULT_EXCHANGES:
@@ -258,14 +273,70 @@ class AsyncDatabaseManager:
             result = []
             for r in rows:
                 d = dict(r)
-                dec_secret = vault.decrypt(d.get("api_secret_enc", ""))
-                dec_pass = vault.decrypt(d.get("passphrase_enc", ""))
-                d["api_key_masked"] = vault.mask(d.get("api_key", ""))
-                d["has_credentials"] = bool(d.get("api_key") and dec_secret)
+                ex_id = d.get("exchange_id", "")
+                raw_key = (d.get("api_key") or "").strip()
+                dec_secret = vault.decrypt(d.get("api_secret_enc", "")).strip()
+                dec_pass = vault.decrypt(d.get("passphrase_enc", "")).strip()
+                needs_passphrase = ex_id in ("okx", "bitget")
+
+                has_key = bool(raw_key)
+                has_sec = bool(dec_secret)
+                has_pass = bool(dec_pass)
+                has_any = has_key or has_sec or has_pass
+                has_all = has_key and has_sec and (has_pass if needs_passphrase else True)
+
+                d["api_key"] = raw_key
+                d["api_key_masked"] = vault.mask(raw_key)
+                d["has_api_key"] = has_key
+                d["has_api_secret"] = has_sec
+                d["has_passphrase"] = has_pass
+                d["has_credentials"] = has_all
                 d["_decrypted_secret"] = dec_secret
                 d["_decrypted_passphrase"] = dec_pass
+                d["account_equity_usdt"] = float(d.get("account_equity_usdt") or 0.0)
+                d["last_verified_at"] = d.get("last_verified_at") or ""
+
+                # Derive clear diagnostic status if incomplete or unconfigured
+                saved_status = d.get("auth_status") or "UNCONFIGURED"
+                saved_msg = d.get("auth_message") or "未配置 API 密钥"
+                if not has_any:
+                    d["auth_status"] = "UNCONFIGURED"
+                    d["auth_message"] = "未配置 API 密钥"
+                elif not has_all:
+                    missing = []
+                    if not has_key:
+                        missing.append("API Key")
+                    if not has_sec:
+                        missing.append("API Secret")
+                    if needs_passphrase and not has_pass:
+                        missing.append("API 口令 (Passphrase)")
+                    d["auth_status"] = "CONFIG_INCOMPLETE"
+                    d["auth_message"] = f"配置不完整：缺少 {', '.join(missing)}，请补充完整后点击「验证并保存」"
+                else:
+                    if saved_status in ("UNCONFIGURED", "CONFIG_INCOMPLETE"):
+                        d["auth_status"] = "CONFIGURED_UNVERIFIED"
+                        d["auth_message"] = "已填写密钥，点击「验证并保存」连通交易所"
+                    else:
+                        d["auth_status"] = saved_status
+                        d["auth_message"] = saved_msg
                 result.append(d)
             return result
+        finally:
+            conn.close()
+
+    def update_exchange_auth_status_sync(
+        self, exchange_id: str, auth_status: str, auth_message: str, account_equity_usdt: float = 0.0
+    ):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            ts_str = time.strftime("%H:%M:%S")
+            conn.execute(
+                """UPDATE exchanges
+                   SET auth_status=?, auth_message=?, account_equity_usdt=?, last_verified_at=?
+                   WHERE exchange_id=?""",
+                (auth_status, auth_message, round(account_equity_usdt, 4), ts_str, exchange_id),
+            )
+            conn.commit()
         finally:
             conn.close()
 
@@ -278,21 +349,27 @@ class AsyncDatabaseManager:
                 (cfg.exchange_id,),
             ).fetchone()
 
+            in_key = (cfg.api_key or "").strip()
+            in_sec = (cfg.api_secret or "").strip()
+            in_pass = (cfg.passphrase or "").strip()
+
             if existing:
-                api_key = cfg.api_key if cfg.api_key and "****" not in cfg.api_key else existing[0]
+                api_key = in_key if (in_key and "****" not in in_key and "•" not in in_key) else existing[0]
                 secret_enc = (
-                    vault.encrypt(cfg.api_secret)
-                    if cfg.api_secret and "****" not in cfg.api_secret
+                    vault.encrypt(in_sec)
+                    if (in_sec and "****" not in in_sec and "•" not in in_sec)
                     else existing[1]
                 )
                 pass_enc = (
-                    vault.encrypt(cfg.passphrase)
-                    if cfg.passphrase and "****" not in cfg.passphrase
+                    vault.encrypt(in_pass)
+                    if (in_pass and "****" not in in_pass and "•" not in in_pass)
                     else existing[2]
                 )
-                # If setting a new leader, demote previous leader or keep single leader
                 if cfg.role == "leader" and cfg.is_active:
-                    cur.execute("UPDATE exchanges SET role = 'follower' WHERE role = 'leader' AND exchange_id != ?", (cfg.exchange_id,))
+                    cur.execute(
+                        "UPDATE exchanges SET role = 'follower' WHERE role = 'leader' AND exchange_id != ?",
+                        (cfg.exchange_id,),
+                    )
                 cur.execute(
                     """UPDATE exchanges
                        SET display_name=?, role=?, api_key=?, api_secret_enc=?, passphrase_enc=?,
@@ -312,8 +389,8 @@ class AsyncDatabaseManager:
                     ),
                 )
             else:
-                secret_enc = vault.encrypt(cfg.api_secret)
-                pass_enc = vault.encrypt(cfg.passphrase)
+                secret_enc = vault.encrypt(in_sec)
+                pass_enc = vault.encrypt(in_pass)
                 cur.execute(
                     """INSERT INTO exchanges
                        (exchange_id, display_name, role, api_key, api_secret_enc, passphrase_enc,
@@ -323,7 +400,7 @@ class AsyncDatabaseManager:
                         cfg.exchange_id,
                         cfg.display_name,
                         cfg.role,
-                        cfg.api_key,
+                        in_key,
                         secret_enc,
                         pass_enc,
                         cfg.vip_level,
