@@ -682,125 +682,34 @@ export default function App() {
 
       {/* ==================== TOP HEADER ==================== */}
       <header
-        className="sticky top-0 z-30 backdrop-blur-md border-b border-line px-4 py-2.5"
+        className="sticky top-0 z-30 backdrop-blur-md border-b border-line px-4 py-2"
         style={{ backgroundColor: 'var(--bg-header)' }}
       >
-        <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-3">
-          {/* Brand Identity */}
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg border border-sky-500/30 bg-sky-500/10 flex items-center justify-center text-sky-600 dark:text-sky-400">
-              <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                <path d="M2 12h4l3-8 4 16 3-8h6" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </div>
-            <div>
-              <div className="flex items-center gap-2.5">
-                <h1 className="font-bold text-base tracking-tight text-main">跨所价差脉冲高频狙击系统</h1>
-                <span
-                  className={`px-2 py-0.5 text-[11px] font-semibold rounded border ${
-                    isLiveMode
-                      ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30'
-                      : 'bg-sky-500/10 text-sky-600 dark:text-sky-400 border-sky-500/25'
-                  }`}
-                >
-                  {isLiveMode ? '当前：实盘交易通道 (独立账本)' : '当前：影子模拟盘 (含延迟与逆向选择仿真)'}
-                </span>
+        {/* Row 1: Brand + Mode Switcher (Left) | Telemetry + Execution + User + Theme (Right) */}
+        <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-2.5">
+          {/* Left: Brand Identity + Mode Switcher */}
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2.5">
+              <div className="w-8 h-8 rounded-lg border border-sky-500/30 bg-sky-500/10 flex items-center justify-center text-sky-600 dark:text-sky-400 shrink-0">
+                <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M2 12h4l3-8 4 16 3-8h6" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
               </div>
-              <p className="text-[11px] text-dim">
-                时间衰减比例基差 · 保留价限价抢单 · 被动挂单止盈 · 八阶段同步锁与回报对账状态机
-              </p>
-            </div>
-          </div>
-
-          {/* Right Status & Controls */}
-          <div className="flex flex-wrap items-center gap-2.5 text-xs">
-            {/* Data Stream Status */}
-            <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg surface-subtle">
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  wsConnected ? 'bg-emerald-500' : 'bg-rose-500'
-                }`}
-              />
-              <span className="text-dim">行情通道:</span>
-              <span className="font-medium text-main">
-                {snapshot.feed_source === 'LIVE_WS'
-                  ? '交易所原生直连'
-                  : snapshot.feed_source === 'LIVE_WS_WAITING'
-                  ? '等待实盘直连'
-                  : '高频脉冲仿真流 (50Hz)'}
-              </span>
-            </div>
-
-            {/* Order RTT */}
-            <div
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg surface-subtle font-mono"
-              title="报单网络往返延迟 (Round-Trip Time)"
-            >
-              <Wifi className="w-3.5 h-3.5 text-sky-500" strokeWidth={1.75} />
-              <span className="text-dim">报单往返延迟:</span>
-              <span className="font-semibold text-main">{snapshot.last_order_rtt_ms} ms</span>
-            </div>
-
-            {/* Real-Time Trading Execution Status Pill */}
-            <div
-              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border font-medium ${
-                isTradingActive
-                  ? 'bg-emerald-500/12 border-emerald-500/35 text-emerald-600 dark:text-emerald-400'
-                  : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
-                  ? 'bg-rose-500/12 border-rose-500/35 text-rose-600 dark:text-rose-400'
-                  : 'bg-amber-500/12 border-amber-500/35 text-amber-600 dark:text-amber-400'
-              }`}
-              title={tradingControl.status_detail || ''}
-            >
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  isTradingActive
-                    ? 'bg-emerald-500 animate-ping'
-                    : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
-                    ? 'bg-rose-500'
-                    : 'bg-amber-500'
-                }`}
-              />
-              <span>{tradingControl.status_label || (isTradingActive ? '自动交易运行中' : '已停止待命')}</span>
-            </div>
-
-            {/* Start / Stop Trading Controls */}
-            <div className="flex items-center rounded-lg surface-subtle p-0.5 border border-line">
-              <button
-                onClick={handleStartTrading}
-                className={`px-2.5 py-1 rounded-md text-xs font-semibold transition flex items-center gap-1 ${
-                  isTradingActive
-                    ? 'bg-emerald-600 text-white shadow-sm'
-                    : 'text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/15'
-                }`}
-                title="验证执行端状态并启动毫秒级自动狙击交易"
-              >
-                <svg className="w-3 h-3" viewBox="0 0 24 24" fill="currentColor">
-                  <polygon points="5 3 19 12 5 21 5 3" />
-                </svg>
-                <span>开始交易</span>
-              </button>
-              <button
-                onClick={handleStopTrading}
-                className={`px-2.5 py-1 rounded-md text-xs font-semibold transition flex items-center gap-1 ${
-                  !isTradingActive
-                    ? 'bg-slate-600 text-white shadow-sm'
-                    : 'text-rose-600 dark:text-rose-400 hover:bg-rose-500/15'
-                }`}
-                title="停止发送新订单，仅保留实时行情监控"
-              >
-                <svg className="w-3 h-3" viewBox="0 0 24 24" fill="currentColor">
-                  <rect x="5" y="5" width="14" height="14" rx="2" />
-                </svg>
-                <span>停止交易</span>
-              </button>
+              <div>
+                <h1 className="font-bold text-sm sm:text-base tracking-tight text-main leading-tight">
+                  跨所价差脉冲高频狙击系统
+                </h1>
+                <p className="text-[10px] text-dim hidden sm:block">
+                  比例对数基差 · 保留价限价抢单 · 被动挂单止盈 · 八阶段同步锁状态机
+                </p>
+              </div>
             </div>
 
             {/* Mode Switcher (Registered users only can see LIVE mode) */}
-            <div className="flex items-center rounded-lg surface-subtle p-0.5 border border-line">
+            <div className="flex items-center rounded-lg surface-subtle p-0.5 border border-line text-xs">
               <button
                 onClick={() => handleModeToggle('SHADOW')}
-                className={`px-2.5 py-1 rounded-md text-xs font-medium transition ${
+                className={`px-2.5 py-1 rounded-md font-medium transition ${
                   !isLiveMode ? 'bg-sky-600 text-white shadow-sm' : 'text-dim hover:text-main'
                 }`}
               >
@@ -809,7 +718,7 @@ export default function App() {
               {currentUser ? (
                 <button
                   onClick={() => handleModeToggle('LIVE')}
-                  className={`px-2.5 py-1 rounded-md text-xs font-medium transition flex items-center gap-1 ${
+                  className={`px-2.5 py-1 rounded-md font-medium transition flex items-center gap-1 ${
                     isLiveMode ? 'bg-emerald-600 text-white shadow-sm' : 'text-dim hover:text-main'
                   }`}
                   title={
@@ -821,25 +730,110 @@ export default function App() {
                   <span>实盘通道</span>
                   {!currentUser.can_use_live && (
                     <span className="text-[10px] px-1 rounded bg-amber-500/20 text-amber-500 font-semibold">
-                      需VIP交易
+                      需VIP
                     </span>
                   )}
                 </button>
               ) : (
                 <button
                   onClick={() => openAuthModal('register')}
-                  className="px-2.5 py-1 rounded-md text-xs font-medium text-amber-600 dark:text-amber-400 hover:bg-amber-500/10 transition flex items-center gap-1"
+                  className="px-2.5 py-1 rounded-md font-medium text-amber-600 dark:text-amber-400 hover:bg-amber-500/10 transition flex items-center gap-1"
                   title="注册并登录账号后才可查看实盘系统"
                 >
                   <Lock className="w-3 h-3" strokeWidth={1.75} />
-                  <span>注册/登录看实盘</span>
+                  <span>注册看实盘</span>
                 </button>
               )}
+            </div>
+          </div>
+
+          {/* Right: Compact Telemetry, Trading Controls, User Badge & Theme */}
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            {/* Combined Feed & RTT Pill */}
+            <div
+              className="hidden xl:flex items-center gap-2 px-2.5 py-1 rounded-lg surface-subtle font-mono text-[11px]"
+              title="行情源与报单网络往返延迟 (RTT)"
+            >
+              <span className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+              <span className="font-sans text-main font-medium">
+                {snapshot.feed_source === 'LIVE_WS' ? '实盘原生直连' : '50Hz仿真流'}
+              </span>
+              <span className="text-dim">|</span>
+              <Wifi className="w-3 h-3 text-sky-500" strokeWidth={1.75} />
+              <span className="text-main font-semibold">{snapshot.last_order_rtt_ms}ms</span>
+            </div>
+
+            {/* Unified Execution Control Group */}
+            <div className="flex items-center rounded-lg surface-subtle p-0.5 border border-line gap-0.5">
+              <div
+                className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-semibold ${
+                  isTradingActive
+                    ? 'text-emerald-600 dark:text-emerald-400'
+                    : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
+                    ? 'text-rose-600 dark:text-rose-400'
+                    : 'text-amber-600 dark:text-amber-400'
+                }`}
+                title={tradingControl.status_detail || ''}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    isTradingActive
+                      ? 'bg-emerald-500 animate-ping'
+                      : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
+                      ? 'bg-rose-500'
+                      : 'bg-amber-500'
+                  }`}
+                />
+                <span>{tradingControl.status_label || (isTradingActive ? '运行中' : '已停止')}</span>
+              </div>
+
+              <button
+                onClick={handleStartTrading}
+                className={`px-2 py-1 rounded-md text-xs font-semibold transition flex items-center gap-1 ${
+                  isTradingActive
+                    ? 'bg-emerald-600 text-white shadow-sm'
+                    : 'text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/15'
+                }`}
+                title="启动毫秒级自动狙击交易"
+              >
+                <svg className="w-2.5 h-2.5" viewBox="0 0 24 24" fill="currentColor">
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+                <span>开始</span>
+              </button>
+
+              <button
+                onClick={handleStopTrading}
+                className={`px-2 py-1 rounded-md text-xs font-semibold transition flex items-center gap-1 ${
+                  !isTradingActive
+                    ? 'bg-slate-600 text-white shadow-sm'
+                    : 'text-rose-600 dark:text-rose-400 hover:bg-rose-500/15'
+                }`}
+                title="停止发送新订单，仅保留实时行情监控"
+              >
+                <svg className="w-2.5 h-2.5" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="5" y="5" width="14" height="14" rx="2" />
+                </svg>
+                <span>停止</span>
+              </button>
+
+              <button
+                onClick={handleKillSwitch}
+                className={`px-2 py-1 rounded-md text-xs font-semibold transition flex items-center gap-1 ${
+                  isKillActive
+                    ? 'bg-emerald-600 text-white'
+                    : 'text-rose-600 dark:text-rose-400 hover:bg-rose-500/15'
+                }`}
+                title="全局紧急熔断：立即撤单平仓并暂停策略"
+              >
+                <Power className="w-3 h-3" strokeWidth={2} />
+                <span>{isKillActive ? '解除熔断' : '熔断'}</span>
+              </button>
             </div>
 
             {/* User Account & VIP Status Pill */}
             {currentUser ? (
-              <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg surface-subtle border border-line">
+              <div className="flex items-center gap-1 px-2 py-1 rounded-lg surface-subtle border border-line">
                 <button
                   onClick={() => setActiveTab('membership')}
                   className="flex items-center gap-1.5 text-left hover:opacity-85 transition"
@@ -854,19 +848,19 @@ export default function App() {
                         : 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30'
                     }`}
                   >
-                    {currentUser.is_vip ? currentUser.vip_label : '未开通会员'}
+                    {currentUser.is_vip ? currentUser.vip_label : '未开VIP'}
                   </span>
                 </button>
                 <button
                   onClick={() => openAuthModal('login')}
                   className="px-1.5 py-0.5 rounded text-[10px] surface-card border border-line text-dim hover:text-main transition"
-                  title="切换其他账号"
+                  title="切换账号"
                 >
                   切换
                 </button>
                 <button
                   onClick={handleLogout}
-                  className="p-1 rounded text-dim hover:text-rose-500 transition"
+                  className="p-0.5 rounded text-dim hover:text-rose-500 transition"
                   title="退出当前账号"
                 >
                   <LogOut className="w-3.5 h-3.5" strokeWidth={1.75} />
@@ -876,70 +870,51 @@ export default function App() {
               <div className="flex items-center gap-1.5">
                 <button
                   onClick={() => openAuthModal('login')}
-                  className="px-2.5 py-1.5 rounded-lg surface-subtle border border-line hover:border-sky-500/50 text-main font-medium transition"
+                  className="px-2.5 py-1 rounded-lg surface-subtle border border-line hover:border-sky-500/50 text-main font-medium transition"
                 >
-                  账号登录
+                  登录
                 </button>
                 <button
                   onClick={() => openAuthModal('register')}
-                  className="px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-semibold transition shadow-sm"
+                  className="px-2.5 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-semibold transition shadow-sm"
                 >
-                  免费注册
+                  注册
                 </button>
               </div>
             )}
 
-            {/* Light / Dark Mode Switcher */}
+            {/* Compact Theme Switcher */}
             <button
               onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg surface-subtle hover:opacity-85 text-main font-medium transition"
-              title="切换明亮模式与深色模式"
+              className="p-1.5 rounded-lg surface-subtle hover:opacity-85 text-main transition border border-line"
+              title={theme === 'light' ? '切换至深色模式' : '切换至明亮模式'}
             >
               {theme === 'light' ? (
-                <>
-                  <Moon className="w-3.5 h-3.5 text-slate-600" strokeWidth={1.75} />
-                  <span>深色模式</span>
-                </>
+                <Moon className="w-3.5 h-3.5 text-slate-600" strokeWidth={1.75} />
               ) : (
-                <>
-                  <Sun className="w-3.5 h-3.5 text-amber-400" strokeWidth={1.75} />
-                  <span>明亮模式</span>
-                </>
+                <Sun className="w-3.5 h-3.5 text-amber-400" strokeWidth={1.75} />
               )}
-            </button>
-
-            {/* Global Kill Switch */}
-            <button
-              onClick={handleKillSwitch}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition ${
-                isKillActive
-                  ? 'bg-emerald-600 hover:bg-emerald-500 border-emerald-500 text-white'
-                  : 'bg-rose-600 hover:bg-rose-500 border-rose-500 text-white'
-              }`}
-            >
-              <Power className="w-3.5 h-3.5" strokeWidth={2} />
-              {isKillActive ? '解除熔断恢复监控' : '全局紧急熔断'}
             </button>
           </div>
         </div>
 
-        {/* Navigation & Pulse Simulation Bar */}
-        <div className="max-w-[1600px] mx-auto mt-2.5 pt-2 border-t border-line flex flex-wrap items-center justify-between gap-2">
+        {/* Row 2: Workspace Navigation Tabs (Left) | Context Status / Pulse Bar (Right) */}
+        <div className="max-w-[1600px] mx-auto mt-2 pt-2 border-t border-line flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-1">
             {[
-              { id: 'radar', label: '实时脉冲雷达与狙击台', icon: Radar, visible: true },
-              { id: 'watchlist', label: `监控合约与参数矩阵 (${strategies.length})`, icon: Sliders, visible: true },
-              { id: 'exchanges', label: '实盘交易所连接与全局风控', icon: Shield, visible: Boolean(currentUser) },
-              { id: 'analytics', label: '盈亏统计与实盘可靠性诊断', icon: BarChart2, visible: true },
+              { id: 'radar', label: '脉冲狙击台', icon: Radar, visible: true },
+              { id: 'watchlist', label: `策略参数矩阵 (${strategies.length})`, icon: Sliders, visible: true },
+              { id: 'exchanges', label: '交易所与全局风控', icon: Shield, visible: Boolean(currentUser) },
+              { id: 'analytics', label: '盈亏统计与诊断', icon: BarChart2, visible: true },
               {
                 id: 'membership',
-                label: currentUser?.is_vip ? '会员中心 (VIP已开通)' : '购买会员 / 开通实盘',
+                label: currentUser?.is_vip ? '会员中心 (VIP)' : '购买会员 / 解锁实盘',
                 icon: CreditCard,
                 visible: true,
               },
               {
                 id: 'admin',
-                label: '后台管理中心 (用户与会员)',
+                label: '后台管理中心',
                 icon: Users,
                 visible: true,
               },
@@ -952,7 +927,7 @@ export default function App() {
                   <button
                     key={tab.id}
                     onClick={() => setActiveTab(tab.id)}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+                    className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium transition ${
                       active
                         ? 'bg-sky-500/12 text-sky-600 dark:text-sky-400 border border-sky-500/30 font-semibold'
                         : 'text-dim hover:text-main'
@@ -965,47 +940,58 @@ export default function App() {
               })}
           </div>
 
-          {/* Clean Line-Icon Pulse Test Bar (Disabled in LIVE mode to protect real data integrity) */}
+          {/* Right Context Bar: Live Connection Summary OR Shadow Pulse Test Buttons */}
           {isLiveMode ? (
-            <div className="flex items-center gap-2 text-xs text-emerald-600 dark:text-emerald-400 font-medium">
-              <Lock className="w-3.5 h-3.5" strokeWidth={1.75} />
-              <span>实盘通道已开启数据保护：仅展示真实交易所成交与私有流回报，已隔离模拟盘数据</span>
+            <div className="flex flex-wrap items-center gap-2 text-[11px]">
+              <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/25 font-medium">
+                Binance {liveStatus.binance_ws_connected ? '已连接' : '重连中'} · OKX{' '}
+                {liveStatus.okx_ws_connected ? '已连接' : '重连中'}
+              </span>
+              <span
+                onClick={() => setActiveTab('exchanges')}
+                className={`cursor-pointer px-2 py-0.5 rounded border font-medium ${
+                  liveStatus.follower_auth_status === 'VERIFIED'
+                    ? 'bg-sky-500/10 text-sky-600 dark:text-sky-400 border-sky-500/25'
+                    : 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/25'
+                }`}
+              >
+                {liveStatus.follower_auth_message || '点击配置执行端 API'}
+              </span>
             </div>
           ) : (
-            <div className="flex flex-wrap items-center gap-1.5 text-xs">
-              <span className="text-dim mr-1">模拟盘脉冲注入 ({selectedSymbol.split('/')[0]}):</span>
-              <button
-                onClick={() => handleInjectPulse('LONG', 0.0085, 'CONVERGE_TP', '多头拉升收敛止盈')}
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 border border-emerald-500/25 font-medium transition"
-              >
-                <ArrowUpRight className="w-3.5 h-3.5" strokeWidth={1.75} />
-                拉升止盈测试
-              </button>
-
-              <button
-                onClick={() => handleInjectPulse('SHORT', 0.0085, 'CONVERGE_TP', '空头下挫收敛止盈')}
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 border border-rose-500/25 font-medium transition"
-              >
-                <ArrowDownRight className="w-3.5 h-3.5" strokeWidth={1.75} />
-                下挫止盈测试
-              </button>
-
-              <button
-                onClick={() => handleInjectPulse('LONG', 0.0082, 'REVERSAL_SL', '主所假突破反转止损')}
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400 border border-amber-500/25 font-medium transition"
-              >
-                <RefreshCw className="w-3 h-3" strokeWidth={1.75} />
-                假突破反转止损
-              </button>
-
-              <button
-                onClick={() => handleInjectPulse('LONG', 0.008, 'MM_WITHDRAW_MISS', '做市商抢先撤单未成交')}
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md surface-subtle hover:opacity-80 text-sub font-medium transition"
-              >
-                <Activity className="w-3.5 h-3.5" strokeWidth={1.75} />
-                撤单未成测试
-              </button>
-            </div>
+            activeTab === 'radar' && (
+              <div className="flex flex-wrap items-center gap-1 text-[11px]">
+                <span className="text-dim mr-0.5">脉冲测试 ({selectedSymbol.split('/')[0]}):</span>
+                <button
+                  onClick={() => handleInjectPulse('LONG', 0.0085, 'CONVERGE_TP', '多头拉升收敛止盈')}
+                  className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 border border-emerald-500/25 font-medium transition"
+                >
+                  <ArrowUpRight className="w-3 h-3" strokeWidth={1.75} />
+                  拉升止盈
+                </button>
+                <button
+                  onClick={() => handleInjectPulse('SHORT', 0.0085, 'CONVERGE_TP', '空头下挫收敛止盈')}
+                  className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 border border-rose-500/25 font-medium transition"
+                >
+                  <ArrowDownRight className="w-3 h-3" strokeWidth={1.75} />
+                  下挫止盈
+                </button>
+                <button
+                  onClick={() => handleInjectPulse('LONG', 0.0082, 'REVERSAL_SL', '主所假突破反转止损')}
+                  className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400 border border-amber-500/25 font-medium transition"
+                >
+                  <RefreshCw className="w-2.5 h-2.5" strokeWidth={1.75} />
+                  反转止损
+                </button>
+                <button
+                  onClick={() => handleInjectPulse('LONG', 0.008, 'MM_WITHDRAW_MISS', '做市商抢先撤单未成交')}
+                  className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded surface-subtle hover:opacity-80 text-sub font-medium transition"
+                >
+                  <Activity className="w-3 h-3" strokeWidth={1.75} />
+                  撤单未成
+                </button>
+              </div>
+            )
           )}
         </div>
       </header>
@@ -1020,209 +1006,101 @@ export default function App() {
       />
 
       {/* ==================== MAIN WORKSPACE ==================== */}
-      <main className="flex-1 max-w-[1600px] w-full mx-auto p-4 space-y-4">
+      <main className="flex-1 max-w-[1600px] w-full mx-auto px-4 py-3 space-y-3.5">
         {/* VIP REQUIREMENT BANNER WHEN LOGGED IN AS NON-VIP IN LIVE MODE */}
         {isLiveMode && currentUser && !currentUser.can_use_live && (
-          <div className="surface-card rounded-xl p-4 border-2 border-amber-500/50 bg-amber-500/5 flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-amber-500/15 text-amber-600 dark:text-amber-400">
-                <Lock className="w-5 h-5" strokeWidth={1.75} />
-              </div>
-              <div>
-                <div className="text-xs font-bold text-main">
-                  当前账号【{currentUser.username}】为普通注册用户（尚未开通 VIP 会员）
-                </div>
-                <p className="text-xs text-sub mt-0.5">
-                  您已解锁实盘通道查看权限，可实时观察 Binance 与 OKX 真实盘口价差脉冲；开通 VIP 会员后即可保存实盘 API 密钥并启动实盘自动交易。
-                </p>
+          <div className="surface-card rounded-xl px-4 py-3 border-l-4 border-l-amber-500 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <Lock className="w-4 h-4 text-amber-500 shrink-0" strokeWidth={2} />
+              <div className="text-xs text-main">
+                <strong>当前账号【{currentUser.username}】尚未开通 VIP 会员：</strong>
+                <span className="text-sub ml-1">
+                  您已拥有实盘通道实时行情查看权限；开通 VIP 会员后即可绑定交易所 API 并启动实盘自动狙击。
+                </span>
               </div>
             </div>
             <button
               onClick={() => setActiveTab('membership')}
-              className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold transition shadow-sm"
+              className="px-3.5 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold transition shadow-sm"
             >
-              立即开通 VIP 会员解锁实盘交易
+              立即开通 VIP 会员
             </button>
           </div>
         )}
-        {/* TRADING EXECUTION & LIVE CHANNEL STATUS BANNER */}
-        <div
-          className={`surface-card rounded-xl p-3.5 border-l-4 flex flex-wrap items-center justify-between gap-3 ${
-            isTradingActive
-              ? 'border-l-emerald-500'
-              : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
-              ? 'border-l-rose-500'
-              : 'border-l-amber-500'
-          }`}
-        >
-          <div className="flex items-center gap-3">
-            <div
-              className={`p-2 rounded-lg ${
-                isTradingActive
-                  ? 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400'
-                  : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
-                  ? 'bg-rose-500/12 text-rose-600 dark:text-rose-400'
-                  : 'bg-amber-500/12 text-amber-600 dark:text-amber-400'
-              }`}
-            >
-              <Shield className="w-5 h-5" strokeWidth={1.75} />
-            </div>
-            <div>
-              <div className="text-xs font-semibold text-main flex flex-wrap items-center gap-2">
-                <span>
-                  {isLiveMode ? '实盘交易通道运行控制台' : '影子模拟盘交易控制台'} —{' '}
-                  {tradingControl.status_label || (isTradingActive ? '自动交易运行中' : '已停止待命')}
-                </span>
-                <span
-                  className={`px-2 py-0.5 rounded text-[11px] font-semibold border ${
-                    isTradingActive
-                      ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30'
-                      : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
-                      ? 'bg-rose-500/15 text-rose-600 dark:text-rose-400 border-rose-500/30'
-                      : 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/30'
-                  }`}
-                >
-                  {isTradingActive ? '正在自动监控脉冲并执行抢单' : '当前仅监听行情 · 不发送新订单'}
-                </span>
-                {isLiveMode && (
-                  <span className="px-2 py-0.5 rounded text-[11px] bg-sky-500/12 text-sky-600 dark:text-sky-400 border border-sky-500/25">
-                    真实 Binance & OKX 盘口价格已接入
-                  </span>
-                )}
+
+        {/* Top 6 KPI Summary Cards (Only shown on Radar & Analytics tabs for a clean layout) */}
+        {(activeTab === 'radar' || activeTab === 'analytics') && (
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
+            <div className="surface-card rounded-xl p-3 border-l-2 border-l-emerald-500">
+              <div className="text-[11px] text-dim">
+                {isLiveMode ? '实盘累计净收益 (USDT)' : '模拟盘累计净收益 (USDT)'}
               </div>
-              <p className="text-xs text-dim mt-1">
-                {isLiveMode ? (
-                  <>
-                    主信号源: <strong className="text-main">{liveStatus.leader_exchange_name}</strong> (
-                    {liveStatus.binance_ws_connected ? '真实盘口已连接' : '重连中'}) · 执行所:{' '}
-                    <strong className="text-main">{liveStatus.follower_exchange_name}</strong> (
-                    {liveStatus.okx_ws_connected ? '真实盘口已连接' : '重连中'}) · API 认证状态:{' '}
-                    <strong
-                      className={
-                        liveStatus.follower_auth_status === 'VERIFIED'
-                          ? 'text-emerald-600 dark:text-emerald-400'
-                          : liveStatus.follower_auth_status === 'UNCONFIGURED'
-                          ? 'text-amber-600 dark:text-amber-400'
-                          : 'text-rose-600 dark:text-rose-400'
-                      }
-                    >
-                      {liveStatus.follower_auth_message || '未配置 API 密钥'}
-                    </strong>
-                  </>
-                ) : (
-                  <span>
-                    {tradingControl.status_detail || '正在使用高频脉冲仿真流进行策略模拟撮合'}
-                  </span>
-                )}
-              </p>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2">
-            {!isTradingActive ? (
-              <button
-                onClick={handleStartTrading}
-                className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition flex items-center gap-1.5 shadow-sm"
+              <div
+                className={`text-base font-bold font-mono mt-0.5 ${
+                  (stats.total_net_pnl ?? 0) >= 0
+                    ? 'text-emerald-600 dark:text-emerald-400'
+                    : 'text-rose-600 dark:text-rose-400'
+                }`}
               >
-                <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
-                  <polygon points="5 3 19 12 5 21 5 3" />
-                </svg>
-                <span>{isLiveMode ? '开始实盘自动交易' : '开始自动交易'}</span>
-              </button>
-            ) : (
-              <button
-                onClick={handleStopTrading}
-                className="px-3.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold transition flex items-center gap-1.5 shadow-sm"
-              >
-                <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
-                  <rect x="5" y="5" width="14" height="14" rx="2" />
-                </svg>
-                <span>停止自动交易</span>
-              </button>
-            )}
+                {(stats.total_net_pnl ?? 0) >= 0 ? '+' : ''}
+                {(stats.total_net_pnl ?? 0).toFixed(4)} U
+              </div>
+              <div className="text-[10px] text-dim font-mono mt-0.5">
+                毛利 {(stats.total_gross_pnl ?? 0).toFixed(2)} · 费 {(stats.total_fees ?? 0).toFixed(2)}
+              </div>
+            </div>
 
-            {isLiveMode && (
-              <button
-                onClick={() => setActiveTab('exchanges')}
-                className="px-3 py-1.5 rounded-lg surface-subtle hover:opacity-85 text-main border border-line text-xs font-medium transition"
-              >
-                {liveStatus.follower_auth_status === 'VERIFIED' ? '查看/修改 API 配置' : '前往配置/修复执行端 API'}
-              </button>
-            )}
-          </div>
-        </div>
+            <div className="surface-card rounded-xl p-3 border-l-2 border-l-sky-500">
+              <div className="text-[11px] text-dim">限价 IOC 抢单成交率</div>
+              <div className="text-base font-bold font-mono text-sky-600 dark:text-sky-400 mt-0.5">
+                {stats.fill_rate_pct ?? 0}%
+              </div>
+              <div className="text-[10px] text-dim font-mono mt-0.5">
+                成交 {stats.ioc_filled_count ?? 0} · 撤单 {stats.ioc_missed_count ?? 0}
+              </div>
+            </div>
 
-        {/* Top 6 KPI Summary Cards (Mode-Isolated) */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-          <div className="surface-card rounded-xl p-3.5">
-            <div className="text-xs text-dim">
-              {isLiveMode ? '实盘累计净收益 (USDT)' : '模拟盘累计净收益 (USDT)'}
+            <div className="surface-card rounded-xl p-3">
+              <div className="text-[11px] text-dim">平仓闭环胜率</div>
+              <div className="text-base font-bold font-mono text-main mt-0.5">{stats.win_rate_pct ?? 0}%</div>
+              <div className="text-[10px] text-dim font-mono mt-0.5">
+                盈利 {stats.win_count ?? 0} · 亏损 {stats.loss_count ?? 0}
+              </div>
             </div>
-            <div
-              className={`text-lg font-bold font-mono mt-1 ${
-                (stats.total_net_pnl ?? 0) >= 0
-                  ? 'text-emerald-600 dark:text-emerald-400'
-                  : 'text-rose-600 dark:text-rose-400'
-              }`}
-            >
-              {(stats.total_net_pnl ?? 0) >= 0 ? '+' : ''}
-              {(stats.total_net_pnl ?? 0).toFixed(4)} USDT
-            </div>
-            <div className="text-[11px] text-dim font-mono mt-0.5">
-              毛利 {(stats.total_gross_pnl ?? 0).toFixed(3)} · 手续费 {(stats.total_fees ?? 0).toFixed(3)}
-            </div>
-          </div>
 
-          <div className="surface-card rounded-xl p-3.5">
-            <div className="text-xs text-dim">限价 IOC 抢单成交率</div>
-            <div className="text-lg font-bold font-mono text-sky-600 dark:text-sky-400 mt-1">
-              {stats.fill_rate_pct ?? 0}%
+            <div className="surface-card rounded-xl p-3">
+              <div className="text-[11px] text-dim">累计盈亏比 / 信号数</div>
+              <div className="text-base font-bold font-mono text-main mt-0.5">{stats.profit_factor ?? 0}</div>
+              <div className="text-[10px] text-dim font-mono mt-0.5">
+                累计触发 {stats.total_signals ?? 0} 次信号
+              </div>
             </div>
-            <div className="text-[11px] text-dim font-mono mt-0.5">
-              成交 {stats.ioc_filled_count ?? 0} 笔 · 撤单 {stats.ioc_missed_count ?? 0} 笔
+
+            <div className="surface-card rounded-xl p-3">
+              <div className="text-[11px] text-dim">被动挂单止盈占比</div>
+              <div className="text-base font-bold font-mono text-amber-600 dark:text-amber-400 mt-0.5">
+                {stats.maker_tp_count ?? 0} / {(stats.maker_tp_count ?? 0) + (stats.taker_exit_count ?? 0)} 笔
+              </div>
+              <div className="text-[10px] text-dim mt-0.5">Post-Only 限价止盈优先</div>
+            </div>
+
+            <div className="surface-card rounded-xl p-3">
+              <div className="text-[11px] text-dim">在途敞口与连续止损</div>
+              <div className="text-base font-bold font-mono text-main mt-0.5">
+                {(snapshot.active_positions || []).length} / {snapshot.risk?.max_concurrent_positions ?? 2} 仓
+              </div>
+              <div className="text-[10px] text-dim font-mono mt-0.5">
+                连亏 {stats.consecutive_losses ?? 0} / {snapshot.risk?.max_consecutive_losses ?? 5} 笔
+              </div>
             </div>
           </div>
-
-          <div className="surface-card rounded-xl p-3.5">
-            <div className="text-xs text-dim">平仓闭环胜率</div>
-            <div className="text-lg font-bold font-mono text-main mt-1">{stats.win_rate_pct ?? 0}%</div>
-            <div className="text-[11px] text-dim font-mono mt-0.5">
-              盈利 {stats.win_count ?? 0} 笔 · 亏损 {stats.loss_count ?? 0} 笔
-            </div>
-          </div>
-
-          <div className="surface-card rounded-xl p-3.5">
-            <div className="text-xs text-dim">累计盈亏比 (盈利/亏损)</div>
-            <div className="text-lg font-bold font-mono text-main mt-1">{stats.profit_factor ?? 0}</div>
-            <div className="text-[11px] text-dim font-mono mt-0.5">
-              累计触发信号 {stats.total_signals ?? 0} 次
-            </div>
-          </div>
-
-          <div className="surface-card rounded-xl p-3.5">
-            <div className="text-xs text-dim">被动挂单止盈占比</div>
-            <div className="text-lg font-bold font-mono text-amber-600 dark:text-amber-400 mt-1">
-              {stats.maker_tp_count ?? 0} / {(stats.maker_tp_count ?? 0) + (stats.taker_exit_count ?? 0)} 笔
-            </div>
-            <div className="text-[11px] text-dim mt-0.5">开仓即挂 Post-Only 限价止盈</div>
-          </div>
-
-          <div className="surface-card rounded-xl p-3.5">
-            <div className="text-xs text-dim">在途敞口与连续止损监控</div>
-            <div className="text-lg font-bold font-mono text-main mt-1">
-              {(snapshot.active_positions || []).length} / {snapshot.risk?.max_concurrent_positions ?? 2} 仓
-            </div>
-            <div className="text-[11px] text-dim font-mono mt-0.5">
-              连续亏损 {stats.consecutive_losses ?? 0} / {snapshot.risk?.max_consecutive_losses ?? 5} 笔
-            </div>
-          </div>
-        </div>
+        )}
 
         {/* ==================== VIEW 1: LIVE RADAR DASHBOARD ==================== */}
         {activeTab === 'radar' && (
-          <div className="space-y-4">
-            {/* Monitored Contracts Strip */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+          <div className="space-y-3.5">
+            {/* Compact Monitored Contracts Grid with Pulse Progress Bar */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
               {strategies.map((s) => {
                 const t = snapshot.telemetry?.[s.symbol] || {};
                 const isSelected = s.symbol === selectedSymbol;
@@ -1233,24 +1111,27 @@ export default function App() {
                 const isStale = pushGapMs > (s.max_book_staleness_ms || 600);
                 const maxJumpPct = t.max_jump_seen_pct ?? 0;
                 const targetJumpPct = (s.min_jump_pct ?? 0.006) * 100;
+                const jumpProgress = Math.min(100, Math.round((maxJumpPct / Math.max(0.01, targetJumpPct)) * 100));
 
                 return (
                   <div
                     key={s.symbol}
                     onClick={() => setSelectedSymbol(s.symbol)}
-                    className={`cursor-pointer rounded-xl p-3.5 transition-all surface-card ${
-                      isSelected ? 'ring-2 ring-sky-500/70' : 'hover:opacity-95'
+                    className={`cursor-pointer rounded-xl p-3 transition-all surface-card ${
+                      isSelected ? 'ring-2 ring-sky-500 border-sky-500/50' : 'hover:border-sky-500/30'
                     }`}
                   >
-                    <div className="flex items-center justify-between mb-2.5">
-                      <div className="flex items-center gap-2">
-                        <span className="font-mono font-bold text-sm text-main">{s.symbol}</span>
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-mono font-bold text-xs sm:text-sm text-main">
+                          {s.symbol.replace(':USDT', '')}
+                        </span>
                         <span className="text-[10px] px-1.5 py-0.5 rounded surface-subtle text-sub">
                           {DIRECTION_LABEL_MAP[s.direction] || s.direction}
                         </span>
                       </div>
                       <span
-                        className={`px-2 py-0.5 rounded text-[11px] font-medium border ${
+                        className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border ${
                           stateKey === 'IDLE'
                             ? 'surface-subtle text-dim'
                             : stateKey === 'HOLDING'
@@ -1264,75 +1145,89 @@ export default function App() {
 
                     <div className="grid grid-cols-2 gap-2 text-xs font-mono">
                       <div>
-                        <div className="text-[10px] text-dim font-sans">主所中枢价 (Binance)</div>
+                        <div className="text-[10px] text-dim font-sans">主所 (Binance)</div>
                         <div className="text-amber-600 dark:text-amber-400 font-semibold mt-0.5">
                           {t.leader_mid ? Number(t.leader_mid).toFixed(prec) : '--'}
                         </div>
                       </div>
                       <div>
-                        <div className="text-[10px] text-dim font-sans">从所买一 / 卖一 (OKX)</div>
-                        <div className="text-sky-600 dark:text-sky-400 font-semibold mt-0.5">
+                        <div className="text-[10px] text-dim font-sans">从所买/卖 (OKX)</div>
+                        <div className="text-sky-600 dark:text-sky-400 font-semibold mt-0.5 truncate">
                           {t.follower_bid ? Number(t.follower_bid).toFixed(prec) : '--'} /{' '}
                           {t.follower_ask ? Number(t.follower_ask).toFixed(prec) : '--'}
                         </div>
                       </div>
                     </div>
 
-                    <div className="mt-2.5 pt-2 border-t border-line flex items-center justify-between text-[11px] font-mono text-dim">
-                      <span title="过去30秒主从交易所滚动对数基差">基差: {t.basis_bps ?? 0}bp</span>
-                      <span title="运行至今捕获到的最大150ms脉冲幅度 / 设定触发阈值">
-                        最高脉冲: {maxJumpPct.toFixed(2)}%/{targetJumpPct.toFixed(2)}%
-                      </span>
-                      <span
-                        title="距离上一次收到从所盘口推送的时间间隔（用于检测断流或卡顿，超过600ms自动拒单保护）"
-                        className={
-                          isStale
-                            ? 'text-rose-500 font-semibold'
-                            : 'text-emerald-600 dark:text-emerald-400'
-                        }
-                      >
-                        延迟: {pushGapMs}ms
-                      </span>
+                    {/* Visual Pulse Progress Bar */}
+                    <div className="mt-2 pt-2 border-t border-line space-y-1">
+                      <div className="flex items-center justify-between text-[10px] font-mono text-dim">
+                        <span>基差: {t.basis_bps ?? 0}bp</span>
+                        <span>
+                          最高脉冲: {maxJumpPct.toFixed(2)}%/{targetJumpPct.toFixed(2)}%
+                        </span>
+                        <span
+                          className={
+                            isStale ? 'text-rose-500 font-semibold' : 'text-emerald-600 dark:text-emerald-400'
+                          }
+                        >
+                          {pushGapMs}ms
+                        </span>
+                      </div>
+                      <div className="w-full h-1 rounded-full surface-subtle overflow-hidden">
+                        <div
+                          className={`h-full transition-all duration-300 ${
+                            jumpProgress >= 100
+                              ? 'bg-emerald-500'
+                              : jumpProgress >= 50
+                              ? 'bg-amber-500'
+                              : 'bg-sky-500/70'
+                          }`}
+                          style={{ width: `${Math.max(4, jumpProgress)}%` }}
+                        />
+                      </div>
                     </div>
                   </div>
                 );
               })}
             </div>
 
-            {/* 8-Stage State Machine Pipeline */}
-            <div className="surface-card rounded-xl p-4">
-              <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                <div className="flex items-center gap-2">
-                  <Cpu className="w-4 h-4 text-sky-500" strokeWidth={1.75} />
+            {/* Compact 8-Stage State Machine Pipeline */}
+            <div className="surface-card rounded-xl px-3.5 py-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <div className="flex items-center gap-1.5">
+                  <Cpu className="w-3.5 h-3.5 text-sky-500" strokeWidth={1.75} />
                   <span className="text-xs font-semibold text-main">
-                    毫秒级持仓状态机拓扑 ({selectedSymbol}) — 同步互斥加锁 · 保留价限价单 · 事件驱动唤醒
+                    毫秒级持仓状态机 ({selectedSymbol.replace(':USDT', '')})
                   </span>
                 </div>
-                <span className="text-xs text-dim font-mono">
-                  开仓门槛: 预期净收益率 ≥ {((currentStrategy.take_profit_pct ?? 0.0025) * 100).toFixed(2)}% · 信号有效窗口 &lt;{' '}
-                  {currentStrategy.max_signal_age_ms ?? 80}ms
+                <span className="text-[11px] text-dim font-mono">
+                  开仓目标净利 ≥ {((currentStrategy.take_profit_pct ?? 0.0025) * 100).toFixed(2)}% · 窗口{' '}
+                  {currentStrategy.window_ms ?? 150}ms · 脉冲阈值{' '}
+                  {((currentStrategy.min_jump_pct ?? 0.006) * 100).toFixed(2)}%
                 </span>
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">
+              <div className="grid grid-cols-4 lg:grid-cols-8 gap-1.5">
                 {STATE_PIPELINE.map((st) => {
                   const activeState = currentTelemetry.state || 'IDLE';
                   const isCurrent = activeState === st.key;
                   return (
                     <div
                       key={st.key}
-                      className={`px-3 py-2 rounded-lg border transition-all ${
+                      className={`px-2.5 py-1.5 rounded-lg border transition-all flex items-center justify-between ${
                         isCurrent
                           ? 'bg-sky-500/12 border-sky-500 text-sky-600 dark:text-sky-300 shadow-sm'
                           : 'surface-subtle text-dim'
                       }`}
                     >
-                      <div className="flex items-center justify-between text-[10px] font-mono">
-                        <span>阶段 {st.step}</span>
-                        {isCurrent && <span className="w-1.5 h-1.5 rounded-full bg-sky-500 animate-ping" />}
+                      <div>
+                        <div className="text-[11px] font-semibold text-main leading-tight">
+                          {st.step} {st.label}
+                        </div>
+                        <div className="text-[10px] text-dim truncate">{st.desc}</div>
                       </div>
-                      <div className="text-xs font-semibold text-main mt-0.5">{st.label}</div>
-                      <div className="text-[10px] text-dim truncate">{st.desc}</div>
+                      {isCurrent && <span className="w-2 h-2 rounded-full bg-sky-500 animate-ping shrink-0" />}
                     </div>
                   );
                 })}
@@ -1340,17 +1235,17 @@ export default function App() {
 
               {/* Active Position Status Bar */}
               {(snapshot.active_positions || []).length > 0 && (
-                <div className="mt-3 pt-3 border-t border-line flex flex-wrap items-center justify-between gap-3 bg-emerald-500/10 px-3.5 py-2 rounded-lg border border-emerald-500/25">
+                <div className="mt-2.5 pt-2 border-t border-line flex flex-wrap items-center justify-between gap-3 bg-emerald-500/10 px-3 py-1.5 rounded-lg border border-emerald-500/25">
                   {snapshot.active_positions.map((pos) => (
                     <div key={pos.symbol} className="flex flex-wrap items-center gap-4 text-xs font-mono">
                       <span className="px-2 py-0.5 rounded bg-emerald-600 text-white font-semibold font-sans">
-                        持仓监控中: {pos.symbol} ({pos.side === 'LONG' ? '多头' : '空头'})
+                        持仓中: {pos.symbol} ({pos.side === 'LONG' ? '多头' : '空头'})
                       </span>
-                      <span className="text-main">成交均价: {pos.entry_price}</span>
-                      <span className="text-emerald-600 dark:text-emerald-400">被动止盈挂单价: {pos.tp_price}</span>
-                      <span className="text-rose-600 dark:text-rose-400">条件止损触发价: {pos.sl_price}</span>
+                      <span className="text-main">均价: {pos.entry_price}</span>
+                      <span className="text-emerald-600 dark:text-emerald-400">止盈价: {pos.tp_price}</span>
+                      <span className="text-rose-600 dark:text-rose-400">止损价: {pos.sl_price}</span>
                       <span className="text-main">
-                        浮动净收益率:{' '}
+                        浮盈:{' '}
                         <strong
                           className={
                             pos.unrealized_net_pct >= 0

@@ -63,16 +63,19 @@
   border: 1px solid var(--border-primary);
 }
 
-.surface-input {
+.surface-input,
+.input-field {
   background-color: var(--bg-input);
   border: 1px solid var(--border-strong);
   color: var(--text-primary);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
-.surface-input:focus {
+.surface-input:focus,
+.input-field:focus {
   outline: none;
   border-color: #0284c7;
-  box-shadow: 0 0 0 2px rgba(2, 132, 199, 0.15);
+  box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.15);
 }
 
 .text-main {
