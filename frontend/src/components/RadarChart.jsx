@@ -124,20 +124,16 @@ export default function RadarChart({ symbol, series = [], telemetry = {}, strate
   const tpThresholdBps = ((strategy?.take_profit_pct ?? 0.0025) + 0.0012) * 10000;
 
   return (
-    <div className="surface-card rounded-xl p-4">
+    <div className="surface-card p-6">
       {/* Chart Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3 mb-3 pb-2.5 border-b border-line">
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4 pb-3.5 border-b border-line">
         <div className="flex items-center gap-2.5">
-          <span className="px-2.5 py-0.5 rounded text-xs font-mono font-semibold bg-sky-500/10 text-sky-600 dark:text-sky-400 border border-sky-500/25">
+          <span className="px-3 py-1 rounded-full text-xs font-mono font-bold surface-subtle text-main">
             {symbol}
           </span>
-          <h3 className="text-sm font-semibold text-main">双所毫秒级对齐逐笔 Tick 阶梯曲线与套利窗口</h3>
+          <h3 className="text-base font-bold text-main">双所毫秒级对齐逐笔 Tick 阶梯曲线</h3>
           {telemetry?.basis_frozen && (
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium rounded bg-amber-500/10 border border-amber-500/30 text-amber-600 dark:text-amber-400">
-              <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <rect x="3" y="11" width="18" height="11" rx="2" />
-                <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-              </svg>
+            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 text-[11px] font-semibold rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-600 dark:text-amber-400">
               脉冲期基差已锁定
             </span>
           )}

@@ -89,16 +89,18 @@ export default function EquityChart({ equityCurve = [], stats = {}, theme = 'dar
   const makerPct = Math.round((makerCount / totalExits) * 100);
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
       {/* Cumulative Equity Curve */}
-      <div className="lg:col-span-2 surface-card rounded-xl p-4">
-        <div className="flex flex-wrap items-center justify-between gap-2 mb-3 pb-2.5 border-b border-line">
-          <div className="flex items-center gap-2">
-            <svg className="w-4 h-4 text-emerald-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="22 7 13.5 15.5 8.5 10.5 2 17" />
-              <polyline points="16 7 22 7 22 13" />
-            </svg>
-            <h3 className="text-sm font-semibold text-main">累计净收益与毛收益对比曲线</h3>
+      <div className="lg:col-span-2 surface-card p-6">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-4 pb-3.5 border-b border-line">
+          <div className="flex items-center gap-2.5">
+            <div className="icon-box w-9 h-9">
+              <svg className="w-4 h-4 text-emerald-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polyline points="22 7 13.5 15.5 8.5 10.5 2 17" />
+                <polyline points="16 7 22 7 22 13" />
+              </svg>
+            </div>
+            <h3 className="text-base font-bold text-main">累计净收益与毛收益对比曲线</h3>
           </div>
 
           <div className="flex items-center gap-4 text-xs font-mono">
@@ -189,14 +191,16 @@ export default function EquityChart({ equityCurve = [], stats = {}, theme = 'dar
       </div>
 
       {/* Directional & Fee Structure Breakdown */}
-      <div className="surface-card rounded-xl p-4 flex flex-col justify-between">
+      <div className="surface-card p-6 flex flex-col justify-between">
         <div>
-          <div className="flex items-center gap-2 mb-3 pb-2.5 border-b border-line">
-            <svg className="w-4 h-4 text-sky-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M21.21 15.89A10 10 0 1 1 8 2.83" />
-              <path d="M22 12A10 10 0 0 0 12 2v10z" />
-            </svg>
-            <h3 className="text-sm font-semibold text-main">多空收益与平仓费率结构分布</h3>
+          <div className="flex items-center gap-2.5 mb-4 pb-3.5 border-b border-line">
+            <div className="icon-box w-9 h-9">
+              <svg className="w-4 h-4 text-sky-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M21.21 15.89A10 10 0 1 1 8 2.83" />
+                <path d="M22 12A10 10 0 0 0 12 2v10z" />
+              </svg>
+            </div>
+            <h3 className="text-base font-bold text-main">多空收益与平仓费率分布</h3>
           </div>
 
           {/* Long vs Short Breakdown */}
