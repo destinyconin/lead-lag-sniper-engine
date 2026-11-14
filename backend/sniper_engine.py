@@ -280,6 +280,22 @@ class BidirectionalSniperEngine:
             self.append_log("WARN", "AUTH", f"[API配置异常] {disp}: {res['auth_message']}", mode="SHADOW")
         return res
 
+    def clear_exchange_credentials(self, exchange_id: str) -> Dict[str, Any]:
+        prev_ex = self.exchanges.get(exchange_id, {})
+        disp = "全部交易所" if exchange_id == "ALL" else prev_ex.get("display_name", exchange_id)
+        self.db.clear_exchange_credentials_sync(exchange_id)
+        for ex in self.db.load_exchanges_sync():
+            self.exchanges[ex["exchange_id"]] = ex
+
+        _, follower_ex = self.get_leader_And_follower_cfg()
+        if exchange_id == "ALL" or follower_ex.get("exchange_id") == exchange_id:
+            self.trading_active_by_mode["LIVE"] = False
+
+        msg = f"已清除 {disp} 本地加密保存的 API Key、Secret 及口令数据"
+        self.append_log("WARN", "AUTH", f"[清除API密钥] {msg}", mode="LIVE")
+        self.append_log("INFO", "AUTH", f"[清除API密钥] {msg}", mode="SHADOW")
+        return {"ok": True, "message": msg}
+
     async def switch_trading_mode(self, new_mode: str):
         prev_mode = self.risk_config.trading_mode
         self.risk_config.trading_mode = new_mode

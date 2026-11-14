@@ -340,6 +340,30 @@ class AsyncDatabaseManager:
         finally:
             conn.close()
 
+    def clear_exchange_credentials_sync(self, exchange_id: str):
+        """Permanently wipes saved API Key, encrypted Secret, Passphrase, and verification state."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            if exchange_id == "ALL":
+                conn.execute(
+                    """UPDATE exchanges
+                       SET api_key='', api_secret_enc='', passphrase_enc='',
+                           auth_status='UNCONFIGURED', auth_message='未配置 API 密钥',
+                           account_equity_usdt=0.0, last_verified_at=''"""
+                )
+            else:
+                conn.execute(
+                    """UPDATE exchanges
+                       SET api_key='', api_secret_enc='', passphrase_enc='',
+                           auth_status='UNCONFIGURED', auth_message='未配置 API 密钥',
+                           account_equity_usdt=0.0, last_verified_at=''
+                       WHERE exchange_id=?""",
+                    (exchange_id,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
     def save_exchange_sync(self, cfg: ExchangeConfigModel):
         conn = sqlite3.connect(self.db_path)
         try:

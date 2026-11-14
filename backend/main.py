@@ -181,6 +181,15 @@ async def verify_exchange_api(exchange_id: str = Query(...)):
     return ex_resp
 
 
+@app.post("/api/exchanges/clear-credentials")
+async def clear_exchange_credentials(exchange_id: str = Query(...)):
+    res = engine.clear_exchange_credentials(exchange_id)
+    ex_resp = await get_exchanges()
+    ex_resp["clear_result"] = res
+    ex_resp["snapshot"] = engine.build_dashboard_snapshot()
+    return ex_resp
+
+
 @app.post("/api/exchanges/fetch-fees")
 async def fetch_vip_fees(exchange_id: str = Query(...), vip_level: str = Query(default="VIP 1")):
     tiers = VIP_FEE_TIERS.get(exchange_id, {})

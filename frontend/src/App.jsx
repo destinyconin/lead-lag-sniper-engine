@@ -432,6 +432,27 @@ export default function App() {
     }
   };
 
+  const handleClearExchangeCredentials = async (exchangeId, displayName) => {
+    const res = await fetch(`/api/exchanges/clear-credentials?exchange_id=${encodeURIComponent(exchangeId)}`, {
+      method: 'POST',
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.exchanges) {
+        setExchanges(
+          data.exchanges.map((item) => ({
+            ...item,
+            api_key: '',
+            api_secret: '',
+            passphrase: '',
+          }))
+        );
+      }
+      if (data.snapshot) setSnapshot(data.snapshot);
+      showToast(data.clear_result?.message || `已清除 ${displayName} 保存的 API 数据`, 'info');
+    }
+  };
+
   const handleAutoFetchVipFee = async (ex, vipLevel) => {
     const res = await fetch(
       `/api/exchanges/fetch-fees?exchange_id=${encodeURIComponent(ex.exchange_id)}&vip_level=${encodeURIComponent(vipLevel)}`,
@@ -1565,10 +1586,20 @@ export default function App() {
                     自由指定主信号源 (Leader) 与实盘执行端 (Follower)，支持自动同步账户 VIP 等级费率及手动覆盖
                   </p>
                 </div>
-                <span className="px-2.5 py-1 rounded-md bg-emerald-500/10 border border-emerald-500/25 text-emerald-600 dark:text-emerald-400 text-xs font-medium flex items-center gap-1.5">
-                  <Lock className="w-3.5 h-3.5" strokeWidth={1.75} />
-                  API 密钥本地 AES-256-GCM 加密存储
-                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => handleClearExchangeCredentials('ALL', '全部交易所')}
+                    className="px-2.5 py-1 rounded-md bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-600 dark:text-rose-400 text-xs font-medium flex items-center gap-1.5 transition"
+                    title="彻底擦除所有交易所已保存的 API Key、Secret 和口令数据"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" strokeWidth={1.75} />
+                    <span>清除全部已存 API 数据</span>
+                  </button>
+                  <span className="px-2.5 py-1 rounded-md bg-emerald-500/10 border border-emerald-500/25 text-emerald-600 dark:text-emerald-400 text-xs font-medium flex items-center gap-1.5">
+                    <Lock className="w-3.5 h-3.5" strokeWidth={1.75} />
+                    API 密钥本地 AES-256-GCM 加密存储
+                  </span>
+                </div>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -1793,7 +1824,15 @@ export default function App() {
                             <span className="text-sub">启用该交易所</span>
                           </label>
 
-                          <div className="flex items-center gap-1.5">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <button
+                              onClick={() => handleClearExchangeCredentials(ex.exchange_id, ex.display_name)}
+                              className="px-2 py-1 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 border border-rose-500/30 text-xs font-medium flex items-center gap-1 transition"
+                              title="清除该交易所本地加密保存的 API Key、Secret 与口令数据"
+                            >
+                              <Trash2 className="w-3 h-3" strokeWidth={1.75} />
+                              <span>清除API数据</span>
+                            </button>
                             <button
                               onClick={() => handleAutoFetchVipFee(ex, 'VIP 1')}
                               className="px-2 py-1 rounded surface-card hover:opacity-80 text-sub text-xs font-medium border border-line"
