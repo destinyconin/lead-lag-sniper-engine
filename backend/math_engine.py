@@ -148,9 +148,11 @@ class SymbolMathState:
         return (bid_qty * ask + ask_qty * bid) / total_qty
 
     def _trim_history(self, ts_list: list[float], tick_list: list[TickSample], max_len: int = 2000):
-        if len(ts_list) > max_len:
-            del ts_list[: len(ts_list) - max_len]
-            del tick_list[: len(tick_list) - max_len]
+        # Amortized batch trim avoids O(N) memmove on every single high-frequency tick
+        if len(ts_list) > max_len + 400:
+            cut = len(ts_list) - max_len
+            del ts_list[:cut]
+            del tick_list[:cut]
 
     def on_follower_tick(self, bid: float, ask: float, bid_qty: float = 10.0, ask_qty: float = 10.0, now_mono: Optional[float] = None) -> TickSample:
         if now_mono is None:
@@ -179,9 +181,13 @@ class SymbolMathState:
                     if l_ret * f_ret > 0:
                         self.cov_lf_ema = 0.96 * self.cov_lf_ema + 0.04 * (l_ret * f_ret)
                         self.var_l_ema = 0.96 * self.var_l_ema + 0.04 * (l_ret * l_ret)
-                        if self.var_l_ema > 1e-10:
-                            raw_beta = self.cov_lf_ema / self.var_l_ema
-                            self.estimated_beta = max(0.80, min(1.05, raw_beta))
+                    else:
+                        # Include non-converging samples in variance denominator so beta is not artificially inflated
+                        self.cov_lf_ema = 0.96 * self.cov_lf_ema
+                        self.var_l_ema = 0.96 * self.var_l_ema + 0.04 * (l_ret * l_ret)
+                    if self.var_l_ema > 1e-10:
+                        raw_beta = self.cov_lf_ema / self.var_l_ema
+                        self.estimated_beta = max(0.50, min(1.05, raw_beta))
                 self._pending_leader_jump = None
 
         return sample
@@ -336,9 +342,10 @@ class SymbolMathState:
         if not l_curr or not f_curr or self.log_basis_ema is None:
             return None
 
-        # Fix #8: Follower book staleness check
+        # Fix #8: Both Leader and Follower book staleness check
         follower_age_ms = now_mono - f_curr.mono_ts
-        if follower_age_ms > cfg.max_book_staleness_ms:
+        leader_age_ms = now_mono - l_curr.mono_ts
+        if follower_age_ms > cfg.max_book_staleness_ms or leader_age_ms > cfg.max_book_staleness_ms:
             return None
 
         if f_curr.bid <= 0 or f_curr.ask <= 0 or f_curr.ask < f_curr.bid:

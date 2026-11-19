@@ -9,6 +9,7 @@ import hashlib
 import math
 import os
 import random
+import time
 import urllib.request
 from typing import Callable, Dict, List, Optional, Tuple
 import httpx
@@ -80,12 +81,12 @@ BASE_PRICES: Dict[str, float] = {
     "CRV/USDT:USDT": 0.8640,
     "LDO/USDT:USDT": 1.840,
     "DYDX/USDT:USDT": 1.420,
-    # High-Volatility Meme Coins
-    "PEPE/USDT:USDT": 0.018520,
+    # High-Volatility Meme Coins (1X per-token USD price matching OKX & divisor-adjusted Binance)
+    "PEPE/USDT:USDT": 0.00001852,
     "WIF/USDT:USDT": 2.1850,
-    "BONK/USDT:USDT": 0.031250,
-    "FLOKI/USDT:USDT": 0.19450,
-    "SHIB/USDT:USDT": 0.024150,
+    "BONK/USDT:USDT": 0.00003125,
+    "FLOKI/USDT:USDT": 0.00019450,
+    "SHIB/USDT:USDT": 0.00002415,
     "ORDI/USDT:USDT": 32.400,
     "PNUT/USDT:USDT": 0.6840,
     "ACT/USDT:USDT": 0.3420,
@@ -129,22 +130,61 @@ def to_okx_inst_id(unified_sym: str) -> str:
     return base_quote.replace("/", "-") + "-SWAP"
 
 
+def okx_inst_id_to_unified(inst_id: str) -> str:
+    """Converts 'XRP-USDT-SWAP' -> 'XRP/USDT:USDT'."""
+    if inst_id.endswith("-USDT-SWAP"):
+        base = inst_id[:-len("-USDT-SWAP")]
+        return f"{base}/USDT:USDT"
+    return inst_id
+
+
+# Shared module-level instrument caches (refreshed by MarketDataGateway & preflight)
+_OKX_INSTRUMENT_CACHE: Dict[str, dict] = {}
+_BINANCE_INSTRUMENT_CACHE: Dict[str, dict] = {}
+_INSTRUMENTS_LAST_FETCH_MONO: float = 0.0
+
+
+def get_okx_instrument_spec(symbol_or_inst_id: str) -> Optional[dict]:
+    """Returns cached OKX SWAP specification (ctVal, lotSz, minSz, tickSz, state, maxLever)."""
+    if not symbol_or_inst_id:
+        return None
+    inst_id = (
+        symbol_or_inst_id
+        if symbol_or_inst_id.endswith("-SWAP")
+        else to_okx_inst_id(symbol_or_inst_id)
+    )
+    return _OKX_INSTRUMENT_CACHE.get(inst_id)
+
+
+def get_binance_instrument_spec(unified_sym: str) -> Optional[dict]:
+    """Returns cached Binance USDM specification (status, tickSize, stepSize, minQty)."""
+    if not unified_sym:
+        return None
+    raw_sym = to_binance_stream_sym(unified_sym).upper()
+    return _BINANCE_INSTRUMENT_CACHE.get(raw_sym)
+
+
 class MarketDataGateway:
     def __init__(
         self,
-        on_leader_bbo: Callable[[str, float, float, float, float], None],
-        on_leader_trade: Callable[[str, str, float, float], None],
-        on_follower_bbo: Callable[[str, float, float, float, float], None],
-        on_log: Callable[[str, str, str], None],
+        on_leader_bbo: Optional[Callable[[str, float, float, float, float], None]] = None,
+        on_leader_trade: Optional[Callable[[str, str, float, float], None]] = None,
+        on_follower_bbo: Optional[Callable[[str, float, float, float, float], None]] = None,
+        on_log: Optional[Callable[[str, str, str], None]] = None,
     ):
-        self._on_leader_bbo = on_leader_bbo
-        self._on_leader_trade = on_leader_trade
-        self._on_follower_bbo = on_follower_bbo
-        self._on_log = on_log
+        self._subscribers: Dict[str, dict] = {}
+        self._feed_mode: str = "SIMULATOR"
+        if on_leader_bbo or on_leader_trade or on_follower_bbo or on_log:
+            self._subscribers["__default__"] = {
+                "mode": self._feed_mode,
+                "symbols": None,
+                "on_leader_bbo": on_leader_bbo,
+                "on_leader_trade": on_leader_trade,
+                "on_follower_bbo": on_follower_bbo,
+                "on_log": on_log,
+            }
 
         self.symbols: List[str] = []
-        # In SHADOW mode, default is "SIMULATOR"; in LIVE mode, switched to "REAL_WS"
-        self.feed_mode: str = "SIMULATOR"
         self.binance_connected: bool = False
         self.okx_connected: bool = False
         self.active_source: str = "HIGH_FREQ_SIM"
@@ -154,11 +194,15 @@ class MarketDataGateway:
         # Real-time cache of genuine exchange BBOs: sym -> (bid, ask, bid_qty, ask_qty)
         self.real_leader_bbo: Dict[str, Tuple[float, float, float, float]] = {}
         self.real_follower_bbo: Dict[str, Tuple[float, float, float, float]] = {}
+        self.real_leader_ts: Dict[str, float] = {}
+        self.real_follower_ts: Dict[str, float] = {}
+        # Cached 15m/1H Bollinger Band Width (BBW) & VCP squeeze metrics: (sym, timeframe) -> dict
+        self.bbw_cache: Dict[Tuple[str, str], dict] = {}
 
         # Telemetry per exchange
         self.exchange_health: Dict[str, dict] = {
             "binanceusdm": {"ping_ms": 14.2, "status": "CONNECTING", "msg_rate_sec": 0, "mode": "BookTicker+AggTrade"},
-            "okx": {"ping_ms": 18.6, "status": "CONNECTING", "msg_rate_sec": 0, "mode": "BBO-TBT+Tickers"},
+            "okx": {"ping_ms": 18.6, "status": "CONNECTING", "msg_rate_sec": 0, "mode": "BBO-TBT"},
             "bybit": {"ping_ms": 22.1, "status": "STANDBY", "msg_rate_sec": 0, "mode": "Orderbook.1"},
             "gate": {"ping_ms": 29.4, "status": "STANDBY", "msg_rate_sec": 0, "mode": "Futures.BookTicker"},
             "bitget": {"ping_ms": 26.8, "status": "STANDBY", "msg_rate_sec": 0, "mode": "Books1"},
@@ -168,17 +212,166 @@ class MarketDataGateway:
         self._tasks: List[asyncio.Task] = []
         self._running = False
         self._resubscribe_flag = False
+        self._symbols_version: int = 0
         self._msg_counts: Dict[str, int] = {"binanceusdm": 0, "okx": 0}
+        self._last_binance_ws_mono: float = 0.0
+        self._last_okx_ws_mono: float = 0.0
+        self._bbw_refresh_in_progress: set[Tuple[str, str]] = set()
 
         # Simulator state per symbol
         self._sim_mid: Dict[str, float] = {}
         self._sim_basis_ratio: Dict[str, float] = {}
         self._active_pulses: Dict[str, dict] = {}
         self._last_auto_pulse_mono: float = mono_ms()
+        self._last_sim_demand_mono: float = mono_ms()
+
+    def touch_simulator_demand(self):
+        self._last_sim_demand_mono = mono_ms()
+
+    @property
+    def feed_mode(self) -> str:
+        return self._feed_mode
+
+    @feed_mode.setter
+    def feed_mode(self, mode: str):
+        self._feed_mode = mode
+        if "__default__" in self._subscribers:
+            self._subscribers["__default__"]["mode"] = mode
+
+    def register_subscriber(
+        self,
+        sub_id: str,
+        on_leader_bbo: Optional[Callable[[str, float, float, float, float], None]] = None,
+        on_leader_trade: Optional[Callable[[str, str, float, float], None]] = None,
+        on_follower_bbo: Optional[Callable[[str, float, float, float, float], None]] = None,
+        on_log: Optional[Callable[[str, str, str], None]] = None,
+        mode: str = "SIMULATOR",
+        symbols: Optional[List[str]] = None,
+    ):
+        self._subscribers[sub_id] = {
+            "mode": mode,
+            "symbols": set(symbols) if symbols is not None else None,
+            "on_leader_bbo": on_leader_bbo,
+            "on_leader_trade": on_leader_trade,
+            "on_follower_bbo": on_follower_bbo,
+            "on_log": on_log,
+        }
+        if symbols:
+            self._merge_symbols(symbols)
+
+    def unregister_subscriber(self, sub_id: str):
+        self._subscribers.pop(sub_id, None)
+        self._recompute_symbol_union()
+
+    def set_subscriber_mode(self, sub_id: str, mode: str):
+        sub = self._subscribers.get(sub_id)
+        if sub:
+            sub["mode"] = mode
+
+    def set_subscriber_symbols(self, sub_id: str, symbols: List[str]):
+        sub = self._subscribers.get(sub_id)
+        if sub:
+            sub["symbols"] = set(symbols)
+        self._recompute_symbol_union()
+
+    def _merge_symbols(self, symbols: List[str]):
+        added = [s for s in symbols if s not in self.symbols]
+        if added:
+            self.symbols = list(dict.fromkeys(self.symbols + added))
+            self._symbols_version += 1
+            for sym in added:
+                if sym not in self._sim_mid:
+                    self._sim_mid[sym] = get_default_base_price(sym)
+                    self._sim_basis_ratio[sym] = random.uniform(-0.00045, 0.00045)
+            self._resubscribe_flag = True
+            for sym in added:
+                self.prime_symbol_immediately(sym)
+
+    def _recompute_symbol_union(self):
+        has_scoped = any(sub.get("symbols") is not None for sub in self._subscribers.values())
+        if not has_scoped:
+            return
+        union: List[str] = []
+        seen = set()
+        for sub in self._subscribers.values():
+            syms = sub.get("symbols")
+            if syms:
+                for s in syms:
+                    if s not in seen:
+                        seen.add(s)
+                        union.append(s)
+        if union:
+            self.set_symbols(union)
+
+    def _has_mode_subscriber(self, mode: str) -> bool:
+        if mode == "REAL_WS" and self._feed_mode != "SIMULATOR":
+            return True
+        if mode == "SIMULATOR" and self._feed_mode == "SIMULATOR" and "__default__" in self._subscribers:
+            return True
+        return any(sub.get("mode") == mode for sub in self._subscribers.values())
+
+    def _dispatch_leader_bbo(self, source_mode: str, sym: str, bid: float, ask: float, bid_q: float, ask_q: float):
+        for sub in list(self._subscribers.values()):
+            if sub.get("mode") != source_mode:
+                continue
+            syms = sub.get("symbols")
+            if syms is not None and sym not in syms:
+                continue
+            cb = sub.get("on_leader_bbo")
+            if cb:
+                try:
+                    cb(sym, bid, ask, bid_q, ask_q)
+                except Exception:
+                    pass
+
+    def _dispatch_leader_trade(self, source_mode: str, sym: str, side: str, px: float, qty: float):
+        for sub in list(self._subscribers.values()):
+            if sub.get("mode") != source_mode:
+                continue
+            syms = sub.get("symbols")
+            if syms is not None and sym not in syms:
+                continue
+            cb = sub.get("on_leader_trade")
+            if cb:
+                try:
+                    cb(sym, side, px, qty)
+                except Exception:
+                    pass
+
+    def _dispatch_follower_bbo(self, source_mode: str, sym: str, bid: float, ask: float, bid_q: float, ask_q: float):
+        for sub in list(self._subscribers.values()):
+            if sub.get("mode") != source_mode:
+                continue
+            syms = sub.get("symbols")
+            if syms is not None and sym not in syms:
+                continue
+            cb = sub.get("on_follower_bbo")
+            if cb:
+                try:
+                    cb(sym, bid, ask, bid_q, ask_q)
+                except Exception:
+                    pass
+
+    def _dispatch_log(self, level: str, sym: str, msg: str, target_mode: Optional[str] = None):
+        for sub in list(self._subscribers.values()):
+            if target_mode and sub.get("mode") != target_mode:
+                continue
+            syms = sub.get("symbols")
+            if syms is not None and sym and sym not in syms:
+                continue
+            cb = sub.get("on_log")
+            if cb:
+                try:
+                    cb(level, sym, msg)
+                except Exception:
+                    pass
 
     def set_symbols(self, symbols: List[str]):
-        added = [s for s in symbols if s not in self.symbols]
-        self.symbols = list(symbols)
+        new_syms = sorted(dict.fromkeys(symbols))
+        added = [s for s in new_syms if s not in self.symbols]
+        if set(new_syms) != set(self.symbols):
+            self.symbols = new_syms
+            self._symbols_version += 1
         for sym in self.symbols:
             if sym not in self._sim_mid:
                 self._sim_mid[sym] = get_default_base_price(sym)
@@ -190,29 +383,98 @@ class MarketDataGateway:
 
     def prime_symbol_immediately(self, sym: str):
         """
-        Immediately pushes initial aligned BBO ticks for `sym` based on current feed_mode:
-        - In REAL_WS (Live mode): uses genuine Binance & OKX BBOs if cached, otherwise triggers async REST fetch.
-        - In SIMULATOR (Shadow mode): uses simulated base price.
+        Immediately pushes initial aligned BBO ticks for `sym` based on subscriber modes:
+        - REAL_WS subscribers receive genuine Binance & OKX BBOs if cached (else async REST snapshot).
+        - SIMULATOR subscribers receive simulated base prices.
         """
-        if self.feed_mode == "REAL_WS":
+        if self._has_mode_subscriber("REAL_WS"):
             l_bbo = self.real_leader_bbo.get(sym)
             f_bbo = self.real_follower_bbo.get(sym)
             if l_bbo and f_bbo:
-                self._on_follower_bbo(sym, f_bbo[0], f_bbo[1], f_bbo[2], f_bbo[3])
-                self._on_leader_bbo(sym, l_bbo[0], l_bbo[1], l_bbo[2], l_bbo[3])
-                return
-            if self._running:
+                self._dispatch_follower_bbo("REAL_WS", sym, f_bbo[0], f_bbo[1], f_bbo[2], f_bbo[3])
+                self._dispatch_leader_bbo("REAL_WS", sym, l_bbo[0], l_bbo[1], l_bbo[2], l_bbo[3])
+            elif self._running:
                 asyncio.create_task(self.fetch_real_bbo_snapshot([sym], emit_immediately=True))
-            return
 
-        base_mid = self._sim_mid.get(sym, get_default_base_price(sym))
-        self._sim_mid[sym] = base_mid
-        basis_ratio = self._sim_basis_ratio.get(sym, -0.00035)
-        half_spread = base_mid * 0.00015
-        f_mid = base_mid * math.exp(-basis_ratio)
+        if self._has_mode_subscriber("SIMULATOR"):
+            base_mid = self._sim_mid.get(sym, get_default_base_price(sym))
+            self._sim_mid[sym] = base_mid
+            basis_ratio = self._sim_basis_ratio.get(sym, -0.00035)
+            half_spread = base_mid * 0.00015
+            f_mid = base_mid * math.exp(-basis_ratio)
+            self._dispatch_follower_bbo("SIMULATOR", sym, f_mid - half_spread * 1.1, f_mid + half_spread * 1.1, 1800.0, 1800.0)
+            self._dispatch_leader_bbo("SIMULATOR", sym, base_mid - half_spread, base_mid + half_spread, 2400.0, 2400.0)
 
-        self._on_follower_bbo(sym, f_mid - half_spread * 1.1, f_mid + half_spread * 1.1, 1800.0, 1800.0)
-        self._on_leader_bbo(sym, base_mid - half_spread, base_mid + half_spread, 2400.0, 2400.0)
+    def get_okx_instrument_spec(self, sym_or_inst: str) -> Optional[dict]:
+        return get_okx_instrument_spec(sym_or_inst)
+
+    def get_binance_instrument_spec(self, sym: str) -> Optional[dict]:
+        return get_binance_instrument_spec(sym)
+
+    async def fetch_exchange_instruments(self, force: bool = False) -> bool:
+        """
+        Fetches authoritative SWAP specs from OKX (`/api/v5/public/instruments?instType=SWAP`)
+        and Binance USDM (`/fapi/v1/exchangeInfo`) and caches ctVal/lotSz/minSz/tickSz globally.
+        """
+        global _INSTRUMENTS_LAST_FETCH_MONO
+        now = mono_ms()
+        if not force and _OKX_INSTRUMENT_CACHE and _BINANCE_INSTRUMENT_CACHE and (now - _INSTRUMENTS_LAST_FETCH_MONO < 240_000.0):
+            return True
+
+        self.proxy_url = get_system_proxy()
+        ok = False
+        try:
+            async with httpx.AsyncClient(proxy=self.proxy_url, timeout=8.0) as client:
+                okx_task = client.get("https://www.okx.com/api/v5/public/instruments?instType=SWAP")
+                bn_task = client.get("https://fapi.binance.com/fapi/v1/exchangeInfo")
+                okx_resp, bn_resp = await asyncio.gather(okx_task, bn_task, return_exceptions=True)
+
+                if isinstance(okx_resp, httpx.Response) and okx_resp.status_code == 200:
+                    for r in okx_resp.json().get("data", []):
+                        inst_id = r.get("instId", "")
+                        if not inst_id.endswith("-USDT-SWAP"):
+                            continue
+                        _OKX_INSTRUMENT_CACHE[inst_id] = {
+                            "instId": inst_id,
+                            "unified_sym": okx_inst_id_to_unified(inst_id),
+                            "state": str(r.get("state", "")),
+                            "ctVal": float(r.get("ctVal") or 1.0),
+                            "ctVal_str": str(r.get("ctVal") or "1"),
+                            "lotSz": float(r.get("lotSz") or 1.0),
+                            "lotSz_str": str(r.get("lotSz") or "1"),
+                            "minSz": float(r.get("minSz") or r.get("lotSz") or 1.0),
+                            "minSz_str": str(r.get("minSz") or r.get("lotSz") or "1"),
+                            "tickSz": float(r.get("tickSz") or 0.0001),
+                            "tickSz_str": str(r.get("tickSz") or "0.0001"),
+                            "maxLmtSz": float(r.get("maxLmtSz") or 0.0),
+                            "maxMktSz": float(r.get("maxMktSz") or 0.0),
+                            "maxLever": float(r.get("lever") or 50.0),
+                        }
+                    ok = True
+
+                if isinstance(bn_resp, httpx.Response) and bn_resp.status_code == 200:
+                    for s_info in bn_resp.json().get("symbols", []):
+                        raw_s = s_info.get("symbol", "")
+                        if not raw_s:
+                            continue
+                        filters = {f.get("filterType"): f for f in s_info.get("filters", [])}
+                        pf = filters.get("PRICE_FILTER", {})
+                        lf = filters.get("LOT_SIZE", {})
+                        _BINANCE_INSTRUMENT_CACHE[raw_s] = {
+                            "symbol": raw_s,
+                            "status": str(s_info.get("status", "")),
+                            "contractType": str(s_info.get("contractType", "")),
+                            "tickSize": float(pf.get("tickSize") or 0.0001),
+                            "stepSize": float(lf.get("stepSize") or 0.001),
+                            "minQty": float(lf.get("minQty") or 0.001),
+                        }
+                    ok = True
+
+                if ok:
+                    _INSTRUMENTS_LAST_FETCH_MONO = mono_ms()
+        except Exception:
+            pass
+        return ok
 
     async def fetch_real_bbo_snapshot(self, target_symbols: Optional[List[str]] = None, emit_immediately: bool = False) -> bool:
         """
@@ -237,44 +499,56 @@ class MarketDataGateway:
                 elapsed = mono_ms() - t0
 
                 if isinstance(okx_resp, httpx.Response) and okx_resp.status_code == 200:
+                    now_okx = mono_ms()
                     rows = okx_resp.json().get("data", [])
                     for r in rows:
                         inst_id = r.get("instId")
                         u_sym = okx_map.get(inst_id)
                         if u_sym and r.get("bidPx") and r.get("askPx"):
+                            # Guard: never overwrite fresh WS BBO (<= 500ms) with slower REST snapshot
+                            if now_okx - self.real_follower_ts.get(u_sym, 0.0) <= 500.0:
+                                continue
                             bid = float(r["bidPx"])
                             ask = float(r["askPx"])
-                            bid_q = float(r.get("bidSz") or 100.0)
-                            ask_q = float(r.get("askSz") or 100.0)
-                            if bid > 0 and ask > 0:
+                            spec = _OKX_INSTRUMENT_CACHE.get(inst_id)
+                            ct_val = float(spec["ctVal"]) if (spec and float(spec.get("ctVal") or 0) > 0) else 1.0
+                            bid_q = float(r.get("bidSz") or 100.0) * ct_val
+                            ask_q = float(r.get("askSz") or 100.0) * ct_val
+                            if bid > 0 and ask > 0 and ask >= bid:
                                 self.real_follower_bbo[u_sym] = (bid, ask, bid_q, ask_q)
-                                if self.feed_mode == "REAL_WS" or emit_immediately:
-                                    self._on_follower_bbo(u_sym, bid, ask, bid_q, ask_q)
+                                self.real_follower_ts[u_sym] = now_okx
+                                if emit_immediately and self._has_mode_subscriber("REAL_WS"):
+                                    self._dispatch_follower_bbo("REAL_WS", u_sym, bid, ask, bid_q, ask_q)
                                     self._msg_counts["okx"] += 1
-                    self.okx_connected = True
-                    self.exchange_health["okx"]["status"] = "LIVE_WS"
-                    self.exchange_health["okx"]["ping_ms"] = round(min(45.0, elapsed * 0.22), 1)
+                    if not self.okx_connected:
+                        self.exchange_health["okx"]["status"] = "REST_FALLBACK"
+                    self.exchange_health["okx"]["ping_ms"] = round(min(120.0, elapsed * 0.25), 1)
                     ok_any = True
 
                 if isinstance(bn_resp, httpx.Response) and bn_resp.status_code == 200:
+                    now_bn = mono_ms()
                     rows = bn_resp.json()
                     for r in rows:
                         raw_s = r.get("symbol")
                         u_sym = bn_map.get(raw_s)
                         if u_sym and r.get("bidPrice") and r.get("askPrice"):
+                            # Guard: never overwrite fresh WS BBO (<= 500ms) with slower REST snapshot
+                            if now_bn - self.real_leader_ts.get(u_sym, 0.0) <= 500.0:
+                                continue
                             div = get_binance_price_divisor(u_sym)
                             bid = float(r["bidPrice"]) / div
                             ask = float(r["askPrice"]) / div
                             bid_q = float(r.get("bidQty") or 100.0) * div
                             ask_q = float(r.get("askQty") or 100.0) * div
-                            if bid > 0 and ask > 0:
+                            if bid > 0 and ask > 0 and ask >= bid:
                                 self.real_leader_bbo[u_sym] = (bid, ask, bid_q, ask_q)
-                                if self.feed_mode == "REAL_WS" or emit_immediately:
-                                    self._on_leader_bbo(u_sym, bid, ask, bid_q, ask_q)
+                                self.real_leader_ts[u_sym] = now_bn
+                                if emit_immediately and self._has_mode_subscriber("REAL_WS"):
+                                    self._dispatch_leader_bbo("REAL_WS", u_sym, bid, ask, bid_q, ask_q)
                                     self._msg_counts["binanceusdm"] += 1
-                    self.binance_connected = True
-                    self.exchange_health["binanceusdm"]["status"] = "LIVE_WS"
-                    self.exchange_health["binanceusdm"]["ping_ms"] = round(min(38.0, elapsed * 0.18), 1)
+                    if not self.binance_connected:
+                        self.exchange_health["binanceusdm"]["status"] = "REST_FALLBACK"
+                    self.exchange_health["binanceusdm"]["ping_ms"] = round(min(120.0, elapsed * 0.22), 1)
                     ok_any = True
 
                 if ok_any:
@@ -283,14 +557,201 @@ class MarketDataGateway:
             self.last_ws_error = f"实盘行情同步异常: {type(e).__name__}"
         return ok_any
 
+    @staticmethod
+    def compute_bbw_metrics(
+        closes: List[float],
+        period: int = 20,
+        num_std: float = 2.0,
+        timeframe: str = "15m",
+    ) -> Optional[dict]:
+        """
+        Computes Bollinger Bands (SMA +/- num_std * sigma), Bollinger Band Width (BBW),
+        historical percentile rank, and Minervini VCP volatility contraction indicator.
+        """
+        vals: List[float] = []
+        for c in closes:
+            if c is None:
+                continue
+            try:
+                fc = float(c)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(fc) and fc > 0:
+                vals.append(fc)
+        if len(vals) < period + 5:
+            return None
+
+        bbw_series: List[float] = []
+        last_mid = 0.0
+        last_upper = 0.0
+        last_lower = 0.0
+
+        for idx in range(period, len(vals) + 1):
+            window = vals[idx - period : idx]
+            mid = sum(window) / period
+            if mid <= 0:
+                continue
+            var = sum((x - mid) ** 2 for x in window) / period
+            std = math.sqrt(max(0.0, var))
+            upper = mid + num_std * std
+            lower = max(1e-12, mid - num_std * std)
+            bbw = (upper - lower) / mid
+            bbw_series.append(bbw)
+            last_mid, last_upper, last_lower = mid, upper, lower
+
+        if not bbw_series or last_mid <= 0:
+            return None
+
+        curr_bbw = bbw_series[-1]
+        if curr_bbw <= 1e-9:
+            pct_rank = 0.0
+        else:
+            less = sum(1 for x in bbw_series if x < curr_bbw - 1e-12)
+            equal = sum(1 for x in bbw_series if abs(x - curr_bbw) <= 1e-12)
+            pct_rank = round(((less + 0.5 * equal) / len(bbw_series)) * 100.0, 1)
+        recent_5 = sum(bbw_series[-5:]) / min(5, len(bbw_series))
+        recent_20 = sum(bbw_series[-20:]) / min(20, len(bbw_series))
+        vcp_contraction = curr_bbw <= recent_5 * 1.05 and recent_5 < recent_20 * 0.92
+
+        return {
+            "timeframe": timeframe,
+            "bbw": round(curr_bbw, 6),
+            "bbw_pct": round(curr_bbw * 100.0, 3),
+            "bbw_percentile": pct_rank,
+            "bb_upper": last_upper,
+            "bb_middle": last_mid,
+            "bb_lower": last_lower,
+            "last_close": vals[-1],
+            "vcp_contraction": vcp_contraction,
+            "samples": len(bbw_series),
+            "updated_at_ms": int(time.time() * 1000),
+        }
+
+    def get_volatility_regime(self, symbol: str, timeframe: str = "15m") -> Optional[dict]:
+        tf = "1H" if str(timeframe or "15m").upper() == "1H" else "15m"
+        cached = self.bbw_cache.get((symbol, tf))
+        if not cached:
+            return None
+        # Reject extremely stale BBW snapshots (> 30 min old)
+        if int(time.time() * 1000) - int(cached.get("updated_at_ms") or 0) > 1_800_000:
+            return None
+        return cached
+
+    async def fetch_symbol_bbw(
+        self,
+        symbol: str,
+        timeframe: str = "15m",
+        client: Optional[httpx.AsyncClient] = None,
+        force: bool = False,
+    ) -> Optional[dict]:
+        """Fetches 15m/1H closed public candles (OKX primary, Binance fallback) with cross-tenant TTL dedup."""
+        tf = "1H" if str(timeframe or "15m").upper() == "1H" else "15m"
+        cache_key = (symbol, tf)
+        now_ms = int(time.time() * 1000)
+        cached = self.bbw_cache.get(cache_key)
+        if not force and cached and (now_ms - int(cached.get("updated_at_ms") or 0)) < 120_000:
+            return cached
+        if cache_key in self._bbw_refresh_in_progress:
+            return cached
+        self._bbw_refresh_in_progress.add(cache_key)
+
+        okx_bar = "1H" if tf == "1H" else "15m"
+        bn_interval = "1h" if tf == "1H" else "15m"
+        proxy = get_system_proxy()
+        own_client = client is None
+        http_client = client or httpx.AsyncClient(proxy=proxy, timeout=6.0)
+        closes: List[float] = []
+        try:
+            inst_id = to_okx_inst_id(symbol)
+            try:
+                resp = await http_client.get(
+                    f"https://www.okx.com/api/v5/market/candles?instId={inst_id}&bar={okx_bar}&limit=100"
+                )
+                if resp.status_code == 200:
+                    rows = resp.json().get("data", [])
+                    if len(rows) >= 25:
+                        # Drop unclosed forming candle (confirm == "0") to prevent repainting; reverse to oldest->newest
+                        closed_rows = [r for r in rows if len(r) >= 5 and (len(r) < 9 or str(r[8]) != "0")]
+                        if len(closed_rows) < 25:
+                            closed_rows = rows
+                        parsed = []
+                        for r in reversed(closed_rows):
+                            try:
+                                c = float(r[4])
+                                if math.isfinite(c) and c > 0:
+                                    parsed.append(c)
+                            except (TypeError, ValueError):
+                                continue
+                        closes = parsed
+                elif resp.status_code == 429:
+                    await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+            if len(closes) < 25:
+                try:
+                    bn_sym = to_binance_stream_sym(symbol).upper()
+                    div = get_binance_price_divisor(symbol)
+                    resp = await http_client.get(
+                        f"https://fapi.binance.com/fapi/v1/klines?symbol={bn_sym}&interval={bn_interval}&limit=100"
+                    )
+                    if resp.status_code == 200:
+                        rows = resp.json()
+                        if isinstance(rows, list) and len(rows) >= 25:
+                            # Exclude forming last candle when enough closed bars exist
+                            use_rows = rows[:-1] if len(rows) > 25 else rows
+                            parsed = []
+                            for r in use_rows:
+                                if len(r) < 5:
+                                    continue
+                                try:
+                                    c = float(r[4]) / div
+                                    if math.isfinite(c) and c > 0:
+                                        parsed.append(c)
+                                except (TypeError, ValueError):
+                                    continue
+                            closes = parsed
+                except Exception:
+                    pass
+        finally:
+            self._bbw_refresh_in_progress.discard(cache_key)
+            if own_client:
+                await http_client.aclose()
+
+        if len(closes) < 25:
+            return cached
+        metrics = self.compute_bbw_metrics(closes, period=20, num_std=2.0, timeframe=tf)
+        if metrics:
+            self.bbw_cache[cache_key] = metrics
+        return metrics
+
+    async def refresh_volatility_regime(self, pairs: List[Tuple[str, str]]) -> int:
+        """Staggered low-load refresh of 15m/1H BBW squeeze metrics for Adaptive/Trend grid symbols."""
+        uniq_pairs = list(dict.fromkeys((s, "1H" if str(tf).upper() == "1H" else "15m") for s, tf in pairs))
+        if not uniq_pairs:
+            return 0
+        updated = 0
+        proxy = get_system_proxy()
+        try:
+            async with httpx.AsyncClient(proxy=proxy, timeout=6.0) as client:
+                for sym, tf in uniq_pairs:
+                    res = await self.fetch_symbol_bbw(sym, tf, client=client)
+                    if res:
+                        updated += 1
+                    await asyncio.sleep(0.06)
+        except Exception:
+            pass
+        return updated
+
     async def start(self):
         if self._running:
             return
         self._running = True
         for sym in self.symbols:
             self.prime_symbol_immediately(sym)
-        # Warm up real BBO cache in background immediately on startup
-        asyncio.create_task(self.fetch_real_bbo_snapshot(emit_immediately=(self.feed_mode == "REAL_WS")))
+        # Warm up instrument specs & real BBO cache in background immediately on startup
+        asyncio.create_task(self.fetch_exchange_instruments())
+        asyncio.create_task(self.fetch_real_bbo_snapshot(emit_immediately=self._has_mode_subscriber("REAL_WS")))
         self._tasks = [
             asyncio.create_task(self._simulator_loop()),
             asyncio.create_task(self._binance_ws_loop()),
@@ -306,6 +767,7 @@ class MarketDataGateway:
         self._tasks.clear()
 
     def inject_pulse(self, req: PulseInjectionRequest):
+        self.touch_simulator_demand()
         sym = req.symbol
         if sym not in self._sim_mid:
             self._sim_mid[sym] = get_default_base_price(sym)
@@ -321,10 +783,11 @@ class MarketDataGateway:
             "pre_jump_mid": base_px,
             "leader_peaked": False,
         }
-        self._on_log(
+        self._dispatch_log(
             "INFO",
             sym,
             f"[脉冲测试注入] {sym} 触发 {'做多拉升' if req.side == 'LONG' else '做空下挫'} ({signed_jump*100:+.2f}%) | 预设路径: {req.follower_scenario}",
+            target_mode="SIMULATOR",
         )
 
     async def _binance_ws_loop(self):
@@ -335,13 +798,19 @@ class MarketDataGateway:
                 continue
 
             self._resubscribe_flag = False
+            sym_ver = self._symbols_version
             self.proxy_url = get_system_proxy()
             sym_map = {to_binance_stream_sym(s).upper(): s for s in self.symbols}
             streams = []
             for s in self.symbols:
                 raw = to_binance_stream_sym(s)
+                if _BINANCE_INSTRUMENT_CACHE and raw.upper() not in _BINANCE_INSTRUMENT_CACHE:
+                    continue
                 streams.append(f"{raw}@bookTicker")
                 streams.append(f"{raw}@aggTrade")
+            if not streams:
+                await asyncio.sleep(1.0)
+                continue
             url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
 
             try:
@@ -351,13 +820,15 @@ class MarketDataGateway:
                     conn_kwargs["proxy"] = self.proxy_url
                 async with websockets.connect(url, **conn_kwargs) as ws:
                     self.binance_connected = True
+                    self._last_binance_ws_mono = mono_ms()
                     self.last_ws_error = ""
                     self.exchange_health["binanceusdm"]["ping_ms"] = round(min(42.0, (mono_ms() - t_conn) * 0.22), 1)
                     self.exchange_health["binanceusdm"]["status"] = "LIVE_WS"
 
                     async for raw_msg in ws:
-                        if not self._running or self._resubscribe_flag:
+                        if not self._running or sym_ver != self._symbols_version:
                             break
+                        self._last_binance_ws_mono = mono_ms()
                         data = orjson.loads(raw_msg).get("data")
                         if not data:
                             continue
@@ -373,30 +844,34 @@ class MarketDataGateway:
                             ask = float(data["a"]) / div
                             bid_q = float(data["B"]) * div
                             ask_q = float(data["A"]) * div
-                            self.real_leader_bbo[unified_sym] = (bid, ask, bid_q, ask_q)
-                            if self.feed_mode != "SIMULATOR":
-                                self._msg_counts["binanceusdm"] += 1
-                                self._on_leader_bbo(unified_sym, bid, ask, bid_q, ask_q)
+                            if bid > 0 and ask > 0 and ask >= bid:
+                                self.real_leader_bbo[unified_sym] = (bid, ask, bid_q, ask_q)
+                                self.real_leader_ts[unified_sym] = self._last_binance_ws_mono
+                                if self._has_mode_subscriber("REAL_WS"):
+                                    self._msg_counts["binanceusdm"] += 1
+                                    self._dispatch_leader_bbo("REAL_WS", unified_sym, bid, ask, bid_q, ask_q)
                         elif event_type == "aggTrade":
-                            if self.feed_mode != "SIMULATOR":
+                            if self._has_mode_subscriber("REAL_WS"):
                                 div = get_binance_price_divisor(unified_sym)
                                 px = float(data["p"]) / div
                                 qty = float(data["q"]) * div
-                                side = "sell" if data.get("m") else "buy"
-                                self._on_leader_trade(unified_sym, side, px, qty)
+                                if px > 0 and qty > 0:
+                                    side = "sell" if data.get("m") else "buy"
+                                    self._dispatch_leader_trade("REAL_WS", unified_sym, side, px, qty)
             except Exception as e:
-                if not self.real_leader_bbo:
-                    self.binance_connected = False
-                    self.last_ws_error = f"Binance WS 重连中 ({type(e).__name__})"
+                self.binance_connected = False
+                self.exchange_health["binanceusdm"]["status"] = "RECONNECTING"
+                self.last_ws_error = f"Binance WS 重连中 ({type(e).__name__})"
                 await asyncio.sleep(2.0)
 
     async def _okx_ws_loop(self):
-        """Native WebSocket client for OKX V5 Swap (`bbo-tbt` + `tickers`) on port 443 with auto proxy."""
+        """Native WebSocket client for OKX V5 Swap (`bbo-tbt` only, avoiding slow `tickers` overwrite)."""
         while self._running:
             if not self.symbols:
                 await asyncio.sleep(0.5)
                 continue
 
+            sym_ver = self._symbols_version
             self.proxy_url = get_system_proxy()
             inst_map = {to_okx_inst_id(s): s for s in self.symbols}
             url = "wss://ws.okx.com/ws/v5/public"
@@ -406,19 +881,30 @@ class MarketDataGateway:
                 if self.proxy_url:
                     conn_kwargs["proxy"] = self.proxy_url
                 async with websockets.connect(url, **conn_kwargs) as ws:
-                    sub_args = []
-                    for inst in inst_map.keys():
-                        sub_args.append({"channel": "bbo-tbt", "instId": inst})
-                        sub_args.append({"channel": "tickers", "instId": inst})
-                    await ws.send(orjson.dumps({"op": "subscribe", "args": sub_args}).decode("utf-8"))
+                    # Batch subscribe frames (<= 40 per frame) to avoid OKX frame limits
+                    all_args = [{"channel": "bbo-tbt", "instId": inst} for inst in inst_map.keys()]
+                    for i in range(0, len(all_args), 40):
+                        await ws.send(orjson.dumps({"op": "subscribe", "args": all_args[i : i + 40]}).decode("utf-8"))
                     self.okx_connected = True
+                    self._last_okx_ws_mono = mono_ms()
                     self.exchange_health["okx"]["ping_ms"] = round(min(45.0, (mono_ms() - t_conn) * 0.25), 1)
                     self.exchange_health["okx"]["status"] = "LIVE_WS"
 
-                    async for raw_msg in ws:
-                        if not self._running or self._resubscribe_flag:
-                            break
-                        payload = orjson.loads(raw_msg)
+                    while self._running and sym_ver == self._symbols_version:
+                        try:
+                            raw_msg = await asyncio.wait_for(ws.recv(), timeout=20.0)
+                        except asyncio.TimeoutError:
+                            # OKX V5 requires application-level text "ping" on idle sockets (< 30s)
+                            await ws.send("ping")
+                            continue
+
+                        self._last_okx_ws_mono = mono_ms()
+                        if raw_msg == "pong" or raw_msg == b"pong":
+                            continue
+                        try:
+                            payload = orjson.loads(raw_msg)
+                        except Exception:
+                            continue
                         rows = payload.get("data")
                         if not rows:
                             continue
@@ -429,58 +915,104 @@ class MarketDataGateway:
                         row = rows[0]
                         bid, ask, bid_q, ask_q = 0.0, 0.0, 0.0, 0.0
                         if "bids" in row and "asks" in row and row["bids"] and row["asks"]:
+                            spec = _OKX_INSTRUMENT_CACHE.get(inst_id)
+                            ct_val = float(spec["ctVal"]) if (spec and float(spec.get("ctVal") or 0) > 0) else 1.0
                             bid = float(row["bids"][0][0])
-                            bid_q = float(row["bids"][0][1])
+                            bid_q = float(row["bids"][0][1]) * ct_val
                             ask = float(row["asks"][0][0])
-                            ask_q = float(row["asks"][0][1])
-                        elif row.get("bidPx") and row.get("askPx"):
-                            bid = float(row["bidPx"])
-                            ask = float(row["askPx"])
-                            bid_q = float(row.get("bidSz") or 100.0)
-                            ask_q = float(row.get("askSz") or 100.0)
+                            ask_q = float(row["asks"][0][1]) * ct_val
 
-                        if bid > 0 and ask > 0:
+                        if bid > 0 and ask > 0 and ask >= bid:
                             self.real_follower_bbo[unified_sym] = (bid, ask, bid_q, ask_q)
-                            if self.feed_mode != "SIMULATOR":
+                            self.real_follower_ts[unified_sym] = self._last_okx_ws_mono
+                            if self._has_mode_subscriber("REAL_WS"):
                                 self._msg_counts["okx"] += 1
-                                self._on_follower_bbo(unified_sym, bid, ask, bid_q, ask_q)
+                                self._dispatch_follower_bbo("REAL_WS", unified_sym, bid, ask, bid_q, ask_q)
             except Exception as e:
-                if not self.real_follower_bbo:
-                    self.okx_connected = False
-                    if not self.last_ws_error:
-                        self.last_ws_error = f"OKX WS 重连中 ({type(e).__name__})"
+                self.okx_connected = False
+                self.exchange_health["okx"]["status"] = "RECONNECTING"
+                if not self.last_ws_error:
+                    self.last_ws_error = f"OKX WS 重连中 ({type(e).__name__})"
                 await asyncio.sleep(2.0)
 
     async def _real_rest_heartbeat_loop(self):
         """
-        Periodically refreshes genuine BBOs from Binance & OKX REST APIs so that:
-        1. In LIVE mode (`feed_mode != 'SIMULATOR'`), even quiet contracts keep fresh (<200ms) book timestamps.
-        2. In SHADOW mode, `real_leader_bbo` and `real_follower_bbo` remain warm for instant 0ms mode switching.
+        Bandwidth-optimized BBO freshness & REST fallback loop:
+        1. Only re-stamps quiet contracts in memory when the exchange's own WebSocket
+           actually received a live frame/pong within the last 5s (prevents stale-feed masking!).
+        2. Fast-retries `fetch_exchange_instruments()` every 5s when cache is empty, else every 300s.
         """
+        last_rest_fetch_mono = mono_ms()
+        last_inst_fetch_mono = mono_ms()
         while self._running:
-            interval = 0.35 if self.feed_mode != "SIMULATOR" else 3.0
-            await asyncio.sleep(interval)
-            if not self.symbols:
-                continue
-            await self.fetch_real_bbo_snapshot(emit_immediately=(self.feed_mode != "SIMULATOR"))
+            now = mono_ms()
+            okx_ws_fresh = self.okx_connected and (now - self._last_okx_ws_mono < 5000.0)
+            bn_ws_fresh = self.binance_connected and (now - self._last_binance_ws_mono < 5000.0)
+            ws_healthy = okx_ws_fresh and bn_ws_fresh
+            has_real = self._has_mode_subscriber("REAL_WS")
+
+            inst_retry_ms = 5_000.0 if not _OKX_INSTRUMENT_CACHE else 300_000.0
+            if now - last_inst_fetch_mono >= inst_retry_ms:
+                last_inst_fetch_mono = now
+                asyncio.create_task(self.fetch_exchange_instruments())
+
+            if has_real:
+                await asyncio.sleep(0.35)
+                if not self.symbols:
+                    continue
+                now = mono_ms()
+                okx_ws_fresh = self.okx_connected and (now - self._last_okx_ws_mono < 5000.0)
+                bn_ws_fresh = self.binance_connected and (now - self._last_binance_ws_mono < 5000.0)
+                ws_healthy = okx_ws_fresh and bn_ws_fresh
+                rest_interval_ms = 12000.0 if ws_healthy else 1200.0
+                if now - last_rest_fetch_mono >= rest_interval_ms:
+                    last_rest_fetch_mono = now
+                    await self.fetch_real_bbo_snapshot(emit_immediately=True)
+                else:
+                    # Only keep quiet contracts fresh when that exchange's WS socket is genuinely alive!
+                    for sym in list(self.symbols):
+                        if okx_ws_fresh and now - self.real_follower_ts.get(sym, 0.0) > 300.0:
+                            f_bbo = self.real_follower_bbo.get(sym)
+                            if f_bbo:
+                                self._dispatch_follower_bbo("REAL_WS", sym, f_bbo[0], f_bbo[1], f_bbo[2], f_bbo[3])
+                        if bn_ws_fresh and now - self.real_leader_ts.get(sym, 0.0) > 300.0:
+                            l_bbo = self.real_leader_bbo.get(sym)
+                            if l_bbo:
+                                self._dispatch_leader_bbo("REAL_WS", sym, l_bbo[0], l_bbo[1], l_bbo[2], l_bbo[3])
+            else:
+                sleep_sec = 30.0 if ws_healthy else 5.0
+                await asyncio.sleep(sleep_sec)
+                if not self.symbols:
+                    continue
+                last_rest_fetch_mono = mono_ms()
+                await self.fetch_real_bbo_snapshot(emit_immediately=False)
 
     async def _simulator_loop(self):
         """
-        High-frequency (20ms tick interval) Lead-Lag market simulator for SHADOW mode.
-        When `self.feed_mode != "SIMULATOR"` (e.g. in LIVE mode), the simulator NEVER emits
-        synthetic ticks or synthetic pulses, guaranteeing 100% real exchange prices in LIVE mode!
+        High-frequency (20ms tick interval) Lead-Lag market simulator for SIMULATOR subscribers.
+        Dispatches ONLY to SIMULATOR subscribers, keeping REAL_WS/LIVE engines 100% pure real data.
         """
         while self._running:
             now = mono_ms()
-            if self.feed_mode != "SIMULATOR":
-                if self.binance_connected and self.okx_connected:
-                    self.active_source = "LIVE_WS"
-                else:
-                    self.active_source = "LIVE_WS_WAITING"
+            has_sim = self._has_mode_subscriber("SIMULATOR")
+            has_real = self._has_mode_subscriber("REAL_WS")
+            if has_real:
+                self.active_source = "LIVE_WS" if (self.binance_connected and self.okx_connected) else "LIVE_WS_WAITING"
+            else:
+                self.active_source = "HIGH_FREQ_SIM"
+
+            if not has_sim:
                 await asyncio.sleep(0.05)
                 continue
 
-            self.active_source = "HIGH_FREQ_SIM"
+            # Auto-idle simulator when no guest has connected for >45s and no pulse is active
+            if (
+                not self._active_pulses
+                and "__default__" not in self._subscribers
+                and (now - self._last_sim_demand_mono > 45_000.0)
+            ):
+                await asyncio.sleep(0.5)
+                continue
 
             # Periodically generate an organic Lead-Lag pulse every ~9-14 seconds in simulator mode
             if self.symbols and (now - self._last_auto_pulse_mono > random.uniform(8500, 13500)):
@@ -523,12 +1055,12 @@ class MarketDataGateway:
                     l_bid, l_ask = l_mid - half_spread, l_mid + half_spread
                     f_bid, f_ask = f_mid - half_spread * 1.1, f_mid + half_spread * 1.1
 
-                    self._on_follower_bbo(sym, f_bid, f_ask, random.uniform(800, 2500), random.uniform(800, 2500))
-                    self._on_leader_bbo(sym, l_bid, l_ask, random.uniform(1200, 4000), random.uniform(1200, 4000))
+                    self._dispatch_follower_bbo("SIMULATOR", sym, f_bid, f_ask, random.uniform(800, 2500), random.uniform(800, 2500))
+                    self._dispatch_leader_bbo("SIMULATOR", sym, l_bid, l_ask, random.uniform(1200, 4000), random.uniform(1200, 4000))
 
                     if abs(drift) > 0 and random.random() < 0.4:
                         tr_side = "buy" if drift >= 0 else "sell"
-                        self._on_leader_trade(sym, tr_side, l_mid, random.uniform(60, 280) / l_mid)
+                        self._dispatch_leader_trade("SIMULATOR", sym, tr_side, l_mid, random.uniform(60, 280) / l_mid)
                 else:
                     elapsed = now - pulse["start_mono"]
                     pre_mid = pulse["pre_jump_mid"]
@@ -542,7 +1074,8 @@ class MarketDataGateway:
                         f_mid = pre_mid * math.exp(-basis_ratio)
                         l_bid_q = 6500.0 if is_long else 400.0
                         l_ask_q = 400.0 if is_long else 6500.0
-                        self._on_leader_trade(
+                        self._dispatch_leader_trade(
+                            "SIMULATOR",
                             sym,
                             "buy" if is_long else "sell",
                             l_mid,
@@ -572,10 +1105,11 @@ class MarketDataGateway:
 
                     l_bid, l_ask = l_mid - half_spread, l_mid + half_spread
                     f_bid, f_ask = f_mid - half_spread * 1.1, f_mid + half_spread * 1.1
-                    self._on_follower_bbo(sym, f_bid, f_ask, 2200.0, 2200.0)
-                    self._on_leader_bbo(sym, l_bid, l_ask, l_bid_q, l_ask_q)
-                    self._msg_counts["binanceusdm"] += 1
-                    self._msg_counts["okx"] += 1
+                    self._dispatch_follower_bbo("SIMULATOR", sym, f_bid, f_ask, 2200.0, 2200.0)
+                    self._dispatch_leader_bbo("SIMULATOR", sym, l_bid, l_ask, l_bid_q, l_ask_q)
+                    if not has_real:
+                        self._msg_counts["binanceusdm"] += 1
+                        self._msg_counts["okx"] += 1
 
             await asyncio.sleep(0.020)
 
@@ -587,7 +1121,7 @@ class MarketDataGateway:
                 self._msg_counts[ex_id] = 0
                 self.exchange_health[ex_id]["msg_rate_sec"] = cnt
                 is_conn = self.binance_connected if ex_id == "binanceusdm" else self.okx_connected
-                if not is_conn and self.feed_mode != "SIMULATOR":
+                if not is_conn and self._has_mode_subscriber("REAL_WS"):
                     self.exchange_health[ex_id]["ping_ms"] = 0.0
                     self.exchange_health[ex_id]["status"] = "RECONNECTING"
                 else:

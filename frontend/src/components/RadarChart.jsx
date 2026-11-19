@@ -1,16 +1,23 @@
 import React, { useMemo, useState } from 'react';
+import { getChartPointIndex, useContainerChartSize } from '../utils/useContainerChartSize';
 
 export default function RadarChart({ symbol, series = [], telemetry = {}, strategy = {}, theme = 'light' }) {
   const [hoverIdx, setHoverIdx] = useState(null);
+  const pricePrec = Math.min(12, Math.max(0, Math.round(Number(strategy?.price_precision ?? 4) || 4)));
 
-  const width = 880;
-  const height = 245;
-  const padLeft = 70;
-  const padRight = 20;
-  const padTop = 18;
-  const padBottom = 26;
-  const plotW = width - padLeft - padRight;
-  const plotH = height - padTop - padBottom;
+  const { containerRef, width, height, isCompact } = useContainerChartSize({
+    defaultWidth: 880,
+    mobileHeight: 205,
+    tabletHeight: 225,
+    desktopHeight: 245,
+  });
+
+  const padLeft = pricePrec >= 6 ? (isCompact ? 64 : 76) : isCompact ? 50 : 68;
+  const padRight = isCompact ? 10 : 20;
+  const padTop = 16;
+  const padBottom = isCompact ? 18 : 24;
+  const plotW = Math.max(120, width - padLeft - padRight);
+  const plotH = Math.max(80, height - padTop - padBottom);
 
   const isLight = theme === 'light';
   const gridStroke = isLight ? '#e2e8f0' : '#1e293b';
@@ -56,29 +63,48 @@ export default function RadarChart({ symbol, series = [], telemetry = {}, strate
       };
     }
 
-    const span = Math.max(maxVal - minVal, maxVal * 0.00055, 1e-6);
+    const span = Math.max(maxVal - minVal, maxVal * 0.0004, 1e-12);
     const lo = minVal - span * 0.22;
     const hi = maxVal + span * 0.22;
+    const denom = Math.max(hi - lo, 1e-12);
+    const changeEps = Math.max(maxVal * 1e-7, 1e-12);
 
-    const toX = (i) => padLeft + (i / (series.length - 1)) * plotW;
-    const toY = (v) => padTop + (1 - (v - lo) / (hi - lo)) * plotH;
+    const validSeries = series.filter((pt) => {
+      const l = Number(pt?.leader_calibrated || pt?.leader_mid || 0);
+      const f = Number(pt?.follower_mid || 0);
+      return Number.isFinite(l) && Number.isFinite(f) && l > 0 && f > 0;
+    });
+    if (validSeries.length < 2) {
+      return {
+        leaderStepPath: '',
+        followerStepPath: '',
+        stepAreaPath: '',
+        minP: lo,
+        maxP: hi,
+        latest: series[series.length - 1] || null,
+        coordList: [],
+      };
+    }
+
+    const toX = (i) => padLeft + (i / (validSeries.length - 1)) * plotW;
+    const toY = (v) => padTop + (1 - (v - lo) / denom) * plotH;
 
     const pts = [];
-    for (let i = 0; i < series.length; i++) {
-      const l = Number(series[i].leader_calibrated || series[i].leader_mid);
-      const f = Number(series[i].follower_mid);
+    for (let i = 0; i < validSeries.length; i++) {
+      const l = Number(validSeries[i].leader_calibrated || validSeries[i].leader_mid);
+      const f = Number(validSeries[i].follower_mid);
       const x = toX(i);
       const yl = toY(l);
       const yf = toY(f);
-      const prevL = i > 0 ? Number(series[i - 1].leader_calibrated || series[i - 1].leader_mid) : l;
-      const prevF = i > 0 ? Number(series[i - 1].follower_mid) : f;
+      const prevL = i > 0 ? Number(validSeries[i - 1].leader_calibrated || validSeries[i - 1].leader_mid) : l;
+      const prevF = i > 0 ? Number(validSeries[i - 1].follower_mid) : f;
       pts.push({
         x,
         yl,
         yf,
-        lChanged: Math.abs(l - prevL) > 1e-9,
-        fChanged: Math.abs(f - prevF) > 1e-9,
-        raw: series[i],
+        lChanged: Math.abs(l - prevL) > changeEps,
+        fChanged: Math.abs(f - prevF) > changeEps,
+        raw: validSeries[i],
       });
     }
 
@@ -114,24 +140,35 @@ export default function RadarChart({ symbol, series = [], telemetry = {}, strate
       latest: series[series.length - 1],
       coordList: pts,
     };
-  }, [series, plotW, plotH]);
+  }, [series, plotW, plotH, padLeft, padTop]);
 
-  const pricePrec = strategy?.price_precision ?? 4;
   const activePoint =
     hoverIdx !== null && coordList[hoverIdx] ? coordList[hoverIdx] : coordList[coordList.length - 1] || null;
   const activeRaw = activePoint ? activePoint.raw : latest;
+  const refPrice = activeRaw ? Number(activeRaw.follower_mid || activeRaw.leader_calibrated || 0) : maxP;
+  const effPricePrec =
+    refPrice > 0 && refPrice < 0.0001
+      ? Math.max(pricePrec, 8)
+      : refPrice > 0 && refPrice < 0.01
+      ? Math.max(pricePrec, 6)
+      : pricePrec;
   const spreadBps = activeRaw ? Number(activeRaw.spread_bps || 0) : telemetry?.live_spread_bps ?? 0;
   const tpThresholdBps = ((strategy?.take_profit_pct ?? 0.0025) + 0.0012) * 10000;
 
+  const handleScrub = (clientX, target) => {
+    const idx = getChartPointIndex(clientX, target, width, padLeft, plotW, coordList.length);
+    if (idx !== null) setHoverIdx(idx);
+  };
+
   return (
-    <div className="surface-card p-6">
+    <div className="surface-card p-4 sm:p-6">
       {/* Chart Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3 mb-4 pb-3.5 border-b border-line">
-        <div className="flex items-center gap-2.5">
-          <span className="px-3 py-1 rounded-full text-xs font-mono font-bold surface-subtle text-main">
+      <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center sm:justify-between gap-3 mb-3.5 sm:mb-4 pb-3 border-b border-line">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="px-2.5 sm:px-3 py-1 rounded-full text-xs font-mono font-bold surface-subtle text-main">
             {symbol}
           </span>
-          <h3 className="text-base font-bold text-main">双所毫秒级对齐逐笔 Tick 阶梯曲线</h3>
+          <h3 className="text-sm sm:text-base font-bold text-main">双所毫秒级对齐逐笔 Tick 阶梯曲线</h3>
           {telemetry?.basis_frozen && (
             <span className="inline-flex items-center gap-1 px-2.5 py-0.5 text-[11px] font-semibold rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-600 dark:text-amber-400">
               脉冲期基差已锁定
@@ -140,28 +177,40 @@ export default function RadarChart({ symbol, series = [], telemetry = {}, strate
         </div>
 
         {/* Step-Line Legend & Readout */}
-        <div className="flex flex-wrap items-center gap-4 text-xs font-mono">
+        <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-x-4 gap-y-1.5 text-[11px] sm:text-xs font-mono">
           <div className="flex items-center gap-1.5">
-            <svg className="w-4 h-3" viewBox="0 0 16 10" fill="none">
-              <path d="M1 8 H8 V2 H15" stroke={leaderColor} strokeWidth="2" strokeLinecap="square" />
+            <svg className="w-4 h-3 shrink-0" viewBox="0 0 16 10" fill="none">
+              <path
+                d="M1 8 H8 V2 H15"
+                stroke={leaderColor}
+                strokeWidth="1.15"
+                vectorEffect="non-scaling-stroke"
+                strokeLinecap="butt"
+              />
             </svg>
-            <span className="text-dim">主所校准 Tick:</span>
+            <span className="text-dim">主所:</span>
             <span className="font-semibold text-main">
-              {activeRaw ? Number(activeRaw.leader_calibrated).toFixed(pricePrec) : '--'}
+              {activeRaw ? Number(activeRaw.leader_calibrated || activeRaw.leader_mid || 0).toFixed(effPricePrec) : '--'}
             </span>
           </div>
 
           <div className="flex items-center gap-1.5">
-            <svg className="w-4 h-3" viewBox="0 0 16 10" fill="none">
-              <path d="M1 8 H8 V2 H15" stroke={followerColor} strokeWidth="2" strokeLinecap="square" />
+            <svg className="w-4 h-3 shrink-0" viewBox="0 0 16 10" fill="none">
+              <path
+                d="M1 8 H8 V2 H15"
+                stroke={followerColor}
+                strokeWidth="1.05"
+                vectorEffect="non-scaling-stroke"
+                strokeLinecap="butt"
+              />
             </svg>
-            <span className="text-dim">从所盘口 Tick:</span>
+            <span className="text-dim">从所:</span>
             <span className="font-semibold text-main">
-              {activeRaw ? Number(activeRaw.follower_mid).toFixed(pricePrec) : '--'}
+              {activeRaw ? Number(activeRaw.follower_mid || 0).toFixed(effPricePrec) : '--'}
             </span>
           </div>
 
-          <div className="flex items-center gap-1.5">
+          <div className="col-span-2 sm:col-span-1 flex items-center gap-1.5">
             <span className="text-dim">滞后套利空间:</span>
             <span
               className={`font-semibold px-1.5 py-0.5 rounded border ${
@@ -177,19 +226,20 @@ export default function RadarChart({ symbol, series = [], telemetry = {}, strate
       </div>
 
       {/* Main Step-After Tick Chart */}
-      <div className="relative w-full overflow-hidden">
+      <div ref={containerRef} className="relative w-full overflow-hidden">
         <svg
           viewBox={`0 0 ${width} ${height}`}
-          className="w-full h-56 select-none cursor-crosshair"
+          style={{ height: `${height}px` }}
+          className="w-full select-none cursor-crosshair touch-pan-y"
           onMouseLeave={() => setHoverIdx(null)}
-          onMouseMove={(e) => {
-            if (!coordList.length) return;
-            const rect = e.currentTarget.getBoundingClientRect();
-            const relX = ((e.clientX - rect.left) / rect.width) * width;
-            const ratio = Math.max(0, Math.min(1, (relX - padLeft) / plotW));
-            const idx = Math.round(ratio * (coordList.length - 1));
-            setHoverIdx(idx);
+          onMouseMove={(e) => handleScrub(e.clientX, e.currentTarget)}
+          onTouchStart={(e) => {
+            if (e.touches?.[0]) handleScrub(e.touches[0].clientX, e.currentTarget);
           }}
+          onTouchMove={(e) => {
+            if (e.touches?.[0]) handleScrub(e.touches[0].clientX, e.currentTarget);
+          }}
+          onTouchEnd={() => setHoverIdx(null)}
         >
           <defs>
             <linearGradient id="hornStepSpreadFill" x1="0" y1="0" x2="0" y2="1">
@@ -210,11 +260,13 @@ export default function RadarChart({ symbol, series = [], telemetry = {}, strate
                   x2={width - padRight}
                   y2={y}
                   stroke={gridStroke}
-                  strokeDasharray="3 3"
-                  strokeWidth="1"
+                  strokeDasharray="2.5 2.5"
+                  strokeWidth="0.65"
+                  vectorEffect="non-scaling-stroke"
+                  shapeRendering="crispEdges"
                 />
                 <text x={padLeft - 8} y={y + 4} textAnchor="end" fill={axisTextFill} className="font-mono text-[10px]">
-                  {val.toFixed(pricePrec)}
+                  {val.toFixed(effPricePrec)}
                 </text>
               </g>
             );
@@ -223,39 +275,43 @@ export default function RadarChart({ symbol, series = [], telemetry = {}, strate
           {/* Shaded Step-After Lead-Lag Divergence Window */}
           {stepAreaPath && <path d={stepAreaPath} fill="url(#hornStepSpreadFill)" />}
 
-          {/* Follower Step-After Tick Path */}
+          {/* Follower Step-After Tick Path (Fine Vector Line) */}
           {followerStepPath && (
             <path
               d={followerStepPath}
               fill="none"
               stroke={followerColor}
-              strokeWidth="1.9"
+              strokeWidth="1.0"
+              vectorEffect="non-scaling-stroke"
+              shapeRendering="geometricPrecision"
               strokeLinejoin="miter"
               strokeLinecap="butt"
             />
           )}
 
-          {/* Leader Calibrated Step-After Tick Path */}
+          {/* Leader Calibrated Step-After Tick Path (Fine Vector Line) */}
           {leaderStepPath && (
             <path
               d={leaderStepPath}
               fill="none"
               stroke={leaderColor}
-              strokeWidth="2.1"
+              strokeWidth="1.15"
+              vectorEffect="non-scaling-stroke"
+              shapeRendering="geometricPrecision"
               strokeLinejoin="miter"
               strokeLinecap="butt"
             />
           )}
 
-          {/* Discrete Tick Jump Dots on Price Changes */}
+          {/* Subtle Micro Tick Jump Dots on Price Changes */}
           {coordList.map((pt, i) => (
             <g key={i}>
-              {pt.fChanged && <circle cx={pt.x} cy={pt.yf} r="1.7" fill={followerColor} />}
-              {pt.lChanged && <circle cx={pt.x} cy={pt.yl} r="1.9" fill={leaderColor} />}
+              {pt.fChanged && <circle cx={pt.x} cy={pt.yf} r="0.95" fill={followerColor} />}
+              {pt.lChanged && <circle cx={pt.x} cy={pt.yl} r="1.05" fill={leaderColor} />}
             </g>
           ))}
 
-          {/* Interactive Crosshair & Endpoint Markers */}
+          {/* Interactive Crosshair & Fine Endpoint Markers */}
           {activePoint && (
             <g>
               <line
@@ -265,25 +321,27 @@ export default function RadarChart({ symbol, series = [], telemetry = {}, strate
                 y2={height - padBottom}
                 stroke={axisTextFill}
                 strokeDasharray="2 2"
-                strokeWidth="1"
+                strokeWidth="0.7"
+                vectorEffect="non-scaling-stroke"
+                shapeRendering="crispEdges"
               />
-              <rect
-                x={activePoint.x - 3.5}
-                y={activePoint.yl - 3.5}
-                width="7"
-                height="7"
+              <circle
+                cx={activePoint.x}
+                cy={activePoint.yl}
+                r="2.4"
                 fill={leaderColor}
                 stroke="#fff"
-                strokeWidth="1.2"
+                strokeWidth="0.9"
+                vectorEffect="non-scaling-stroke"
               />
-              <rect
-                x={activePoint.x - 3.5}
-                y={activePoint.yf - 3.5}
-                width="7"
-                height="7"
+              <circle
+                cx={activePoint.x}
+                cy={activePoint.yf}
+                r="2.4"
                 fill={followerColor}
                 stroke="#fff"
-                strokeWidth="1.2"
+                strokeWidth="0.9"
+                vectorEffect="non-scaling-stroke"
               />
             </g>
           )}
@@ -292,17 +350,17 @@ export default function RadarChart({ symbol, series = [], telemetry = {}, strate
 
       {/* Bottom Bidirectional Spread Oscillator */}
       <div className="mt-2 pt-3 border-t border-line">
-        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-dim mb-1.5">
-          <span>实时基差校准偏离振荡器 (正值做多窗口 / 负值做空窗口 · 开仓触发线 ±{tpThresholdBps.toFixed(0)} 基点)</span>
-          <div className="flex items-center gap-3">
+        <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center sm:justify-between gap-1.5 sm:gap-2 text-[11px] font-mono text-dim mb-1.5">
+          <span>实时偏离振荡器 (正值做多 / 负值做空 · 触发线 ±{tpThresholdBps.toFixed(0)}bp)</span>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <span>
-              30秒对数基差: <strong className="text-main">{telemetry?.basis_bps ?? 0} 基点</strong>
+              30秒基差: <strong className="text-main">{telemetry?.basis_bps ?? 0}bp</strong>
             </span>
             <span>
-              回归收敛系数 β: <strong className="text-main">{telemetry?.estimated_beta ?? 0.88}</strong>
+              系数 β: <strong className="text-main">{telemetry?.estimated_beta ?? 0.88}</strong>
             </span>
             <span>
-              已实现波动率 σ: <strong className="text-main">{telemetry?.volatility_sigma_bps ?? 0} 基点</strong>
+              波动率 σ: <strong className="text-main">{telemetry?.volatility_sigma_bps ?? 0}bp</strong>
             </span>
           </div>
         </div>

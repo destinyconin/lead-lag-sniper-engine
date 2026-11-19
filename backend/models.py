@@ -18,6 +18,7 @@ class SniperState(str, Enum):
     RECONCILE = "RECONCILE"     # Uncertain fill status, reconciling with exchange
     HOLDING = "HOLDING"         # Position open, Post-Only TP & Hard SL active
     EXITING = "EXITING"         # Canceling TP / executing market or IOC exit with retry
+    EXIT_UNCERTAIN = "EXIT_UNCERTAIN"  # Exit failed/uncertain; locked until exchange reconciliation
     CLOSED = "CLOSED"           # Accounting & async persistence
     COOLDOWN = "COOLDOWN"       # Post-trade debounce
 
@@ -36,8 +37,19 @@ class ExchangeConfigModel(BaseModel):
     is_active: bool = True
 
 
+GRID_STRATEGY_TYPES = ("LONG_SHORT_GRID", "TREND_GRID", "ADAPTIVE_GRID")
+
+
+def is_grid_strategy(strategy_type: Optional[str]) -> bool:
+    return str(strategy_type or "") in GRID_STRATEGY_TYPES
+
+
 class SymbolStrategy(BaseModel):
     symbol: str = Field(default="XRP/USDT:USDT", description="Unified perpetual swap symbol")
+    strategy_type: Literal["LEAD_LAG", "LONG_SHORT_GRID", "TREND_GRID", "ADAPTIVE_GRID"] = Field(
+        default="LEAD_LAG",
+        description="Per-symbol running strategy: LEAD_LAG, LONG_SHORT_GRID, TREND_GRID, or ADAPTIVE_GRID",
+    )
     direction: Literal["BOTH", "LONG_ONLY", "SHORT_ONLY"] = "BOTH"
     order_usdt: float = Field(default=300.0, gt=0, description="Notional order size in USDT")
     leverage: int = Field(default=5, ge=1, le=50, description="Leverage multiplier")
@@ -60,8 +72,37 @@ class SymbolStrategy(BaseModel):
     max_book_staleness_ms: int = Field(default=600, ge=50, le=5000, description="Maximum Follower book age to prevent stale book false triggers")
     contract_size: float = Field(default=1.0, gt=0, description="Contract multiplier / lot value")
     min_qty: float = Field(default=0.1, gt=0, description="Minimum order quantity")
-    qty_precision: int = Field(default=2, ge=0, le=8, description="Quantity decimal places")
-    price_precision: int = Field(default=4, ge=0, le=8, description="Price decimal places")
+    qty_precision: int = Field(default=2, ge=0, le=12, description="Quantity decimal places")
+    price_precision: int = Field(default=4, ge=0, le=12, description="Price decimal places")
+    # Long-Short Grid strategy parameters
+    grid_side_mode: Literal["LONG_SHORT", "LONG_ONLY", "SHORT_ONLY"] = Field(
+        default="LONG_SHORT", description="Grid directional mode: symmetrical LONG_SHORT, LONG_ONLY, or SHORT_ONLY"
+    )
+    grid_levels: int = Field(default=5, ge=1, le=30, description="Number of grid levels per active side")
+    grid_step_pct: float = Field(default=0.0060, ge=0.0001, le=0.50, allow_inf_nan=False, description="Price step between adjacent grid levels (0.006 = 0.60%)")
+    grid_take_profit_pct: float = Field(default=0.0065, ge=0.0001, le=0.50, allow_inf_nan=False, description="Per-grid take-profit target ratio")
+    grid_range_pct: float = Field(default=0.05, ge=0.001, le=0.80, allow_inf_nan=False, description="Outer boundary +/- ratio around center price")
+    grid_stop_loss_pct: float = Field(default=0.08, ge=0.002, le=0.90, allow_inf_nan=False, description="Breakout hard stop-loss ratio from grid center")
+    grid_recenter_enabled: bool = Field(default=True, description="Auto-recenter grid when flat and price leaves range")
+    # Reverse / Trend Breakout Grid & Adaptive VCP/BBW Dual-Mode parameters
+    trend_dead_zone_mult: float = Field(
+        default=2.0, ge=0.5, le=10.0, allow_inf_nan=False, description="First-level breakout dead-zone multiplier of grid_step_pct"
+    )
+    trend_trailing_mult: float = Field(
+        default=1.5, ge=0.3, le=10.0, allow_inf_nan=False, description="Trailing-stop pullback multiplier of grid_step_pct from peak/trough"
+    )
+    trend_pyramid_decay: bool = Field(
+        default=True, description="Use front-loaded decaying pyramid sizing (e.g. 50%/30%/20%) in trend grid mode"
+    )
+    trend_use_bb_breakout: bool = Field(
+        default=True, description="Align first breakout level outside live 15m/1H Bollinger upper/lower band when available"
+    )
+    bbw_timeframe: Literal["15m", "1H"] = Field(
+        default="15m", description="Candle timeframe for VCP / Bollinger Band Width squeeze detection"
+    )
+    bbw_squeeze_percentile: float = Field(
+        default=20.0, ge=1.0, le=50.0, allow_inf_nan=False, description="Historical BBW percentile threshold to trigger adaptive trend grid mode"
+    )
     is_running: bool = True
     auto_disabled_reason: Optional[str] = None
 
@@ -71,16 +112,26 @@ class GlobalRiskConfig(BaseModel):
     trading_mode: Literal["SHADOW", "LIVE"] = "SHADOW"
     feed_source: Literal["AUTO", "REAL_WS", "SIMULATOR"] = "AUTO"
     dynamic_leader_enabled: bool = False
-    max_daily_loss_usdt: float = 150.0
-    max_consecutive_losses: int = 5
-    max_concurrent_positions: int = 2
-    max_exposure_usdt: float = 1500.0
-    latency_circuit_breaker_ms: float = 250.0
-    auto_disable_rolling_trades: int = 8
-    cooldown_ms: int = 500
-    shadow_base_latency_ms: float = 26.0
-    shadow_latency_jitter_ms: float = 12.0
-    shadow_adverse_selection_prob: float = 0.25
+    max_daily_loss_usdt: float = Field(default=150.0, ge=1.0, le=1_000_000.0, allow_inf_nan=False)
+    max_consecutive_losses: int = Field(default=5, ge=1, le=500)
+    max_concurrent_positions: int = Field(default=2, ge=1, le=200)
+    max_exposure_usdt: float = Field(default=1500.0, ge=10.0, le=10_000_000.0, allow_inf_nan=False)
+    latency_circuit_breaker_ms: float = Field(default=250.0, ge=20.0, le=30_000.0, allow_inf_nan=False)
+    auto_disable_rolling_trades: int = Field(default=8, ge=1, le=100)
+    cooldown_ms: int = Field(default=500, ge=0, le=60_000)
+    shadow_base_latency_ms: float = Field(default=26.0, ge=0.0, le=5_000.0, allow_inf_nan=False)
+    shadow_latency_jitter_ms: float = Field(default=12.0, ge=0.0, le=5_000.0, allow_inf_nan=False)
+    shadow_adverse_selection_prob: float = Field(default=0.25, ge=0.0, le=1.0, allow_inf_nan=False)
+
+
+class BatchSymbolUpdateRequest(BaseModel):
+    action: Literal["validate", "apply"] = "validate"
+    strategy_filter: Literal["ALL_GRID", "ADAPTIVE_GRID", "TREND_GRID", "LONG_SHORT_GRID", "ALL"] = "ALL_GRID"
+    only_running: bool = False
+    grid_step_pct: Optional[float] = Field(default=None, ge=0.0005, le=0.20, allow_inf_nan=False)
+    grid_take_profit_pct: Optional[float] = Field(default=None, ge=0.0005, le=0.25, allow_inf_nan=False)
+    trend_trailing_mult: Optional[float] = Field(default=None, ge=0.3, le=10.0, allow_inf_nan=False)
+    auto_fix_anomalies: bool = True
 
 
 class PulseInjectionRequest(BaseModel):
@@ -95,24 +146,27 @@ class PulseInjectionRequest(BaseModel):
 class RegisterRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=32)
     password: str = Field(..., min_length=6, max_length=64)
-    email: str = Field(default="")
+    email: str = Field(default="", max_length=120)
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=128)
 
 
 class ChangePasswordRequest(BaseModel):
-    old_password: str
+    old_password: str = Field(..., min_length=1, max_length=128)
     new_password: str = Field(..., min_length=6, max_length=64)
 
 
 class PurchaseMembershipRequest(BaseModel):
     plan_id: int
-    pay_method: Literal["INSTANT_PAY", "USDT_TRC20", "USDT_ERC20", "ALIPAY_WECHAT"] = "INSTANT_PAY"
+    chain_network: str = "MULTI_EVM"
+    force_new: bool = False
+
+
+class CheckPaymentOrderRequest(BaseModel):
     tx_hash: str = ""
-    auto_confirm: bool = True
 
 
 class RedeemVipCodeRequest(BaseModel):
@@ -133,7 +187,7 @@ class AdminUpdateUserRequest(BaseModel):
     email: Optional[str] = None
     role: Optional[Literal["user", "admin"]] = None
     is_active: Optional[bool] = None
-    new_password: Optional[str] = None
+    new_password: Optional[str] = Field(default=None, max_length=128)
 
 
 class AdminGrantVipRequest(BaseModel):
@@ -164,6 +218,8 @@ class AdminGenerateVipCodesRequest(BaseModel):
 
 class AdminAuditOrderRequest(BaseModel):
     order_id: int
-    action: Literal["APPROVE", "REJECT"] = "APPROVE"
+    action: Literal["APPROVE", "REJECT", "EXPIRE"] = "APPROVE"
+    tx_hash: Optional[str] = None
+
 
 

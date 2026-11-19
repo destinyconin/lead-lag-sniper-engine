@@ -11,6 +11,8 @@ env/
 *.db
 *.db-shm
 *.db-wal
+*.db.bak*
+*.bak*
 .env
 
 # Node / Frontend

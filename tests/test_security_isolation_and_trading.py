@@ -1,0 +1,2136 @@
+import asyncio
+import json
+import os
+import sqlite3
+import tempfile
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import httpx
+from fastapi.testclient import TestClient
+
+from backend.crypto_utils import vault
+from backend.database import AsyncDatabaseManager
+from backend.executor import ExecutionAdapter, quantize_decimal_step
+from backend.market_gateway import _BINANCE_INSTRUMENT_CACHE, _OKX_INSTRUMENT_CACHE
+from backend.models import GlobalRiskConfig, SymbolStrategy
+from backend.payment_monitor import (
+    PAYMENT_WALLET_ADDRESS,
+    RECIPIENT_PADDED_TOPIC,
+    SUPPORTED_CHAINS,
+    TRANSFER_EVENT_TOPIC,
+    OnChainPaymentMonitor,
+)
+from backend.user_membership import UserMembershipManager, rate_limiter
+
+
+def test_legacy_db_migration_preserves_ye520958_and_isolates_tenants():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "legacy.db")
+        mgr = UserMembershipManager(db_path=db_file)
+        mgr.init_sync()
+
+        # Register ye520958 inside legacy DB before multi-tenant migration
+        reg_ye = mgr.register_user("ye520958", "testpass123", "ye@example.com", client_ip="120.230.56.84")
+        assert reg_ye["ok"] is True
+        ye_uid = reg_ye["user"]["id"]
+
+        reg_other = mgr.register_user("other_trader", "testpass123", "other@example.com", client_ip="198.51.100.99")
+        assert reg_other["ok"] is True
+        other_uid = reg_other["user"]["id"]
+
+        # Inject legacy single-tenant tables matching the real v1 schema WITHOUT user_id columns
+        conn = sqlite3.connect(db_file)
+        conn.executescript(
+            """
+            CREATE TABLE exchanges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exchange_id VARCHAR(32) NOT NULL UNIQUE,
+                display_name VARCHAR(64) NOT NULL,
+                role VARCHAR(16) NOT NULL,
+                api_key TEXT DEFAULT '',
+                api_secret_enc TEXT DEFAULT '',
+                passphrase_enc TEXT DEFAULT '',
+                vip_level VARCHAR(16) DEFAULT 'VIP 0',
+                taker_fee DECIMAL(8, 6) NOT NULL,
+                maker_fee DECIMAL(8, 6) NOT NULL,
+                is_active BOOLEAN DEFAULT 1,
+                auth_status VARCHAR(32) DEFAULT 'UNCONFIGURED',
+                auth_message TEXT DEFAULT '',
+                account_equity_usdt REAL DEFAULT 0.0,
+                last_verified_at TEXT DEFAULT ''
+            );
+            CREATE TABLE symbol_configs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol VARCHAR(32) NOT NULL UNIQUE,
+                direction VARCHAR(16) DEFAULT 'BOTH',
+                order_usdt DECIMAL(12, 2) DEFAULT 300.0,
+                leverage INTEGER DEFAULT 5,
+                window_ms INTEGER DEFAULT 150,
+                min_jump_pct DECIMAL(8, 6) DEFAULT 0.006,
+                adaptive_z_score DECIMAL(8, 4) DEFAULT 3.0,
+                lag_confirm_max_pct DECIMAL(8, 6) DEFAULT 0.001,
+                take_profit_pct DECIMAL(8, 6) DEFAULT 0.0025,
+                stop_loss_pct DECIMAL(8, 6) DEFAULT 0.0035,
+                reversal_stop_ratio DECIMAL(8, 4) DEFAULT 0.50,
+                trailing_stop_enabled BOOLEAN DEFAULT 1,
+                trailing_retracement_pct DECIMAL(8, 6) DEFAULT 0.0008,
+                max_hold_ms INTEGER DEFAULT 1500,
+                slippage_pct DECIMAL(8, 6) DEFAULT 0.0005,
+                beta_coeff DECIMAL(8, 4) DEFAULT 0.88,
+                auto_beta_enabled BOOLEAN DEFAULT 1,
+                require_volume_confirm BOOLEAN DEFAULT 1,
+                use_post_only_tp BOOLEAN DEFAULT 1,
+                max_signal_age_ms INTEGER DEFAULT 80,
+                max_book_staleness_ms INTEGER DEFAULT 600,
+                contract_size DECIMAL(12, 6) DEFAULT 1.0,
+                min_qty DECIMAL(12, 6) DEFAULT 0.01,
+                qty_precision INTEGER DEFAULT 2,
+                price_precision INTEGER DEFAULT 4,
+                is_running BOOLEAN DEFAULT 1,
+                auto_disabled_reason TEXT DEFAULT ''
+            );
+            CREATE TABLE trade_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol VARCHAR(32) NOT NULL,
+                leader_ex VARCHAR(32) NOT NULL,
+                follower_ex VARCHAR(32) NOT NULL,
+                side VARCHAR(8) NOT NULL,
+                trading_mode VARCHAR(16) DEFAULT 'SHADOW',
+                order_id VARCHAR(64) NOT NULL,
+                exit_order_type VARCHAR(16) NOT NULL,
+                leader_jump_pct REAL,
+                follower_lag_pct REAL,
+                expected_net_pct REAL,
+                actual_slippage_pct REAL,
+                beta_est REAL,
+                leader_snapshot_price REAL,
+                follower_snapshot_price REAL,
+                reservation_price REAL,
+                entry_price REAL,
+                exit_price REAL,
+                filled_qty REAL,
+                gross_pnl_usdt REAL,
+                fee_usdt REAL,
+                net_pnl_usdt REAL,
+                signal_ts_ms INTEGER,
+                submit_ts_ms INTEGER,
+                ack_ts_ms INTEGER,
+                signal_to_fill_ms REAL,
+                hold_duration_ms INTEGER,
+                exit_reason VARCHAR(32),
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE orders (
+                order_id VARCHAR(64) PRIMARY KEY,
+                symbol VARCHAR(32) NOT NULL,
+                exchange_id VARCHAR(32) NOT NULL,
+                purpose VARCHAR(24) NOT NULL,
+                side VARCHAR(8) NOT NULL,
+                order_type VARCHAR(16) NOT NULL,
+                price REAL,
+                requested_qty REAL,
+                filled_qty REAL,
+                avg_price REAL,
+                status VARCHAR(24) NOT NULL,
+                latency_ms REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE positions (
+                symbol VARCHAR(32) PRIMARY KEY,
+                exchange_id VARCHAR(32) NOT NULL,
+                side VARCHAR(8) NOT NULL,
+                qty REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                tp_order_id VARCHAR(64),
+                sl_order_id VARCHAR(64),
+                state VARCHAR(16) NOT NULL,
+                opened_at_ms INTEGER,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE risk_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                level VARCHAR(16) NOT NULL,
+                category VARCHAR(32) NOT NULL,
+                symbol VARCHAR(32),
+                message TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE runtime_settings (
+                key VARCHAR(64) PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """INSERT INTO exchanges
+               (exchange_id, display_name, role, api_key, api_secret_enc, passphrase_enc, auth_status, auth_message, account_equity_usdt, taker_fee, maker_fee, is_active)
+               VALUES ('okx', 'OKX Swap', 'follower', 'ye-live-key-123456', ?, ?, 'VERIFIED', '已配置且验证通过 (权益: 49.95 USDT)', 49.95, 0.0005, 0.0002, 1)""",
+            (vault.encrypt("ye-live-secret"), vault.encrypt("ye-pass")),
+        )
+        conn.execute(
+            "INSERT INTO symbol_configs (symbol, order_usdt, leverage, is_running) VALUES (?, ?, ?, 1)",
+            ("SOL/USDT:USDT", 10.0, 10),
+        )
+        conn.execute(
+            "INSERT INTO runtime_settings (key, value_json) VALUES ('risk_config', ?)",
+            (json.dumps({"trading_mode": "LIVE", "feed_source": "REAL_WS"}),),
+        )
+        conn.execute(
+            """INSERT INTO trade_logs (symbol, leader_ex, follower_ex, side, trading_mode, order_id, exit_order_type, net_pnl_usdt)
+               VALUES ('BTC/USDT:USDT', 'binanceusdm', 'okx', 'LONG', 'SHADOW', 'sh-1', 'MAKER_POST_ONLY', 1.25)"""
+        )
+        conn.execute(
+            """INSERT INTO trade_logs (symbol, leader_ex, follower_ex, side, trading_mode, order_id, exit_order_type, net_pnl_usdt)
+               VALUES ('SOL/USDT:USDT', 'binanceusdm', 'okx', 'LONG', 'LIVE', 'lv-1', 'TAKER_IOC', 0.55)"""
+        )
+        conn.commit()
+        conn.close()
+
+        # Run multi-tenant migration
+        adb = AsyncDatabaseManager(db_path=db_file)
+        adb.init_sync()
+
+        # 1. ye520958 retains OKX encrypted creds, 49.95 equity, SOL strategy, LIVE runtime_setting & LIVE trade
+        ye_ex = {e["exchange_id"]: e for e in adb.load_exchanges_sync(user_id=ye_uid)}
+        assert ye_ex["okx"]["api_key"] == "ye-live-key-123456"
+        assert ye_ex["okx"]["_decrypted_secret"] == "ye-live-secret"
+        assert ye_ex["okx"]["account_equity_usdt"] == 49.95
+        ye_syms = adb.load_symbols_sync(user_id=ye_uid)
+        assert [s.symbol for s in ye_syms] == ["SOL/USDT:USDT"]
+        assert ye_syms[0].order_usdt == 10.0
+        ye_risk = adb.load_runtime_setting_sync("risk_config", user_id=ye_uid)
+        assert ye_risk["trading_mode"] == "LIVE"
+        ye_trades = adb.load_recent_trades_sync(user_id=ye_uid)
+        assert len(ye_trades) == 1 and ye_trades[0]["trading_mode"] == "LIVE"
+
+        # 2. Other user sees ZERO of ye520958's credentials, equity, or strategies
+        other_ex = {e["exchange_id"]: e for e in adb.load_exchanges_sync(user_id=other_uid)}
+        assert other_ex["okx"]["has_credentials"] is False
+        assert other_ex["okx"]["account_equity_usdt"] == 0.0
+        assert other_ex["okx"]["api_key"] == ""
+        assert adb.load_recent_trades_sync(user_id=other_uid) == []
+
+        # 3. Guest (user_id=0) retains ONLY SHADOW trade logs & zero credentials
+        guest_ex = {e["exchange_id"]: e for e in adb.load_exchanges_sync(user_id=0)}
+        assert guest_ex["okx"]["has_credentials"] is False
+        guest_trades = adb.load_recent_trades_sync(user_id=0)
+        assert len(guest_trades) == 1 and guest_trades[0]["trading_mode"] == "SHADOW"
+
+
+def test_api_and_websocket_multi_tenant_isolation():
+    import backend.main as main_mod
+    from backend.engine_manager import EngineManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_db = os.path.join(tmpdir, "api_iso.db")
+        orig_db_path = main_mod.db_manager.db_path
+        orig_um_path = main_mod.user_manager.db_path
+        orig_em = main_mod.engine_manager
+
+        try:
+            rate_limiter._buckets.clear()
+            main_mod.user_manager.db_path = test_db
+            main_mod.user_manager.init_sync()
+            main_mod.db_manager.db_path = test_db
+            main_mod.db_manager.init_sync()
+            main_mod.engine_manager = EngineManager(main_mod.db_manager, get_user_fn=main_mod.user_manager.get_user_by_id)
+
+            # Avoid external exchange WS/REST calls during isolated HTTP/WS unit test
+            with (
+                patch.object(main_mod.engine_manager.gateway, "start", new=AsyncMock(return_value=None)),
+                patch.object(main_mod.engine_manager.gateway, "stop", new=AsyncMock(return_value=None)),
+                patch.object(main_mod.engine_manager.gateway, "fetch_exchange_instruments", new=AsyncMock(return_value=True)),
+                patch.object(main_mod.engine_manager.gateway, "fetch_real_bbo_snapshot", new=AsyncMock(return_value=True)),
+                patch.object(main_mod.payment_monitor, "start", return_value=None),
+                patch.object(main_mod.payment_monitor, "stop", new=AsyncMock(return_value=None)),
+            ):
+                with TestClient(main_mod.app) as client:
+                    # Register two separate VIP users via admin grant
+                    r1 = client.post(
+                        "/api/auth/register",
+                        json={"username": "ye520958", "password": "password123"},
+                        headers={"X-Real-IP": "198.51.100.1"},
+                    )
+                    assert r1.status_code == 200
+                    tok_ye = r1.json()["token"]
+                    uid_ye = r1.json()["user"]["id"]
+
+                    r2 = client.post(
+                        "/api/auth/register",
+                        json={"username": "alice_vip", "password": "password123"},
+                        headers={"X-Real-IP": "198.51.100.2"},
+                    )
+                    assert r2.status_code == 200
+                    tok_alice = r2.json()["token"]
+                    uid_alice = r2.json()["user"]["id"]
+
+                    main_mod.user_manager.confirm_order_paid_onchain
+                    # Grant VIP to both users cleanly in DB
+                    conn = sqlite3.connect(test_db)
+                    conn.execute(
+                        "UPDATE users SET vip_tier='季度旗舰版会员', vip_expires_at=? WHERE id IN (?, ?)",
+                        (int(time.time()) + 86400 * 30, uid_ye, uid_alice),
+                    )
+                    conn.commit()
+                    conn.close()
+
+                    # Save ye520958 exchange config (mocking verify so offline deterministic)
+                    with patch(
+                        "backend.executor.ExecutionAdapter.verify_exchange_credentials",
+                        new=AsyncMock(
+                            return_value={
+                                "ok": True,
+                                "auth_status": "VERIFIED",
+                                "auth_message": "已配置且验证通过 (权益: 49.95 USDT)",
+                                "account_equity_usdt": 49.95,
+                            }
+                        ),
+                    ):
+                        up_res = client.post(
+                            "/api/exchanges/update",
+                            headers={"Authorization": f"Bearer {tok_ye}"},
+                            json={
+                                "exchange_id": "okx",
+                                "display_name": "OKX Swap",
+                                "role": "follower",
+                                "api_key": "ye-secret-api-key-999",
+                                "api_secret": "ye-secret-sec",
+                                "passphrase": "ye-pass",
+                                "vip_level": "VIP 1",
+                                "taker_fee": 0.0005,
+                                "maker_fee": 0.0002,
+                                "is_active": True,
+                            },
+                        )
+                        assert up_res.status_code == 200
+
+                    # 1. Guest accessing /api/exchanges MUST get 401
+                    assert client.get("/api/exchanges").status_code == 401
+
+                    # 2. Guest accessing /api/stats MUST get sanitized guest preview (0 equity, no key)
+                    g_stats = client.get("/api/stats").json()
+                    assert g_stats["is_guest_preview"] is True
+                    assert g_stats["live_status"]["follower_equity_usdt"] == 0.0
+                    assert g_stats["live_status"]["follower_has_api_key"] is False
+
+                    # 3. Guest WS MUST get guest preview only, NOT ye520958's 49.95 equity
+                    with client.websocket_connect("/ws/dashboard") as ws_guest:
+                        msg_guest = json.loads(ws_guest.receive_text())
+                        assert msg_guest["is_guest_preview"] is True
+                        assert msg_guest["live_status"]["follower_equity_usdt"] == 0.0
+
+                    # 4. Alice accessing /api/exchanges & /ws/dashboard MUST NOT see ye520958's key/equity
+                    alice_ex = client.get(
+                        "/api/exchanges", headers={"Authorization": f"Bearer {tok_alice}"}
+                    ).json()
+                    alice_okx = next(e for e in alice_ex["exchanges"] if e["exchange_id"] == "okx")
+                    assert alice_okx["has_credentials"] is False
+                    assert alice_okx["account_equity_usdt"] == 0.0
+
+                    with client.websocket_connect(f"/ws/dashboard?token={tok_alice}") as ws_alice:
+                        msg_alice = json.loads(ws_alice.receive_text())
+                        assert msg_alice["owner_user_id"] == uid_alice
+                        assert msg_alice["live_status"]["follower_equity_usdt"] == 0.0
+
+                    # 5. ye520958 accessing /ws/dashboard?token=... DOES see their own 49.95 equity
+                    with client.websocket_connect(f"/ws/dashboard?token={tok_ye}") as ws_ye:
+                        msg_ye = json.loads(ws_ye.receive_text())
+                        assert msg_ye["owner_user_id"] == uid_ye
+                        assert msg_ye["live_status"]["follower_equity_usdt"] == 49.95
+                        assert msg_ye["trading_mode"] == "LIVE"
+
+                    # 6. Preflight requires auth (401 for guest) & isolates per user
+                    assert client.post("/api/exchanges/preflight").status_code == 401
+                    pf_alice = client.post(
+                        "/api/exchanges/preflight", headers={"Authorization": f"Bearer {tok_alice}"}
+                    )
+                    assert pf_alice.status_code == 200
+                    assert pf_alice.json()["ok"] is False
+
+                    # 7. Login brute-force rate limiter returns HTTP 429 after threshold
+                    statuses = []
+                    for _ in range(22):
+                        lr = client.post(
+                            "/api/auth/login",
+                            json={"username": "ye520958", "password": "wrongpassword"},
+                            headers={"X-Real-IP": "198.51.100.77"},
+                        )
+                        statuses.append(lr.status_code)
+                    assert 429 in statuses
+        finally:
+            main_mod.db_manager.db_path = orig_db_path
+            main_mod.user_manager.db_path = orig_um_path
+            main_mod.engine_manager = orig_em
+
+
+def test_payment_monitor_rejects_spoofed_erc20_and_historical_replay():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "pay_sec.db")
+        mgr = UserMembershipManager(db_path=db_file)
+        mgr.init_sync()
+        u = mgr.register_user("pay_tester", "pass123456")["user"]
+        plan = next(p for p in mgr.list_plans() if p["price_usdt"] == 99.0)
+        ord_res = mgr.create_web3_payment_order(u["id"], plan["id"], "Arbitrum")
+        order = ord_res["order"]
+        pay_amt = float(order["pay_amount_usdt"])
+        raw_6dec = int(round(pay_amt * 1_000_000))
+        data_hex = "0x" + raw_6dec.to_bytes(32, "big").hex()
+
+        monitor = OnChainPaymentMonitor(mgr)
+        arb_chain = next(c for c in SUPPORTED_CHAINS if c["id"] == "arbitrum")
+        arb_usdt = "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"
+        fake_token = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+        async def run_checks():
+            # Fake ERC-20 token must NEVER confirm payment
+            with patch.object(
+                monitor,
+                "_rpc_call",
+                new=AsyncMock(
+                    side_effect=[
+                        {
+                            "status": "0x1",
+                            "blockNumber": "0x10",
+                            "logs": [
+                                {
+                                    "address": fake_token,
+                                    "topics": [
+                                        TRANSFER_EVENT_TOPIC,
+                                        "0x" + "0" * 24 + "1" * 40,
+                                        RECIPIENT_PADDED_TOPIC,
+                                    ],
+                                    "data": data_hex,
+                                }
+                            ],
+                        },
+                        {"timestamp": hex(int(time.time()))},
+                    ]
+                ),
+            ):
+                async with httpx.AsyncClient() as client:
+                    res = await monitor._check_tx_on_chain(
+                        client, arb_chain, "0x" + "1" * 64, [dict(order)]
+                    )
+                    assert res is None
+
+            # Whitelisted USDT token with block timestamp BEFORE order creation must be rejected (replay)
+            monitor._block_ts_cache.clear()
+            with patch.object(
+                monitor,
+                "_rpc_call",
+                new=AsyncMock(
+                    side_effect=[
+                        {
+                            "status": "0x1",
+                            "blockNumber": "0x11",
+                            "logs": [
+                                {
+                                    "address": arb_usdt,
+                                    "topics": [
+                                        TRANSFER_EVENT_TOPIC,
+                                        "0x" + "0" * 24 + "1" * 40,
+                                        RECIPIENT_PADDED_TOPIC,
+                                    ],
+                                    "data": data_hex,
+                                }
+                            ],
+                        },
+                        {"timestamp": hex(int(order["created_at_ts"]) - 3600)},
+                    ]
+                ),
+            ):
+                async with httpx.AsyncClient() as client:
+                    res_old = await monitor._check_tx_on_chain(
+                        client, arb_chain, "0x" + "2" * 64, [dict(order)]
+                    )
+                    assert res_old is None
+
+            # Whitelisted USDT token inside valid window must confirm VIP
+            monitor._block_ts_cache.clear()
+            with patch.object(
+                monitor,
+                "_rpc_call",
+                new=AsyncMock(
+                    side_effect=[
+                        {
+                            "status": "0x1",
+                            "blockNumber": "0x12",
+                            "logs": [
+                                {
+                                    "address": arb_usdt,
+                                    "topics": [
+                                        TRANSFER_EVENT_TOPIC,
+                                        "0x" + "0" * 24 + "1" * 40,
+                                        RECIPIENT_PADDED_TOPIC,
+                                    ],
+                                    "data": data_hex,
+                                }
+                            ],
+                        },
+                        {"timestamp": hex(int(order["created_at_ts"]) + 15)},
+                    ]
+                ),
+            ):
+                async with httpx.AsyncClient() as client:
+                    res_ok = await monitor._check_tx_on_chain(
+                        client, arb_chain, "0x" + "3" * 64, [dict(order)]
+                    )
+                    assert res_ok is not None and res_ok["matched"] is True
+
+        asyncio.run(run_checks())
+        assert mgr.get_user_by_id(u["id"])["is_vip"] is True
+
+
+def test_okx_live_execution_ctval_acct_lv_and_close():
+    # Seed dynamic instrument cache with real OKX ADA & BTC SWAP specs
+    _OKX_INSTRUMENT_CACHE["ADA-USDT-SWAP"] = {
+        "instId": "ADA-USDT-SWAP",
+        "unified_sym": "ADA/USDT:USDT",
+        "state": "live",
+        "ctVal": 100.0,
+        "ctVal_str": "100",
+        "lotSz": 0.1,
+        "lotSz_str": "0.1",
+        "minSz": 0.1,
+        "minSz_str": "0.1",
+        "tickSz": 0.0001,
+        "tickSz_str": "0.0001",
+        "maxLever": 75.0,
+    }
+    _OKX_INSTRUMENT_CACHE["BTC-USDT-SWAP"] = {
+        "instId": "BTC-USDT-SWAP",
+        "unified_sym": "BTC/USDT:USDT",
+        "state": "live",
+        "ctVal": 0.01,
+        "ctVal_str": "0.01",
+        "lotSz": 0.01,
+        "lotSz_str": "0.01",
+        "minSz": 0.01,
+        "minSz_str": "0.01",
+        "tickSz": 0.1,
+        "tickSz_str": "0.1",
+        "maxLever": 100.0,
+    }
+    _BINANCE_INSTRUMENT_CACHE["ADAUSDT"] = {"symbol": "ADAUSDT", "status": "TRADING"}
+    _BINANCE_INSTRUMENT_CACHE["BTCUSDT"] = {"symbol": "BTCUSDT", "status": "TRADING"}
+
+    px_s, _ = quantize_decimal_step(0.000018523456, "0.0000000001", rounding="down")
+    assert px_s == "0.0000185234"
+
+    risk = GlobalRiskConfig(trading_mode="LIVE", feed_source="REAL_WS")
+    adapter = ExecutionAdapter(get_math_state=lambda _: None, get_risk_cfg=lambda: risk)
+    ex_cfg = {
+        "exchange_id": "okx",
+        "api_key": "test-key-1234",
+        "_decrypted_secret": "test-sec-1234",
+        "_decrypted_passphrase": "pass",
+        "account_equity_usdt": 49.95,
+    }
+    cfg_ada = SymbolStrategy(symbol="ADA/USDT:USDT", order_usdt=10.0, leverage=10, price_precision=4, qty_precision=1)
+
+    async def run_okx_tests():
+        # 1. Verify account in acctLv="1" (Simple mode) must fail with ACCOUNT_MODE_UNSUPPORTED & equity preserved
+        def fake_req_simple(client, creds, method, path, payload=None):
+            return {}
+
+        with patch.object(
+            httpx.AsyncClient,
+            "get",
+            new=AsyncMock(
+                side_effect=[
+                    SimpleNamespace(json=lambda: {"code": "0", "data": [{"totalEq": "49.95", "details": []}]}),
+                    SimpleNamespace(json=lambda: {"code": "0", "data": [{"acctLv": "1", "posMode": "net_mode", "perm": "read_only,trade"}]}),
+                ]
+            ),
+        ):
+            ver_simple = await adapter.verify_exchange_credentials(ex_cfg)
+            assert ver_simple["ok"] is False
+            assert ver_simple["auth_status"] == "ACCOUNT_MODE_UNSUPPORTED"
+            assert ver_simple["account_equity_usdt"] == 49.95
+
+        # 2. Entry IOC + Protective Orders + Exit Retry with acctLv="2" and ADA ctVal=100
+        calls = []
+
+        async def mock_okx_req(client, creds, method, path, payload=None):
+            calls.append((method, path, payload))
+            if path == "/api/v5/account/config":
+                return {"code": "0", "data": [{"acctLv": "2", "posMode": "net_mode", "perm": "read_only,trade"}]}
+            if path == "/api/v5/account/set-leverage":
+                return {"code": "0", "data": [{"lever": "10"}]}
+            if path == "/api/v5/trade/order" and payload and payload.get("ordType") == "ioc" and payload.get("side") == "buy":
+                return {"code": "0", "data": [{"ordId": "okx-entry-1", "sCode": "0"}]}
+            if path.startswith("/api/v5/trade/order?instId=ADA-USDT-SWAP&ordId=okx-entry-1"):
+                # 0.2 contracts * 100 ctVal = 20 ADA filled at $0.50 = $10 notional
+                return {"code": "0", "data": [{"accFillSz": "0.2", "avgPx": "0.5000", "state": "filled"}]}
+            if path == "/api/v5/trade/order-algo":
+                return {"code": "0", "data": [{"algoId": "okx-sl-algo-1", "sCode": "0"}]}
+            if path == "/api/v5/trade/order" and payload and payload.get("ordType") == "post_only":
+                return {"code": "0", "data": [{"ordId": "okx-tp-po-1", "sCode": "0"}]}
+            if path.startswith("/api/v5/trade/order?instId=ADA-USDT-SWAP&ordId=okx-tp-po-1"):
+                return {"code": "0", "data": [{"accFillSz": "0", "avgPx": "", "state": "live"}]}
+            if path in ("/api/v5/trade/cancel-order", "/api/v5/trade/cancel-algos"):
+                return {"code": "0", "data": [{"sCode": "0"}]}
+            if path == "/api/v5/trade/order" and payload and payload.get("reduceOnly") is True:
+                return {"code": "0", "data": [{"ordId": "okx-exit-1", "sCode": "0"}]}
+            if path.startswith("/api/v5/trade/order?instId=ADA-USDT-SWAP&ordId=okx-exit-1"):
+                return {"code": "0", "data": [{"accFillSz": "0.2", "avgPx": "0.5020", "state": "filled"}]}
+            return {"code": "0", "data": []}
+
+        # Clear simple-mode cached meta for fresh test
+        adapter._okx_account_meta.clear()
+        with patch.object(adapter, "_okx_request", new=AsyncMock(side_effect=mock_okx_req)):
+            entry_res = await adapter.place_entry_ioc(
+                cfg=cfg_ada, side="LONG", qty=20.0, reservation_price=0.50, trigger_price=0.499, exchange_cfg=ex_cfg
+            )
+            assert entry_res.status == "FILLED"
+            assert entry_res.contracts == 0.2
+            assert abs(entry_res.filled_qty - 20.0) < 1e-6  # 0.2 * 100 ctVal = 20 ADA
+
+            tp_id, sl_id, crossed = await adapter.place_protective_orders(
+                cfg_ada, "LONG", entry_res.filled_qty, 0.5020, 0.4980,
+                exchange_cfg=ex_cfg, contracts=entry_res.contracts, ct_val=entry_res.ct_val,
+            )
+            assert tp_id == "okx-tp-po-1"
+            assert sl_id == "okx-sl-algo-1"
+            assert crossed is False
+
+            exit_res = await adapter.execute_exit_with_retry(
+                cfg_ada, "LONG", entry_res.filled_qty, "TIMEOUT", 0.5020,
+                exchange_cfg=ex_cfg, contracts=entry_res.contracts, ct_val=entry_res.ct_val,
+            )
+            assert exit_res.status == "FILLED"
+            assert abs(exit_res.filled_qty - 20.0) < 1e-6
+            assert exit_res.avg_price == 0.5020
+
+        paths_called = [p for _, p, _ in calls]
+        assert "/api/v5/account/set-leverage" in paths_called
+        assert "/api/v5/trade/order-algo" in paths_called
+        assert "/api/v5/trade/cancel-order" in paths_called
+        assert "/api/v5/trade/cancel-algos" in paths_called
+
+        # 3. Preflight check with live instrument cache and mocked verify/max-size
+        fake_gateway = SimpleNamespace(
+            fetch_exchange_instruments=AsyncMock(return_value=True),
+            real_follower_bbo={"ADA/USDT:USDT": (0.499, 0.501, 100.0, 100.0)},
+            real_leader_bbo={"ADA/USDT:USDT": (0.500, 0.501, 100.0, 100.0)},
+        )
+        with (
+            patch.object(
+                adapter,
+                "verify_exchange_credentials",
+                new=AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "auth_status": "VERIFIED",
+                        "auth_message": "VERIFIED",
+                        "account_equity_usdt": 49.95,
+                        "acct_lv": "2",
+                        "pos_mode": "net_mode",
+                    }
+                ),
+            ),
+            patch.object(
+                adapter,
+                "_okx_request",
+                new=AsyncMock(return_value={"code": "0", "data": [{"maxBuy": "10", "maxSell": "10"}]}),
+            ),
+        ):
+            pf = await adapter.preflight_check_symbols(ex_cfg, [cfg_ada], {}, gateway=fake_gateway)
+            assert pf["ok"] is True
+            assert pf["symbols"][0]["symbol"] == "ADA/USDT:USDT"
+            assert pf["symbols"][0]["ctVal"] == 100.0
+            assert pf["symbols"][0]["planned_sz"] == "0.2"
+
+    asyncio.run(run_okx_tests())
+
+
+def test_okx_account_mode_auto_upgrade_and_multi_exchange_verify():
+    from backend.sniper_engine import BidirectionalSniperEngine
+
+    risk = GlobalRiskConfig(trading_mode="LIVE", feed_source="REAL_WS")
+    adapter = ExecutionAdapter(get_math_state=lambda _: None, get_risk_cfg=lambda: risk)
+    okx_cfg = {
+        "exchange_id": "okx",
+        "api_key": "okx-k-1234",
+        "_decrypted_secret": "okx-s-1234",
+        "_decrypted_passphrase": "pass",
+        "account_equity_usdt": 49.95,
+    }
+
+    async def run_verify_tests():
+        # 1. auto_upgrade_okx_mode=True calls POST /api/v5/account/set-account-level and turns VERIFIED
+        with (
+            patch.object(
+                httpx.AsyncClient,
+                "get",
+                new=AsyncMock(
+                    side_effect=[
+                        SimpleNamespace(json=lambda: {"code": "0", "data": [{"totalEq": "49.95", "details": []}]}),
+                        SimpleNamespace(json=lambda: {"code": "0", "data": [{"acctLv": "1", "posMode": "net_mode", "perm": "read_only,trade"}]}),
+                    ]
+                ),
+            ),
+            patch.object(
+                httpx.AsyncClient,
+                "post",
+                new=AsyncMock(return_value=SimpleNamespace(json=lambda: {"code": "0", "data": [{"acctLv": "2"}]})),
+            ),
+        ):
+            res = await adapter.verify_exchange_credentials(okx_cfg, auto_upgrade_okx_mode=True)
+            assert res["ok"] is True
+            assert res["auth_status"] == "VERIFIED"
+            assert res["acct_lv"] == "2"
+
+        # 2. Manual switch_okx_account_level handles OKX 59000 conflict cleanly
+        with patch.object(
+            adapter,
+            "_okx_request",
+            new=AsyncMock(return_value={"code": "59000", "msg": "open positions exist"}),
+        ):
+            sw_fail = await adapter.switch_okx_account_level(okx_cfg, "2")
+            assert sw_fail["ok"] is False
+            assert "59000" in sw_fail["message"]
+
+        # 3. Bybit / Bitget / Gate real endpoint verification parsing
+        with patch.object(
+            httpx.AsyncClient,
+            "get",
+            new=AsyncMock(
+                return_value=SimpleNamespace(
+                    status_code=200,
+                    json=lambda: {"retCode": 0, "result": {"list": [{"totalEquity": "125.5"}]}},
+                )
+            ),
+        ):
+            by_res = await adapter.verify_exchange_credentials(
+                {"exchange_id": "bybit", "api_key": "byb-key-1234", "_decrypted_secret": "byb-sec-1234"}
+            )
+            assert by_res["ok"] is True and by_res["account_equity_usdt"] == 125.5
+
+        with patch.object(
+            httpx.AsyncClient,
+            "get",
+            new=AsyncMock(
+                return_value=SimpleNamespace(
+                    status_code=200,
+                    json=lambda: {"code": "00000", "data": [{"marginCoin": "USDT", "usdtEquity": "88.8"}]},
+                )
+            ),
+        ):
+            bg_res = await adapter.verify_exchange_credentials(
+                {"exchange_id": "bitget", "api_key": "bg-key-1234", "_decrypted_secret": "bg-sec-1234", "_decrypted_passphrase": "pass"}
+            )
+            assert bg_res["ok"] is True and bg_res["account_equity_usdt"] == 88.8
+
+        with patch.object(
+            httpx.AsyncClient,
+            "get",
+            new=AsyncMock(
+                return_value=SimpleNamespace(status_code=200, json=lambda: {"total": "210.25"})
+            ),
+        ):
+            gt_res = await adapter.verify_exchange_credentials(
+                {"exchange_id": "gate", "api_key": "gt-key-1234", "_decrypted_secret": "gt-sec-1234"}
+            )
+            assert gt_res["ok"] is True and gt_res["account_equity_usdt"] == 210.25
+
+    asyncio.run(run_verify_tests())
+
+
+def test_long_short_grid_strategy_lifecycle_and_per_symbol_selection():
+    from backend.grid_engine import LongShortGridTracker
+    from backend.sniper_engine import BidirectionalSniperEngine
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "grid_test.db")
+        adb = AsyncDatabaseManager(db_path=db_file)
+        adb.init_sync()
+
+        # Persist one LEAD_LAG symbol and one LONG_SHORT_GRID symbol on user_id=7
+        adb.ensure_user_workspace_sync(7)
+        s_ll = SymbolStrategy(symbol="SOL/USDT:USDT", strategy_type="LEAD_LAG", order_usdt=10.0, leverage=5)
+        s_grid = SymbolStrategy(
+            symbol="BTC/USDT:USDT",
+            strategy_type="LONG_SHORT_GRID",
+            grid_side_mode="LONG_SHORT",
+            grid_levels=3,
+            grid_step_pct=0.01,
+            grid_take_profit_pct=0.025,
+            grid_range_pct=0.05,
+            grid_stop_loss_pct=0.10,
+            order_usdt=100.0,
+            leverage=5,
+            price_precision=2,
+            qty_precision=4,
+            min_qty=0.0001,
+            slippage_pct=0.0005,
+        )
+        adb.upsert_symbol_sync(s_ll, user_id=7)
+        adb.upsert_symbol_sync(s_grid, user_id=7)
+        loaded = {s.symbol: s for s in adb.load_symbols_sync(user_id=7)}
+        assert loaded["SOL/USDT:USDT"].strategy_type == "LEAD_LAG"
+        assert loaded["BTC/USDT:USDT"].strategy_type == "LONG_SHORT_GRID"
+        assert loaded["BTC/USDT:USDT"].grid_levels == 3
+        assert loaded["BTC/USDT:USDT"].grid_side_mode == "LONG_SHORT"
+
+        # Test Grid Tracker directly on symmetrical Long + Short oscillation & net_mode protection
+        tracker = LongShortGridTracker("BTC/USDT:USDT")
+        tracker.sync_config(s_grid, current_mid=100000.0)
+        assert tracker.center_price == 100000.0
+        assert "L1" in tracker.levels and "S1" in tracker.levels
+        assert tracker.levels["L1"]["trigger_price"] == 99000.0
+        assert tracker.levels["S1"]["trigger_price"] == 101000.0
+
+        # Price drops to trigger L1 in LIVE net_mode -> L1 opens
+        en1, ex1 = tracker.evaluate_tick(98950.0, 98960.0, 98955.0, s_grid, is_net_mode=True, allow_entries=True)
+        assert len(en1) == 1 and en1[0]["slot_id"] == "L1"
+        tracker.mark_entry_filled("L1", 98960.0, 0.001, 0.1, 0.01, s_grid, 0.0007)
+
+        # In net_mode, while L1 LONG is open (< TP 101500), rally hitting S1 (101050) must NOT open SHORT
+        en_block, ex_mid = tracker.evaluate_tick(101050.0, 101060.0, 101055.0, s_grid, is_net_mode=True, allow_entries=True)
+        assert len(en_block) == 0 and len(ex_mid) == 0
+
+        # L1 reaches TP (>101500) & exits cleanly
+        en_exit, ex_hit = tracker.evaluate_tick(101600.0, 101610.0, 101605.0, s_grid, is_net_mode=True, allow_entries=False)
+        assert len(ex_hit) == 1 and ex_hit[0]["slot_id"] == "L1" and ex_hit[0]["exit_reason"] == "GRID_TP"
+        tracker.mark_exited("L1", net_pnl=1.10)
+
+        # Now L1 is closed, Short S1 triggers cleanly
+        en_s, _ = tracker.evaluate_tick(101050.0, 101060.0, 101055.0, s_grid, is_net_mode=True, allow_entries=True)
+        assert len(en_s) == 1 and en_s[0]["slot_id"] == "S1" and en_s[0]["side"] == "SHORT"
+
+        # Also test full async BidirectionalSniperEngine dispatch in SHADOW mode
+        async def run_engine_grid_flow():
+            eng = BidirectionalSniperEngine(adb, user_id=7)
+            eng.risk_config = GlobalRiskConfig(
+                trading_mode="SHADOW", shadow_base_latency_ms=5.0, shadow_latency_jitter_ms=1.0, shadow_adverse_selection_prob=0.0
+            )
+            eng.trading_active_by_mode["SHADOW"] = True
+            eng.exchanges = {
+                "binanceusdm": {"exchange_id": "binanceusdm", "display_name": "Binance", "role": "leader", "is_active": True, "taker_fee": 0.0004, "maker_fee": 0.0002},
+                "okx": {"exchange_id": "okx", "display_name": "OKX", "role": "follower", "is_active": True, "taker_fee": 0.0005, "maker_fee": 0.0002},
+            }
+            await adb.start_worker()
+            eng._register_symbol_internal(s_grid)
+
+            # Initialize center @ 100000 -> drop to 98900 (opens L1) -> bounce to 101600 (closes L1 TP)
+            eng._handle_follower_bbo("BTC/USDT:USDT", 99995.0, 100005.0, 10.0, 10.0)
+            eng._handle_follower_bbo("BTC/USDT:USDT", 98895.0, 98905.0, 10.0, 10.0)
+            await asyncio.sleep(0.08)
+            assert len(eng.active_grid_positions) >= 1
+
+            eng._handle_follower_bbo("BTC/USDT:USDT", 101600.0, 101610.0, 10.0, 10.0)
+            await asyncio.sleep(0.08)
+            snap = eng.build_dashboard_snapshot()
+            assert snap["telemetry"]["BTC/USDT:USDT"]["strategy_type"] == "LONG_SHORT_GRID"
+            assert snap["stats"]["win_count"] >= 1
+            await adb.stop_worker()
+
+        asyncio.run(run_engine_grid_flow())
+
+
+def test_pepe_shib_high_precision_grid_save_and_verify_prompts():
+    """
+    Verifies:
+    1. High-precision meme coins like PEPE (price_precision=10) and SHIB (price_precision=9)
+       can be verified and saved as LONG_SHORT_GRID with order_usdt=5 without triggering 422 errors.
+    2. 1000SHIB / 1000PEPE aliases normalize to SHIB/USDT:USDT and PEPE/USDT:USDT.
+    3. Invalid or unsupported symbols return verified=False with a descriptive Chinese error prompt.
+    """
+    from backend.main import app
+    from backend.market_gateway import _OKX_INSTRUMENT_CACHE
+
+    _OKX_INSTRUMENT_CACHE["PEPE-USDT-SWAP"] = {
+        "instId": "PEPE-USDT-SWAP",
+        "unified_sym": "PEPE/USDT:USDT",
+        "state": "live",
+        "ctVal": 10000000.0,
+        "ctVal_str": "10000000",
+        "lotSz": 0.1,
+        "lotSz_str": "0.1",
+        "minSz": 0.1,
+        "minSz_str": "0.1",
+        "tickSz": 1e-10,
+        "tickSz_str": "0.0000000001",
+        "maxLever": 50.0,
+    }
+    _OKX_INSTRUMENT_CACHE["SHIB-USDT-SWAP"] = {
+        "instId": "SHIB-USDT-SWAP",
+        "unified_sym": "SHIB/USDT:USDT",
+        "state": "live",
+        "ctVal": 1000000.0,
+        "ctVal_str": "1000000",
+        "lotSz": 0.1,
+        "lotSz_str": "0.1",
+        "minSz": 0.1,
+        "minSz_str": "0.1",
+        "tickSz": 1e-9,
+        "tickSz_str": "0.000000001",
+        "maxLever": 50.0,
+    }
+
+    with TestClient(app) as client:
+        # 1. Verify SHIB and 1000SHIB
+        r_shib = client.get("/api/symbol/verify?symbol=shib").json()
+        assert r_shib["verified"] is True
+        assert r_shib["symbol"] == "SHIB/USDT:USDT"
+        assert r_shib["recommended_precision"]["price_precision"] == 9
+
+        r_1000shib = client.get("/api/symbol/verify?symbol=1000SHIB").json()
+        assert r_1000shib["verified"] is True
+        assert r_1000shib["symbol"] == "SHIB/USDT:USDT"
+
+        # 2. Verify PEPE (price_precision=10)
+        r_pepe = client.get("/api/symbol/verify?symbol=PEPE").json()
+        assert r_pepe["verified"] is True
+        assert r_pepe["symbol"] == "PEPE/USDT:USDT"
+        assert r_pepe["recommended_precision"]["price_precision"] == 10
+
+        # 3. Verify invalid & nonexistent symbols return verified=False + error prompt
+        r_bad = client.get("/api/symbol/verify?symbol=@@@").json()
+        assert r_bad["verified"] is False
+        assert "error" in r_bad and r_bad["error"]
+
+        r_unknown = client.get("/api/symbol/verify?symbol=FAKETOKEN999").json()
+        assert r_unknown["verified"] is False
+        assert "未上线" in r_unknown["error"]
+
+        # 4. Validate SymbolStrategy model accepts price_precision=9 and 10 with LONG_SHORT_GRID & order_usdt=5
+        pepe_cfg = SymbolStrategy(
+            symbol="PEPE/USDT:USDT",
+            strategy_type="LONG_SHORT_GRID",
+            order_usdt=5.0,
+            leverage=5,
+            price_precision=10,
+            qty_precision=0,
+            min_qty=1000000.0,
+        )
+        shib_cfg = SymbolStrategy(
+            symbol="SHIB/USDT:USDT",
+            strategy_type="LONG_SHORT_GRID",
+            order_usdt=5.0,
+            leverage=5,
+            price_precision=9,
+            qty_precision=0,
+            min_qty=100000.0,
+        )
+        assert pepe_cfg.price_precision == 10
+        assert shib_cfg.price_precision == 9
+
+
+def test_position_persistence_and_live_sync_across_pause_and_restart():
+    from backend.sniper_engine import BidirectionalSniperEngine
+    from backend.models import ExchangeConfigModel, SniperState
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "pos_recovery_test.db")
+        adb = AsyncDatabaseManager(db_path=db_file)
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(77)
+
+        # Configure tenant 77 in LIVE mode with one GRID symbol (BTC) and one LEAD_LAG symbol (SOL)
+        adb.save_exchange_sync(
+            ExchangeConfigModel(
+                exchange_id="binanceusdm",
+                display_name="Binance USD-M",
+                role="leader",
+                is_active=True,
+                taker_fee=0.0004,
+                maker_fee=0.0002,
+            ),
+            user_id=77,
+        )
+        adb.save_exchange_sync(
+            ExchangeConfigModel(
+                exchange_id="okx",
+                display_name="OKX Swap",
+                role="follower",
+                is_active=True,
+                api_key="test-okx-key",
+                api_secret="test-okx-sec",
+                passphrase="test-okx-pass",
+                taker_fee=0.0005,
+                maker_fee=0.0002,
+            ),
+            user_id=77,
+        )
+        btc_grid = SymbolStrategy(
+            symbol="BTC/USDT:USDT",
+            strategy_type="LONG_SHORT_GRID",
+            grid_side_mode="LONG_SHORT",
+            grid_levels=3,
+            grid_step_pct=0.01,
+            grid_take_profit_pct=0.025,
+            grid_range_pct=0.05,
+            grid_stop_loss_pct=0.10,
+            order_usdt=100.0,
+            leverage=5,
+            price_precision=1,
+            qty_precision=2,
+            min_qty=0.01,
+        )
+        sol_ll = SymbolStrategy(
+            symbol="SOL/USDT:USDT",
+            strategy_type="LEAD_LAG",
+            order_usdt=50.0,
+            leverage=5,
+            take_profit_pct=0.015,
+            stop_loss_pct=0.025,
+            price_precision=2,
+            qty_precision=1,
+            min_qty=0.1,
+        )
+        adb.upsert_symbol_sync(btc_grid, user_id=77)
+        adb.upsert_symbol_sync(sol_ll, user_id=77)
+
+        async def run_recovery_flow():
+            # 1. Session A: open a grid position & persist state before stop/restart
+            eng1 = BidirectionalSniperEngine(adb, user_id=77)
+            for ex in adb.load_exchanges_sync(user_id=77):
+                eng1.exchanges[ex["exchange_id"]] = ex
+            for cfg in adb.load_symbols_sync(user_id=77):
+                eng1._register_symbol_internal(cfg)
+            eng1.risk_config = GlobalRiskConfig(trading_mode="LIVE", user_started=True, max_exposure_usdt=5000.0)
+            eng1.trading_active_by_mode["LIVE"] = True
+            eng1.exchanges["okx"]["_decrypted_secret"] = "test-okx-sec"
+            eng1.exchanges["okx"]["_decrypted_passphrase"] = "test-okx-pass"
+
+            tracker1 = eng1.grid_trackers["BTC/USDT:USDT"]
+            tracker1.sync_config(btc_grid, current_mid=100000.0)
+            tracker1.recover_open_position(
+                side="LONG",
+                entry_price=98000.0,
+                filled_qty=0.01,
+                contracts=1.0,
+                ct_val=0.01,
+                cfg=btc_grid,
+                round_trip_fee=0.001,
+                preferred_slot="L1",
+            )
+            eng1._save_open_strategy_state()
+            eng1.persist_runtime_state()
+
+            saved_state = adb.load_runtime_setting_sync("open_strategy_state", user_id=77)
+            assert isinstance(saved_state, dict)
+            assert saved_state.get("grid_states", {}).get("BTC/USDT:USDT"), "open_strategy_state should persist BTC grid slot"
+
+            # Insert a LEAD_LAG OPEN position row for SOL into positions table
+            conn = sqlite3.connect(db_file)
+            conn.execute(
+                """INSERT INTO positions (user_id, symbol, exchange_id, side, qty, entry_price, tp_order_id, sl_order_id, state, opened_at_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (77, "SOL/USDT:USDT", "okx", "SHORT", 2.0, 150.0, "", "", "HOLDING", int(time.time() * 1000)),
+            )
+            conn.commit()
+            conn.close()
+
+            # 2. Session B: Simulate full service restart + pause -> resume
+            eng2 = BidirectionalSniperEngine(adb, user_id=77)
+            for ex in adb.load_exchanges_sync(user_id=77):
+                eng2.exchanges[ex["exchange_id"]] = ex
+            for cfg in adb.load_symbols_sync(user_id=77):
+                eng2._register_symbol_internal(cfg)
+            eng2.risk_config = GlobalRiskConfig(trading_mode="LIVE", user_started=True, max_exposure_usdt=5000.0)
+            eng2.exchanges["okx"]["_decrypted_secret"] = "test-okx-sec"
+            eng2.exchanges["okx"]["_decrypted_passphrase"] = "test-okx-pass"
+
+            await eng2._reconcile_startup_positions()
+            # Persisted grid state must be restored immediately on startup without getting wiped
+            assert any(k.startswith("BTC/USDT:USDT:") for k in eng2.active_grid_positions), (
+                f"Expected restored grid slot for BTC, got {list(eng2.active_grid_positions.keys())}"
+            )
+            # LEAD_LAG DB row must NOT be wiped to ORPHAN_RECOVERED before exchange sync verifies it
+            assert len(adb.load_open_positions_sync(user_id=77)) == 1
+
+            live_okx_rows = [
+                {
+                    "symbol": "BTC/USDT:USDT",
+                    "inst_id": "BTC-USDT-SWAP",
+                    "side": "LONG",
+                    "contracts": 1.0,
+                    "ct_val": 0.01,
+                    "qty": 0.01,
+                    "entry_price": 98000.0,
+                    "mark_price": 99000.0,
+                    "notional_usdt": 990.0,
+                    "margin_usdt": 198.0,
+                    "leverage": 5,
+                    "upl_usdt": 10.0,
+                    "upl_ratio": 0.0505,
+                    "mgn_mode": "isolated",
+                    "pos_id": "okx-pos-btc",
+                },
+                {
+                    "symbol": "SOL/USDT:USDT",
+                    "inst_id": "SOL-USDT-SWAP",
+                    "side": "SHORT",
+                    "contracts": 2.0,
+                    "ct_val": 1.0,
+                    "qty": 2.0,
+                    "entry_price": 150.0,
+                    "mark_price": 147.0,
+                    "notional_usdt": 294.0,
+                    "margin_usdt": 58.8,
+                    "leverage": 5,
+                    "upl_usdt": 6.0,
+                    "upl_ratio": 0.102,
+                    "mgn_mode": "isolated",
+                    "pos_id": "okx-pos-sol",
+                },
+                {
+                    "symbol": "NVDA/USDT:USDT",
+                    "inst_id": "NVDA-USDT-SWAP",
+                    "side": "LONG",
+                    "contracts": 5.0,
+                    "ct_val": 0.1,
+                    "qty": 0.5,
+                    "entry_price": 135.0,
+                    "mark_price": 136.0,
+                    "notional_usdt": 68.0,
+                    "margin_usdt": 13.6,
+                    "leverage": 5,
+                    "upl_usdt": 0.5,
+                    "upl_ratio": 0.0367,
+                    "mgn_mode": "isolated",
+                    "pos_id": "okx-pos-nvda",
+                },
+            ]
+
+            mock_fetch = AsyncMock(return_value={"ok": True, "positions": list(live_okx_rows)})
+            with (
+                patch.object(eng2.executor, "fetch_live_positions", new=mock_fetch),
+                patch.object(
+                    eng2.executor,
+                    "verify_exchange_credentials",
+                    new=AsyncMock(
+                        return_value={
+                            "ok": True,
+                            "auth_status": "VERIFIED",
+                            "auth_message": "账户模式: 单币种保证金",
+                            "account_equity_usdt": 100.0,
+                        }
+                    ),
+                ),
+                patch.object(eng2.executor, "preflight_check_symbols", new=AsyncMock(return_value={"ok": True, "errors": [], "warnings": []})),
+            ):
+                # Pause then Resume -> automatically syncs live OKX positions
+                await eng2.set_trading_active(False)
+                resume_res = await eng2.set_trading_active(True)
+                assert resume_res["ok"] is True
+
+                snap = eng2.build_dashboard_snapshot()
+                by_sym = {p["symbol"]: p for p in snap["active_positions"]}
+                assert set(by_sym.keys()) == {"BTC/USDT:USDT", "SOL/USDT:USDT", "NVDA/USDT:USDT"}
+
+                # BTC -> Grid strategy recovered
+                assert by_sym["BTC/USDT:USDT"]["strategy_type"] == "LONG_SHORT_GRID"
+                assert by_sym["BTC/USDT:USDT"]["managed_by_strategy"] is True
+                assert by_sym["BTC/USDT:USDT"]["recovered"] is True
+                assert by_sym["BTC/USDT:USDT"]["tp_price"] > 98000.0
+                assert by_sym["BTC/USDT:USDT"]["sl_price"] > 0
+
+                # SOL -> Lead-Lag strategy recovered & monitoring active
+                assert eng2.symbol_states.get("SOL/USDT:USDT") == SniperState.HOLDING
+                assert "SOL/USDT:USDT" in eng2.active_positions
+                assert by_sym["SOL/USDT:USDT"]["strategy_type"] == "LEAD_LAG"
+                assert by_sym["SOL/USDT:USDT"]["managed_by_strategy"] is True
+                assert by_sym["SOL/USDT:USDT"]["side"] == "SHORT"
+
+                # NVDA -> Unmanaged exchange holding visible in dashboard
+                assert by_sym["NVDA/USDT:USDT"]["strategy_type"] == "UNMANAGED"
+                assert by_sym["NVDA/USDT:USDT"]["managed_by_strategy"] is False
+
+                # Adopt NVDA into grid strategy -> becomes managed LONG_SHORT_GRID slot
+                adopt_res = await eng2.adopt_exchange_position_into_grid("NVDA/USDT:USDT")
+                assert adopt_res["ok"] is True
+                assert "NVDA/USDT:USDT" in eng2.strategies
+                assert eng2.strategies["NVDA/USDT:USDT"].strategy_type == "LONG_SHORT_GRID"
+
+                snap_adopted = eng2.build_dashboard_snapshot()
+                by_sym_adopted = {p["symbol"]: p for p in snap_adopted["active_positions"]}
+                assert by_sym_adopted["NVDA/USDT:USDT"]["strategy_type"] == "LONG_SHORT_GRID"
+                assert by_sym_adopted["NVDA/USDT:USDT"]["managed_by_strategy"] is True
+
+                # When NVDA closes on OKX, next periodic sync cleans stale recovered slot
+                mock_fetch.return_value = {"ok": True, "positions": list(live_okx_rows[:2])}
+                await eng2.sync_live_exchange_positions("periodic")
+                snap_after_close = eng2.build_dashboard_snapshot()
+                assert "NVDA/USDT:USDT" not in {p["symbol"] for p in snap_after_close["active_positions"]}
+
+            for t in list(eng2._bg_tasks):
+                t.cancel()
+            if eng2._bg_tasks:
+                await asyncio.gather(*list(eng2._bg_tasks), return_exceptions=True)
+
+        asyncio.run(run_recovery_flow())
+
+        # Verify guest public preview remains isolated and leaks zero OKX holdings
+        from backend.main import app
+        with TestClient(app) as client:
+            guest_stats = client.get("/api/stats").json()
+            assert guest_stats["risk"]["trading_mode"] == "SHADOW"
+            assert not any(p.get("symbol") == "NVDA/USDT:USDT" for p in guest_stats.get("active_positions", []))
+
+
+def test_zero_latency_db_persistence_http_pool_and_ws_radar_filter():
+    from backend.executor import OrderResult
+    from backend.math_engine import mono_ms
+    from backend.sniper_engine import BidirectionalSniperEngine
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "perf_opt_test.db")
+        adb = AsyncDatabaseManager(db_path=db_file)
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(88)
+
+        zec_cfg = SymbolStrategy(
+            symbol="ZEC/USDT:USDT",
+            strategy_type="LONG_SHORT_GRID",
+            order_usdt=5.0,
+            leverage=5,
+            min_qty=0.01,
+            price_precision=2,
+            qty_precision=2,
+        )
+        btc_cfg = SymbolStrategy(
+            symbol="BTC/USDT:USDT",
+            strategy_type="LONG_SHORT_GRID",
+            order_usdt=50.0,
+            leverage=5,
+            min_qty=0.0001,
+            price_precision=1,
+            qty_precision=3,
+        )
+        adb.upsert_symbol_sync(zec_cfg, user_id=88)
+        adb.upsert_symbol_sync(btc_cfg, user_id=88)
+
+        async def run_perf_checks():
+            await adb.start_worker()
+            try:
+                eng = BidirectionalSniperEngine(adb, user_id=88)
+                for ex in adb.load_exchanges_sync(user_id=88):
+                    eng.exchanges[ex["exchange_id"]] = ex
+                for cfg in adb.load_symbols_sync(user_id=88):
+                    eng._register_symbol_internal(cfg)
+                    eng._seed_initial_ticks(cfg.symbol, cfg, eng.math_states[cfg.symbol])
+
+                # 1. Persistent HTTP client pooling reuses warm connection within same loop
+                async with eng.executor._borrow_http_client(None, timeout=4.0) as c1:
+                    async with eng.executor._borrow_http_client(None, timeout=4.0) as c2:
+                        assert c1 is c2
+
+                # 2. Radar filter returns only requested coin (cuts WS payload size by ~80%)
+                full_snap = eng.build_dashboard_snapshot()
+                assert set(full_snap["radar_series"].keys()) >= {"ZEC/USDT:USDT", "BTC/USDT:USDT"}
+                filtered_snap = eng.build_dashboard_snapshot(radar_symbol="BTC/USDT:USDT")
+                assert list(filtered_snap["radar_series"].keys()) == ["BTC/USDT:USDT"]
+
+                # 3. Structural size/margin rejection backs off 60s and stops spamming SQLite orders
+                eng.risk_config = GlobalRiskConfig(trading_mode="LIVE", user_started=True)
+                tracker = eng.grid_trackers["ZEC/USDT:USDT"]
+                tracker.sync_config(zec_cfg, current_mid=400.0)
+                slot_info = {**tracker.levels["S1"], "reservation_price": 404.0, "trigger_exec_price": 404.0}
+                tracker.levels["S1"]["status"] = "ENTERING"
+
+                with patch.object(
+                    eng.executor,
+                    "place_entry_ioc",
+                    new=AsyncMock(
+                        return_value=OrderResult(
+                            order_id="ioc-zec-block",
+                            status="MISSED",
+                            filled_qty=0.0,
+                            avg_price=0.0,
+                            latency_ms=0.04,
+                            raw_msg="OKX 实盘下单元数据校验拦截: 单笔金额 5.00U 小于 OKX 最小开仓额 9.60U",
+                        )
+                    ),
+                ):
+                    await eng._run_grid_entry(zec_cfg, tracker, slot_info, "LIVE")
+
+                lv_s1 = tracker.levels["S1"]
+                assert lv_s1["status"] == "IDLE"
+                assert lv_s1["cooldown_until_mono"] - mono_ms() > 50_000.0
+
+                # Updating order_usdt clears backoff immediately without waiting 60s
+                zec_cfg_fixed = zec_cfg.model_copy(update={"order_usdt": 15.0})
+                eng.add_or_update_symbol(zec_cfg_fixed)
+                assert tracker.levels["S1"]["cooldown_until_mono"] == 0.0
+
+                # 4. Async runtime persistence flushes through batch worker
+                eng._save_open_strategy_state()
+                await asyncio.sleep(0.35)
+                assert isinstance(adb.load_runtime_setting_sync("open_strategy_state", user_id=88), dict)
+
+                # 5. Cleanup prunes aged MISSED orders while keeping 100% of FILLED orders
+                conn = sqlite3.connect(db_file)
+                conn.execute(
+                    """INSERT INTO orders (order_id, user_id, symbol, exchange_id, purpose, side, order_type, price, requested_qty, filled_qty, avg_price, status, latency_ms, created_at)
+                       VALUES ('old-miss-1', 88, 'ZEC/USDT:USDT', 'okx', 'GRID_S1', 'SHORT', 'IOC_LIMIT', 400, 0.01, 0, 0, 'MISSED', 0.04, datetime('now', '-5 days')),
+                              ('old-fill-1', 88, 'BTC/USDT:USDT', 'okx', 'GRID_L1', 'LONG', 'IOC_LIMIT', 64000, 0.01, 0.01, 64000, 'FILLED', 25.0, datetime('now', '-10 days'))"""
+                )
+                conn.commit()
+                conn.close()
+
+                clean_res = adb.cleanup_old_records_sync(missed_keep_hours=48, risk_keep_days=14)
+                assert clean_res["missed_deleted"] == 1
+                conn = sqlite3.connect(db_file)
+                rem_ids = {r[0] for r in conn.execute("SELECT order_id FROM orders WHERE user_id = 88").fetchall()}
+                conn.close()
+                assert "old-fill-1" in rem_ids
+                assert "old-miss-1" not in rem_ids
+
+                # 6. Verify real-time total unrealized profit / loss / net aggregation across all open positions
+                eng.active_grid_positions["BTC/USDT:USDT:L1"] = {
+                    "symbol": "BTC/USDT:USDT",
+                    "strategy_type": "LONG_SHORT_GRID",
+                    "grid_slot_id": "L1",
+                    "mode": "LIVE",
+                    "side": "LONG",
+                    "qty": 0.01,
+                    "notional_usdt": 650.0,
+                    "entry_price": 64000.0,
+                    "mark_price": 65000.0,
+                    "unrealized_net_pct": 0.015,
+                    "unrealized_usdt": 10.0,
+                    "managed_by_strategy": True,
+                }
+                eng.active_positions["ZEC/USDT:USDT"] = {
+                    "symbol": "ZEC/USDT:USDT",
+                    "strategy_type": "LEAD_LAG",
+                    "mode": "LIVE",
+                    "side": "SHORT",
+                    "qty": 0.1,
+                    "notional_usdt": 40.0,
+                    "entry_price": 400.0,
+                    "mark_price": 425.0,
+                    "unrealized_net_pct": -0.0625,
+                    "unrealized_usdt": -2.5,
+                    "managed_by_strategy": True,
+                }
+                eng.exchange_live_positions = {
+                    # Already managed above (must NOT double-count)
+                    "BTC/USDT:USDT:LONG": {
+                        "symbol": "BTC/USDT:USDT",
+                        "side": "LONG",
+                        "qty": 0.01,
+                        "contracts": 1.0,
+                        "ct_val": 0.01,
+                        "notional_usdt": 650.0,
+                        "entry_price": 64000.0,
+                        "mark_price": 65000.0,
+                        "leverage": 5,
+                        "unrealized_net_pct": 0.015,
+                        "unrealized_usdt": 10.0,
+                    },
+                    # Unmanaged losing holding (MUST be included in loss sum)
+                    "NVDA/USDT:USDT:LONG": {
+                        "symbol": "NVDA/USDT:USDT",
+                        "side": "LONG",
+                        "qty": 0.5,
+                        "contracts": 5.0,
+                        "ct_val": 0.1,
+                        "notional_usdt": 65.0,
+                        "entry_price": 135.0,
+                        "mark_price": 130.0,
+                        "leverage": 5,
+                        "unrealized_net_pct": -0.037,
+                        "unrealized_usdt": -1.25,
+                    },
+                    # Unmanaged winning holding (MUST be included in profit sum)
+                    "SNDK/USDT:USDT:LONG": {
+                        "symbol": "SNDK/USDT:USDT",
+                        "side": "LONG",
+                        "qty": 1.0,
+                        "contracts": 1.0,
+                        "ct_val": 1.0,
+                        "notional_usdt": 45.0,
+                        "entry_price": 44.0,
+                        "mark_price": 45.5,
+                        "leverage": 5,
+                        "unrealized_net_pct": 0.034,
+                        "unrealized_usdt": 1.5,
+                    },
+                }
+
+                # Also verify live follower tick refreshes unrealized_usdt in real time for exchange positions
+                # and multi-slot net_mode grids do not double-count or drift from exchange avgPx
+                eng.active_grid_positions["BTC/USDT:USDT:L2"] = {
+                    "symbol": "BTC/USDT:USDT",
+                    "strategy_type": "LONG_SHORT_GRID",
+                    "grid_slot_id": "L2",
+                    "mode": "LIVE",
+                    "side": "LONG",
+                    "qty": 0.005,
+                    "notional_usdt": 325.0,
+                    "entry_price": 63500.0,
+                    "mark_price": 65000.0,
+                    "unrealized_net_pct": 0.02,
+                    "unrealized_usdt": 7.5,
+                    "managed_by_strategy": True,
+                }
+                eng._handle_follower_bbo("BTC/USDT:USDT", 65200.0, 65201.0, 10.0, 10.0)
+                # Exchange BTC LONG qty=0.01, avgPx=64000, mark=bid=65200 -> +12.0 USDT, notional=652.0
+                pnl_snap = eng.build_dashboard_snapshot(radar_symbol="BTC/USDT:USDT")
+                ps = pnl_snap["position_pnl_summary"]
+                assert ps["total_positions"] == 4
+                assert ps["strategy_slots"] == 5
+                assert ps["profit_count"] == 2
+                assert ps["loss_count"] == 2
+                assert ps["total_profit_usdt"] == 13.5   # 12.0 (BTC) + 1.5 (SNDK)
+                assert ps["total_loss_usdt"] == -3.75    # -2.5 (ZEC) + -1.25 (NVDA)
+                assert ps["net_unrealized_usdt"] == 9.75 # 13.5 - 3.75
+                assert ps["total_notional_usdt"] == 802.0
+                assert pnl_snap["stats"]["position_pnl_summary"] == ps
+
+                await eng.executor.aclose()
+            finally:
+                await adb.stop_worker()
+
+        asyncio.run(run_perf_checks())
+
+
+def test_trend_breakout_grid_and_adaptive_vcp_dual_mode_switching():
+    from backend.grid_engine import LongShortGridTracker, calc_pyramid_weights
+    from backend.market_gateway import MarketDataGateway
+    import math
+
+    # 1. Verify exact 50% / 30% / 20% decaying pyramid weights for 3 levels
+    assert calc_pyramid_weights(3, decay_enabled=True) == [0.50, 0.30, 0.20]
+    assert abs(sum(calc_pyramid_weights(5, decay_enabled=True)) - 1.0) < 1e-9
+
+    # 2. Verify SQLite migration & round-trip persistence for TREND_GRID and ADAPTIVE_GRID
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "trend_grid_test.db")
+        adb = AsyncDatabaseManager(db_path=db_file)
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(99)
+
+        trend_cfg = SymbolStrategy(
+            symbol="SOL/USDT:USDT",
+            strategy_type="TREND_GRID",
+            grid_side_mode="LONG_SHORT",
+            grid_levels=3,
+            grid_step_pct=0.01,
+            grid_range_pct=0.08,
+            grid_stop_loss_pct=0.08,
+            order_usdt=100.0,
+            leverage=5,
+            price_precision=2,
+            qty_precision=2,
+            slippage_pct=0.0005,
+            trend_dead_zone_mult=2.0,
+            trend_trailing_mult=1.5,
+            trend_pyramid_decay=True,
+            trend_use_bb_breakout=True,
+            bbw_timeframe="15m",
+            bbw_squeeze_percentile=20.0,
+        )
+        adaptive_cfg = trend_cfg.model_copy(
+            update={"symbol": "BTC/USDT:USDT", "strategy_type": "ADAPTIVE_GRID", "bbw_timeframe": "1H"}
+        )
+        adb.upsert_symbol_sync(trend_cfg, user_id=99)
+        adb.upsert_symbol_sync(adaptive_cfg, user_id=99)
+
+        loaded = {s.symbol: s for s in adb.load_symbols_sync(user_id=99)}
+        assert loaded["SOL/USDT:USDT"].strategy_type == "TREND_GRID"
+        assert loaded["SOL/USDT:USDT"].trend_dead_zone_mult == 2.0
+        assert loaded["SOL/USDT:USDT"].trend_trailing_mult == 1.5
+        assert loaded["SOL/USDT:USDT"].trend_pyramid_decay is True
+        assert loaded["BTC/USDT:USDT"].strategy_type == "ADAPTIVE_GRID"
+        assert loaded["BTC/USDT:USDT"].bbw_timeframe == "1H"
+
+    # 3. Verify TREND_GRID: Dead Zone + BB Upper + 50/30/20 Pyramid + Livermore SL + Batch Trailing Stop
+    bb_info = {
+        "timeframe": "15m",
+        "bbw": 0.012,
+        "bbw_pct": 1.2,
+        "bbw_percentile": 8.0,
+        "bb_upper": 102.50,
+        "bb_middle": 100.00,
+        "bb_lower": 97.50,
+        "vcp_contraction": True,
+    }
+    tracker = LongShortGridTracker("SOL/USDT:USDT")
+    tracker.sync_config(trend_cfg, current_mid=100.0, bbw_info=bb_info)
+    assert tracker.active_grid_mode == "TREND_BREAKOUT"
+    # L1 must clear BOTH 2*step (102.0) and BB upper (102.5) -> 102.5; S1 -> 97.5
+    assert tracker.levels["L1"]["trigger_price"] == 102.50
+    assert tracker.levels["L2"]["trigger_price"] == 103.50
+    assert tracker.levels["L3"]["trigger_price"] == 104.50
+    assert tracker.levels["S1"]["trigger_price"] == 97.50
+    # Decaying 50% / 30% / 20% of 300U budget
+    assert tracker.levels["L1"]["order_usdt"] == 150.0 and tracker.levels["L1"]["weight_pct"] == 50.0
+    assert tracker.levels["L2"]["order_usdt"] == 90.0 and tracker.levels["L2"]["weight_pct"] == 30.0
+    assert tracker.levels["L3"]["order_usdt"] == 60.0 and tracker.levels["L3"]["weight_pct"] == 20.0
+    # No fixed TP cap
+    assert tracker.levels["L1"]["tp_price"] == 0.0
+
+    # Price inside dead zone (101.8) -> zero entries
+    en0, ex0 = tracker.evaluate_tick(101.7, 101.8, 101.75, trend_cfg, is_net_mode=True, round_trip_fee=0.0007)
+    assert en0 == [] and ex0 == []
+
+    # Price breaks above L1 (102.55) -> only L1 triggers first (sequential pyramid)
+    en1, ex1 = tracker.evaluate_tick(102.50, 102.55, 102.52, trend_cfg, is_net_mode=True, round_trip_fee=0.0007)
+    assert [e["slot_id"] for e in en1] == ["L1"]
+    tracker.mark_entry_filled("L1", entry_price=102.55, filled_qty=1.46, contracts=1.46, ct_val=1.0, cfg=trend_cfg, round_trip_fee=0.0007)
+    # L1 initial SL sits at center_price (100.0) to cut false breakouts immediately
+    assert tracker.levels["L1"]["sl_price"] == 100.0
+
+    # Price rallies to L2 (103.55) -> L2 opens and raises L1's SL to breakeven + fee!
+    en2, _ = tracker.evaluate_tick(103.50, 103.55, 103.52, trend_cfg, is_net_mode=True, round_trip_fee=0.0007)
+    assert [e["slot_id"] for e in en2] == ["L2"]
+    tracker.mark_entry_filled("L2", entry_price=103.55, filled_qty=0.87, contracts=0.87, ct_val=1.0, cfg=trend_cfg, round_trip_fee=0.0007)
+    assert tracker.levels["L1"]["sl_price"] >= round(102.55 * 1.0007, 2)  # Livermore breakeven protection!
+    assert tracker.levels["L2"]["sl_price"] == 102.55  # Previous leg entry
+
+    # Price rallies to L3 (104.55) -> L3 opens, L1 SL moves up to L2 entry (guaranteed profit!), L2 SL to breakeven
+    en3, _ = tracker.evaluate_tick(104.50, 104.55, 104.52, trend_cfg, is_net_mode=True, round_trip_fee=0.0007)
+    assert [e["slot_id"] for e in en3] == ["L3"]
+    tracker.mark_entry_filled("L3", entry_price=104.55, filled_qty=0.57, contracts=0.57, ct_val=1.0, cfg=trend_cfg, round_trip_fee=0.0007)
+    assert tracker.levels["L1"]["sl_price"] == 103.55  # Locked profit!
+    assert tracker.levels["L2"]["sl_price"] >= round(103.55 * 1.0007, 2)
+    assert tracker.levels["L3"]["sl_price"] == 103.55
+
+    # Let profits run to peak 110.00 (no fixed TP!) -> trail stop = 110 * (1 - 0.015) = 108.35
+    _, ex_peak = tracker.evaluate_tick(110.00, 110.05, 110.02, trend_cfg, is_net_mode=True, round_trip_fee=0.0007)
+    assert ex_peak == []
+    assert tracker.long_peak_price == 110.00
+    assert tracker.long_trail_stop_price == 108.35
+
+    # Pullback to 108.80 (still above 108.35) -> still holding
+    _, ex_mid = tracker.evaluate_tick(108.80, 108.85, 108.82, trend_cfg, is_net_mode=True, round_trip_fee=0.0007)
+    assert ex_mid == []
+
+    # Pullback to 108.30 (<= 108.35) -> ALL 3 profitable LONG slots batch-exit via TREND_TRAIL_TP!
+    _, ex_trail = tracker.evaluate_tick(108.30, 108.35, 108.32, trend_cfg, is_net_mode=True, round_trip_fee=0.0007)
+    assert {e["slot_id"] for e in ex_trail} == {"L1", "L2", "L3"}
+    assert all(e["exit_reason"] == "TREND_TRAIL_TP" for e in ex_trail)
+
+    # 4. Verify real BBW / VCP compression math on synthetic candles (80 wide bars -> 20 tight squeeze bars)
+    closes = [100.0 + 4.5 * math.sin(i * 0.7) for i in range(80)] + [100.0 + 0.15 * math.sin(i * 0.7) for i in range(25)]
+    bbw_res = MarketDataGateway.compute_bbw_metrics(closes, period=20, num_std=2.0, timeframe="15m")
+    assert bbw_res is not None
+    assert bbw_res["bbw_percentile"] <= 15.0
+    assert bbw_res["vcp_contraction"] is True
+
+    # 5. Verify ADAPTIVE_GRID dual-mode switching + mid-position lock + hysteresis
+    adp_tracker = LongShortGridTracker("BTC/USDT:USDT")
+    normal_bbw = {"timeframe": "1H", "bbw_pct": 3.5, "bbw_percentile": 62.0, "bb_upper": 103.0, "bb_lower": 97.0}
+    squeeze_bbw = {"timeframe": "1H", "bbw_pct": 0.9, "bbw_percentile": 8.0, "bb_upper": 101.2, "bb_lower": 98.8}
+    hyst_bbw = {"timeframe": "1H", "bbw_pct": 1.6, "bbw_percentile": 26.0, "bb_upper": 101.8, "bb_lower": 98.2}
+
+    adp_tracker.sync_config(adaptive_cfg, current_mid=100.0, bbw_info=normal_bbw)
+    assert adp_tracker.active_grid_mode == "MEAN_REVERSION"
+    assert adp_tracker.levels["L1"]["trigger_price"] == 99.0  # Traditional buy-dip below center
+
+    # Open L1 in MEAN_REVERSION -> squeeze arrives mid-position -> MUST NOT switch while holding!
+    en_mr, _ = adp_tracker.evaluate_tick(98.90, 98.95, 98.92, adaptive_cfg, is_net_mode=True, bbw_info=normal_bbw)
+    assert [e["slot_id"] for e in en_mr] == ["L1"]
+    adp_tracker.mark_entry_filled("L1", 98.95, 1.0, 1.0, 1.0, adaptive_cfg, 0.0007)
+    adp_tracker.evaluate_tick(99.20, 99.25, 99.22, adaptive_cfg, is_net_mode=True, bbw_info=squeeze_bbw)
+    assert adp_tracker.active_grid_mode == "MEAN_REVERSION"  # Locked during open position!
+
+    # Close L1 -> flat -> next tick under squeeze_bbw auto-recenters & switches to TREND_BREAKOUT!
+    adp_tracker.mark_exited("L1", 0.5)
+    adp_tracker.evaluate_tick(100.0, 100.05, 100.02, adaptive_cfg, is_net_mode=True, bbw_info=squeeze_bbw)
+    assert adp_tracker.active_grid_mode == "TREND_BREAKOUT"
+    assert adp_tracker.levels["L1"]["trigger_price"] > 100.02  # Breakout LONG now ABOVE center!
+    assert adp_tracker.consume_regime_log() is not None
+
+    # Hysteresis check: bbw_percentile=26% (< 20+15=35%) stays TREND_BREAKOUT
+    adp_tracker.evaluate_tick(100.0, 100.05, 100.02, adaptive_cfg, is_net_mode=True, bbw_info=hyst_bbw)
+    assert adp_tracker.active_grid_mode == "TREND_BREAKOUT"
+
+    # Volatility expands back to 62% (>= 35%) while flat -> cleanly returns to MEAN_REVERSION!
+    adp_tracker.evaluate_tick(100.0, 100.05, 100.02, adaptive_cfg, is_net_mode=True, bbw_info=normal_bbw)
+    assert adp_tracker.active_grid_mode == "MEAN_REVERSION"
+    assert adp_tracker.levels["L1"]["trigger_price"] < 100.02
+
+
+def test_stats_reset_clears_kpis_preserves_positions_and_persists_across_restart():
+    from backend.main import app
+    from backend.sniper_engine import BidirectionalSniperEngine
+    from backend.math_engine import wall_ms
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "stats_reset_test.db")
+        adb = AsyncDatabaseManager(db_path=db_file)
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(88)
+
+        btc_grid = SymbolStrategy(
+            symbol="BTC/USDT:USDT",
+            strategy_type="LONG_SHORT_GRID",
+            grid_side_mode="LONG_SHORT",
+            grid_levels=3,
+            grid_step_pct=0.006,
+            grid_take_profit_pct=0.012,
+            grid_range_pct=0.04,
+            grid_stop_loss_pct=0.08,
+            order_usdt=100.0,
+            leverage=5,
+            price_precision=1,
+            qty_precision=2,
+            min_qty=0.01,
+        )
+        adb.upsert_symbol_sync(btc_grid, user_id=88)
+
+        async def run_reset_flow():
+            await adb.start_worker()
+            eng1 = BidirectionalSniperEngine(adb, user_id=88)
+            for cfg in adb.load_symbols_sync(user_id=88):
+                eng1._register_symbol_internal(cfg)
+            eng1.risk_config = GlobalRiskConfig(trading_mode="LIVE", feed_source="REAL_WS")
+
+            # Seed an open grid position that MUST survive statistics reset untouched
+            tracker = eng1.grid_trackers["BTC/USDT:USDT"]
+            tracker.sync_config(btc_grid, current_mid=100000.0)
+            tracker.mark_entry_filled("L1", 99400.0, 0.01, 1.0, 0.01, btc_grid, 0.0007)
+            tracker.completed_cycles = 4
+            tracker.total_net_pnl = 18.5
+            eng1.active_grid_positions["BTC/USDT:USDT:L1"] = {
+                "symbol": "BTC/USDT:USDT",
+                "side": "LONG",
+                "trading_mode": "LIVE",
+                "grid_slot_id": "L1",
+                "entry_price": 99400.0,
+                "qty": 0.01,
+            }
+
+            # Record 2 pre-reset trades (1 win, 1 loss) + 1 missed IOC in LIVE mode
+            t_old = wall_ms() - 5000
+            old_win = {
+                "time": "10:00:01.000",
+                "symbol": "BTC/USDT:USDT",
+                "side": "LONG",
+                "trading_mode": "LIVE",
+                "order_id": "old-win-1",
+                "entry_price": 99000.0,
+                "exit_price": 100000.0,
+                "filled_qty": 0.01,
+                "gross_pnl_usdt": 10.0,
+                "fee_usdt": 0.5,
+                "net_pnl_usdt": 9.5,
+                "signal_ts_ms": t_old,
+                "submit_ts_ms": t_old,
+                "ack_ts_ms": t_old,
+                "hold_duration_ms": 1200,
+                "exit_reason": "GRID_TP_L1",
+            }
+            old_loss = {
+                "time": "10:00:02.000",
+                "symbol": "BTC/USDT:USDT",
+                "side": "SHORT",
+                "trading_mode": "LIVE",
+                "order_id": "old-loss-1",
+                "entry_price": 100000.0,
+                "exit_price": 100500.0,
+                "filled_qty": 0.01,
+                "gross_pnl_usdt": -5.0,
+                "fee_usdt": 0.5,
+                "net_pnl_usdt": -5.5,
+                "signal_ts_ms": t_old + 1000,
+                "submit_ts_ms": t_old + 1000,
+                "ack_ts_ms": t_old + 1000,
+                "hold_duration_ms": 800,
+                "exit_reason": "GRID_SL_S1",
+            }
+            eng1.stats_by_mode["LIVE"]["total_signals"] += 3
+            eng1.stats_by_mode["LIVE"]["ioc_filled_count"] += 2
+            eng1.stats_by_mode["LIVE"]["ioc_missed_count"] += 1
+            adb.record_trade_async(old_win, user_id=88)
+            adb.record_trade_async(old_loss, user_id=88)
+            eng1._accumulate_trade_into_stats(old_win, is_historical=False, mode_override="LIVE")
+            eng1._accumulate_trade_into_stats(old_loss, is_historical=False, mode_override="LIVE")
+
+            snap_before = eng1.build_dashboard_snapshot()
+            assert snap_before["stats"]["total_net_pnl"] == 4.0
+            assert snap_before["stats"]["win_count"] == 1
+            assert snap_before["stats"]["loss_count"] == 1
+            assert snap_before["stats"]["ioc_filled_count"] == 2
+            assert snap_before["stats"]["ioc_missed_count"] == 1
+            assert snap_before["stats"]["total_signals"] == 3
+            assert snap_before["stats"]["stats_reset_at_ms"] == 0
+
+            # 1. Execute one-click statistics reset
+            res = eng1.reset_statistics("LIVE")
+            assert res["ok"] is True
+            assert res["mode"] == "LIVE"
+            reset_ts = res["reset_at_ms"]
+            assert reset_ts > t_old + 1000
+
+            snap_after = eng1.build_dashboard_snapshot()
+            st = snap_after["stats"]
+            assert st["total_net_pnl"] == 0.0
+            assert st["total_gross_pnl"] == 0.0
+            assert st["total_fees"] == 0.0
+            assert st["ioc_filled_count"] == 0
+            assert st["ioc_missed_count"] == 0
+            assert st["fill_rate_pct"] == 0.0
+            assert st["win_count"] == 0
+            assert st["loss_count"] == 0
+            assert st["win_rate_pct"] == 0.0
+            assert st["total_signals"] == 0
+            assert st["equity_curve"] == []
+            assert st["recent_trades"] == []
+            assert st["stats_reset_at_ms"] == reset_ts
+            assert tracker.completed_cycles == 0
+            assert tracker.total_net_pnl == 0.0
+            # Open positions MUST be 100% preserved!
+            assert "BTC/USDT:USDT:L1" in eng1.active_grid_positions
+            assert tracker.levels["L1"]["status"] == "OPEN"
+
+            # 2. Record a brand-new trade AFTER reset_ts -> accumulates freshly from 0
+            t_new = reset_ts + 250
+            new_win = {
+                "time": "10:05:00.000",
+                "symbol": "BTC/USDT:USDT",
+                "side": "LONG",
+                "trading_mode": "LIVE",
+                "order_id": "post-reset-win-1",
+                "entry_price": 100000.0,
+                "exit_price": 100600.0,
+                "filled_qty": 0.01,
+                "gross_pnl_usdt": 6.0,
+                "fee_usdt": 0.4,
+                "net_pnl_usdt": 5.6,
+                "signal_ts_ms": t_new,
+                "submit_ts_ms": t_new,
+                "ack_ts_ms": t_new,
+                "hold_duration_ms": 900,
+                "exit_reason": "GRID_TP_L1",
+            }
+            eng1.stats_by_mode["LIVE"]["total_signals"] += 1
+            eng1.stats_by_mode["LIVE"]["ioc_filled_count"] += 1
+            adb.record_trade_async(new_win, user_id=88)
+            eng1._accumulate_trade_into_stats(new_win, is_historical=False, mode_override="LIVE")
+            await adb.stop_worker()
+
+            snap_post = eng1.build_dashboard_snapshot()
+            assert snap_post["stats"]["total_net_pnl"] == 5.6
+            assert snap_post["stats"]["win_count"] == 1
+            assert snap_post["stats"]["loss_count"] == 0
+            assert snap_post["stats"]["win_rate_pct"] == 100.0
+            assert snap_post["stats"]["ioc_filled_count"] == 1
+            assert snap_post["stats"]["ioc_missed_count"] == 0
+            assert snap_post["stats"]["total_signals"] == 1
+
+            # 3. Simulate full server restart: new engine loads DB and MUST skip pre-reset trades
+            eng2 = BidirectionalSniperEngine(adb, user_id=88)
+            with (
+                patch.object(eng2, "_reconcile_startup_positions", new=AsyncMock()),
+                patch.object(eng2.gateway, "start", new=AsyncMock()),
+            ):
+                await eng2.start()
+
+            snap_restarted = eng2.build_dashboard_snapshot()
+            st2 = snap_restarted["stats"]
+            assert st2["stats_reset_at_ms"] == reset_ts
+            assert st2["total_net_pnl"] == 5.6
+            assert st2["win_count"] == 1
+            assert st2["loss_count"] == 0
+            assert st2["win_rate_pct"] == 100.0
+            assert st2["ioc_filled_count"] == 1
+            assert st2["total_signals"] == 1
+            assert len(st2["recent_trades"]) == 1
+            assert st2["recent_trades"][0]["entry"] == 100000.0
+            assert st2["recent_trades"][0]["exit"] == 100600.0
+
+        asyncio.run(run_reset_flow())
+
+    # 4. Unauthenticated guest CANNOT call /api/stats/reset (strict 401 guard)
+    with TestClient(app) as client:
+        r_unauth = client.post("/api/stats/reset")
+        assert r_unauth.status_code == 401
+
+
+def test_batch1_trend_grid_no_death_spiral_and_sync_cooldown():
+    from backend.grid_engine import LongShortGridTracker
+    from backend.math_engine import mono_ms
+
+    cfg = SymbolStrategy(
+        symbol="SOL/USDT:USDT",
+        strategy_type="TREND_GRID",
+        grid_side_mode="LONG_SHORT",
+        grid_levels=3,
+        grid_step_pct=0.006,
+        grid_take_profit_pct=0.0065,
+        grid_range_pct=0.08,
+        grid_stop_loss_pct=0.10,
+        order_usdt=100.0,
+        leverage=5,
+        price_precision=2,
+        qty_precision=2,
+        trend_dead_zone_mult=2.0,
+        trend_trailing_mult=1.5,
+        trend_pyramid_decay=True,
+        trend_use_bb_breakout=False,
+    )
+    tracker = LongShortGridTracker("SOL/USDT:USDT")
+    tracker.sync_config(cfg, current_mid=100.0)
+    assert tracker.active_grid_mode == "TREND_BREAKOUT"
+    assert tracker.levels["L1"]["trigger_price"] == 101.20
+
+    # 1. Breakout LONG L1 at 101.25, then rally to 106.0 -> trailing stop = 106*(1-0.009) = 105.05
+    en1, _ = tracker.evaluate_tick(101.20, 101.25, 101.22, cfg, is_net_mode=True, round_trip_fee=0.0010)
+    assert [e["slot_id"] for e in en1] == ["L1"]
+    tracker.mark_entry_filled("L1", 101.25, 1.0, 1.0, 1.0, cfg, round_trip_fee=0.0010)
+
+    # Verify Livermore SL clamp: if L2 fills at same price as L1 (adverse slip), neither L1 nor L2 SL sits >= 101.25!
+    tracker.mark_entry_filled("L2", 101.25, 0.6, 0.6, 1.0, cfg, round_trip_fee=0.0010)
+    assert tracker.levels["L2"]["sl_price"] < 101.25
+    assert tracker.levels["L1"]["sl_price"] < 101.25
+
+    # When L3 fills higher at 102.50, L1 & L2 SL lock breakeven + 2*taker_fee (0.0010) cleanly!
+    tracker.mark_entry_filled("L3", 102.50, 0.4, 0.4, 1.0, cfg, round_trip_fee=0.0010)
+    assert tracker.levels["L2"]["sl_price"] >= round(101.25 * 1.0010, 2)
+    assert tracker.levels["L3"]["sl_price"] == 101.25
+
+    # Rally to 106.0 then pullback to 104.90 -> batch TREND_TRAIL_TP exit
+    tracker.evaluate_tick(106.00, 106.05, 106.02, cfg, is_net_mode=True, round_trip_fee=0.0010)
+    _, ex_trail = tracker.evaluate_tick(104.90, 104.95, 104.92, cfg, is_net_mode=True, round_trip_fee=0.0010)
+    assert {e["slot_id"] for e in ex_trail} == {"L1", "L2", "L3"}
+    tracker.mark_exited("L1", 3.6)
+    tracker.mark_exited("L2", 2.1)
+    tracker.mark_exited("L3", 0.9)
+    assert tracker._needs_post_trend_recenter is True
+
+    # Next tick at 104.92 (far above old center 100.0): MUST recenter to 104.92 instead of re-entering L1 immediately!
+    en_after, ex_after = tracker.evaluate_tick(104.90, 104.95, 104.92, cfg, is_net_mode=True, round_trip_fee=0.0010)
+    assert en_after == [] and ex_after == []
+    assert abs(tracker.center_price - 104.92) < 0.01
+    assert tracker.levels["L1"]["trigger_price"] > 106.0
+
+    # 2. sync_config() with identical params MUST preserve 60s structural backoff cooldown
+    tracker.levels["L1"]["status"] = "ENTERING"
+    tracker.mark_entry_missed("L1", backoff_ms=60_000.0)
+    cd_before = tracker.levels["L1"]["cooldown_until_mono"]
+    assert cd_before > mono_ms() + 30_000.0
+    tracker.sync_config(cfg, current_mid=104.92)
+    assert tracker.levels["L1"]["cooldown_until_mono"] == cd_before
+
+    # Changing config params SHOULD rebuild and clear cooldowns
+    cfg_changed = cfg.model_copy(update={"grid_step_pct": 0.008})
+    tracker.sync_config(cfg_changed, current_mid=104.92)
+    assert tracker.levels["L1"]["cooldown_until_mono"] == 0.0
+
+
+def test_batch1_executor_decimal_partial_exit_no_fallback_and_uncertain_reconcile():
+    from backend.executor import ExecutionAdapter
+    from backend.market_gateway import _OKX_INSTRUMENT_CACHE
+
+    async def run_exec_checks():
+        rc = GlobalRiskConfig(trading_mode="LIVE")
+        ex = ExecutionAdapter(lambda _: None, lambda: rc)
+        ex.mode = "LIVE"
+        cfg = SymbolStrategy(
+            symbol="ETH/USDT:USDT",
+            strategy_type="LONG_SHORT_GRID",
+            order_usdt=100.0,
+            leverage=5,
+            price_precision=2,
+            qty_precision=3,
+        )
+        okx_cfg = {
+            "exchange_id": "okx",
+            "api_key": "k",
+            "_decrypted_secret": "s",
+            "_decrypted_passphrase": "p",
+            "is_testnet": False,
+            "taker_fee": 0.0005,
+        }
+
+        # 1. Unknown/unloaded instrument spec MUST be rejected in _calc_okx_entry_sz
+        _OKX_INSTRUMENT_CACHE.pop("FAKE-USDT-SWAP", None)
+        sz_str, _, _, _, err_msg = ex._calc_okx_entry_sz("FAKE/USDT:USDT", 100.0, 100.0, 500.0, 5.0)
+        assert sz_str == "" and "未同步" in err_msg
+
+        # Populate ETH spec BEFORE partial exit & uncertain entry tests
+        _OKX_INSTRUMENT_CACHE["ETH-USDT-SWAP"] = {
+            "instId": "ETH-USDT-SWAP",
+            "ctVal": 0.1,
+            "lotSz": 0.01,
+            "lotSz_str": "0.01",
+            "minSz": 0.01,
+            "tickSz": 0.01,
+            "tickSz_str": "0.01",
+            "maxLever": 50,
+            "state": "live",
+        }
+
+        # 2. Exact Decimal rem_contracts (0.03 - 0.02 = 0.01) & allow_close_position_fallback=False MUST NOT call close-position
+        called_paths = []
+
+        async def mock_okx_req(client, creds, method, path, payload=None):
+            called_paths.append((method, path, payload))
+            if path == "/api/v5/trade/order":
+                return {"code": "0", "data": [{"ordId": f"ord-{len(called_paths)}", "sCode": "0"}]}
+            if path.startswith("/api/v5/trade/order?"):
+                # First exit fills 0.02 of 0.03, second fills remaining 0.01 -> no close-position call!
+                order_calls = [p for p in called_paths if p[1] == "/api/v5/trade/order"]
+                if len(order_calls) == 1:
+                    return {"code": "0", "data": [{"state": "partially_filled", "accFillSz": "0.02", "avgPx": "3000.0"}]}
+                return {"code": "0", "data": [{"state": "filled", "accFillSz": "0.01", "avgPx": "3002.0"}]}
+            return {"code": "0", "data": []}
+
+        with (
+            patch.object(ex, "_okx_request", side_effect=mock_okx_req),
+            patch.object(ex, "ensure_okx_account_meta", new=AsyncMock(return_value={"posMode": "net_mode", "acctLv": "2"})),
+        ):
+            res = await ex.execute_exit_with_retry(
+                cfg=cfg,
+                side="LONG",
+                qty=0.03,
+                exit_reason="GRID_TP_L1",
+                tp_price=3000.0,
+                exchange_cfg=okx_cfg,
+                contracts=0.03,
+                ct_val=1.0,
+                allow_close_position_fallback=False,
+            )
+            assert res.status == "FILLED"
+            assert not any("close-position" in p[1] for p in called_paths)
+            order_payloads = [p[2] for p in called_paths if p[1] == "/api/v5/trade/order"]
+            assert order_payloads[0]["sz"] == "0.03"
+            assert order_payloads[1]["sz"] == "0.01"  # exact Decimal subtraction!
+
+        # 3. Post-submit network timeout returns UNCERTAIN (not MISSED) and reconcile_order NEVER fakes FILLED in LIVE
+        async def mock_timeout_req(client, creds, method, path, payload=None):
+            raise RuntimeError("network read timeout after submit")
+
+        with (
+            patch.object(ex, "_okx_request", side_effect=mock_timeout_req),
+            patch.object(ex, "ensure_okx_account_meta", new=AsyncMock(return_value={"posMode": "net_mode", "acctLv": "2"})),
+            patch.object(ex, "ensure_leverage", new=AsyncMock(return_value=(True, ""))),
+        ):
+            entry_res = await ex.place_entry_ioc(cfg, "LONG", 0.03, 3001.0, 3000.0, okx_cfg)
+            assert entry_res.status == "UNCERTAIN"
+            assert entry_res.cl_ord_id.startswith("sn")
+
+            rec_res = await ex.reconcile_order(
+                cfg, entry_res.order_id, 0.03, 3000.0, exchange_cfg=okx_cfg, cl_ord_id=entry_res.cl_ord_id
+            )
+            assert rec_res.status == "UNCERTAIN"
+
+        # 4. Non-OKX LIVE entry MUST be rejected explicitly instead of mocking FILLED
+        non_okx = dict(okx_cfg, exchange_id="binance_usdm")
+        bad_res = await ex.place_entry_ioc(cfg, "LONG", 0.03, 3001.0, 3000.0, non_okx)
+        assert bad_res.status == "MISSED" and ("仅支持" in bad_res.raw_msg or "OKX" in bad_res.raw_msg)
+
+    asyncio.run(run_exec_checks())
+
+
+def test_batch1_gateway_disconnect_honesty_and_flat_bbw():
+    from backend.market_gateway import MarketDataGateway
+
+    gw = MarketDataGateway()
+    gw.set_symbols(["BTC/USDT:USDT"])
+    gw.real_follower_bbo["BTC/USDT:USDT"] = (100000.0, 100001.0, 1.0, 1.0)
+    gw.okx_connected = True
+    gw.binance_connected = True
+
+    # Flat candles must report 0.0% BBW percentile (extreme compression), NOT 100.0%
+    flat_metrics = MarketDataGateway.compute_bbw_metrics([100.0] * 40, period=20, num_std=2.0, timeframe="15m")
+    assert flat_metrics is not None
+    assert flat_metrics["bbw"] == 0.0
+    assert flat_metrics["bbw_percentile"] == 0.0
+
+    # REST fallback mode must never claim LIVE_WS
+    gw.binance_connected = False
+    gw.okx_connected = False
+    gw.active_source = "REST_FALLBACK"
+    assert gw.active_source != "LIVE_WS"
+
+
+def test_batch2_auth_pfp_payment_atomicity_delete_purge_and_api_hardening():
+    from backend.user_membership import UserMembershipManager
+    from backend.engine_manager import EngineManager
+    from backend.main import app
+    import base64, hashlib, hmac, json, time
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "batch2_security.db")
+        adb = AsyncDatabaseManager(db_path=db_file)
+        adb.init_sync()
+        um = UserMembershipManager(db_path=db_file)
+        um.init_sync()
+
+        u_res = um.register_user("alice_sec", "Secret1234!", "alice@test.local")
+        assert u_res["ok"] is True
+        uid = u_res["user"]["id"]
+
+        # 1. Forged token signed with server secret but missing `pfp` claim MUST be rejected
+        from backend.user_membership import TOKEN_SECRET
+
+        pld_bytes = json.dumps(
+            {"uid": uid, "usr": "alice_sec", "role": "user", "exp": int(time.time()) + 3600},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        b64_pld = base64.urlsafe_b64encode(pld_bytes).decode("utf-8").rstrip("=")
+        sig = hmac.new(TOKEN_SECRET, b64_pld.encode("utf-8"), hashlib.sha256).hexdigest()
+        no_pfp_token = f"{b64_pld}.{sig}"
+        assert um.get_user_from_token(no_pfp_token) is None
+
+        # 2. Payment atomicity: cancelling an order prevents later on-chain confirmation from granting VIP
+        plans = um.list_plans()
+        order_res = um.create_web3_payment_order(uid, plans[0]["id"], "MULTI_EVM")
+        assert order_res["ok"] is True
+        order_id = order_res["order"]["id"]
+        order_no = order_res["order"]["order_no"]
+        pay_amt = float(order_res["order"]["pay_amount_usdt"])
+
+        cancel_res = um.cancel_user_order(uid, order_no)
+        assert cancel_res["ok"] is True
+        confirm_cancelled = um.confirm_order_paid_onchain(order_id, "BSC", "0x" + "a" * 64, pay_amt)
+        assert confirm_cancelled["ok"] is False
+
+        # Fresh order confirmed once succeeds, duplicate confirmation is rejected
+        order_res2 = um.create_web3_payment_order(uid, plans[0]["id"], "MULTI_EVM")
+        order_id2 = order_res2["order"]["id"]
+        pay_amt2 = float(order_res2["order"]["pay_amount_usdt"])
+        ok1 = um.confirm_order_paid_onchain(order_id2, "BSC", "0x" + "b" * 64, pay_amt2)
+        assert ok1["ok"] is True
+        ok2 = um.confirm_order_paid_onchain(order_id2, "BSC", "0x" + "c" * 64, pay_amt2)
+        assert ok2["ok"] is False
+
+        # 3. admin_delete_user purges exchanges/runtime_settings and EngineManager does NOT resurrect deleted user
+        adb.ensure_user_workspace_sync(uid)
+        del_res = um.admin_delete_user(uid)
+        assert del_res["ok"] is True
+        import sqlite3
+
+        with sqlite3.connect(db_file) as c_chk:
+            assert c_chk.execute("SELECT COUNT(*) FROM exchanges WHERE user_id=?", (uid,)).fetchone()[0] == 0
+            assert c_chk.execute("SELECT COUNT(*) FROM symbol_configs WHERE user_id=?", (uid,)).fetchone()[0] == 0
+            assert c_chk.execute("SELECT COUNT(*) FROM runtime_settings WHERE user_id=?", (uid,)).fetchone()[0] == 0
+
+        async def check_no_ghost():
+            mgr = EngineManager(adb, get_user_fn=um.get_user_by_id)
+            with patch("backend.sniper_engine.BidirectionalSniperEngine.start", new=AsyncMock()):
+                await mgr.start()
+            assert uid not in mgr.user_engines
+            await mgr.stop()
+
+        asyncio.run(check_no_ghost())
+
+    # 4. Unknown /api/* path returns 404 JSON (never 200 SPA HTML)
+    with TestClient(app) as client:
+        r_404 = client.get("/api/nonexistent-route-check")
+        assert r_404.status_code == 404
+        assert "detail" in r_404.json()
+
+
+def test_batch_symbol_validate_and_apply_preserves_open_positions():
+    from backend.sniper_engine import BidirectionalSniperEngine
+    from backend.models import BatchSymbolUpdateRequest
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "batch_symbols_test.db")
+        adb = AsyncDatabaseManager(db_path=db_file)
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(77)
+
+        # Coin 1: narrow 0.40% step (has open position!)
+        eth_narrow = SymbolStrategy(
+            symbol="ETH/USDT:USDT",
+            strategy_type="ADAPTIVE_GRID",
+            grid_levels=3,
+            grid_step_pct=0.004,
+            grid_take_profit_pct=0.005,
+            grid_range_pct=0.05,
+            grid_stop_loss_pct=0.08,
+            order_usdt=100.0,
+            leverage=5,
+            price_precision=2,
+            qty_precision=3,
+        )
+        # Coin 2: inverted TP < step (SOL case: step 0.60%, tp 0.45%)
+        sol_inverted = SymbolStrategy(
+            symbol="SOL/USDT:USDT",
+            strategy_type="ADAPTIVE_GRID",
+            grid_levels=3,
+            grid_step_pct=0.006,
+            grid_take_profit_pct=0.0045,
+            grid_range_pct=0.05,
+            grid_stop_loss_pct=0.08,
+            order_usdt=100.0,
+            leverage=5,
+            price_precision=2,
+            qty_precision=2,
+        )
+        adb.upsert_symbol_sync(eth_narrow, user_id=77)
+        adb.upsert_symbol_sync(sol_inverted, user_id=77)
+
+        eng = BidirectionalSniperEngine(adb, user_id=77)
+        for cfg in adb.load_symbols_sync(user_id=77):
+            eng._register_symbol_internal(cfg)
+
+        # Open a live slot on ETH before running batch update
+        eth_tracker = eng.grid_trackers["ETH/USDT:USDT"]
+        eth_tracker.sync_config(eth_narrow, current_mid=3000.0)
+        eth_tracker.mark_entry_filled("L1", 2988.0, 0.03, 0.3, 0.1, eth_narrow, round_trip_fee=0.0010)
+        assert eth_tracker.levels["L1"]["status"] == "OPEN"
+
+        # 1. Read-only validate catches BOTH anomalies and changes nothing
+        val_res = eng.validate_and_batch_update_symbols(
+            BatchSymbolUpdateRequest(action="validate", strategy_filter="ALL_GRID")
+        )
+        assert val_res["ok"] is True
+        assert val_res["grid_round_trip_fee_pct"] == 0.1  # 2 * 0.05%
+        by_sym = {it["symbol"]: it for it in val_res["items"]}
+        assert any("步长偏窄" in x for x in by_sym["ETH/USDT:USDT"]["issues"])
+        assert any("止盈低于步长倒挂" in x for x in by_sym["SOL/USDT:USDT"]["issues"])
+        assert eng.strategies["ETH/USDT:USDT"].grid_step_pct == 0.004
+
+        # 2. Apply updates step->0.60%, tp->0.65% safely without disturbing ETH open L1 slot
+        app_res = eng.validate_and_batch_update_symbols(
+            BatchSymbolUpdateRequest(
+                action="apply",
+                strategy_filter="ALL_GRID",
+                grid_step_pct=0.006,
+                grid_take_profit_pct=0.0065,
+                auto_fix_anomalies=True,
+            )
+        )
+        assert app_res["ok"] is True
+        assert app_res["updated_count"] >= 2
+        assert app_res["open_deferred_count"] == 1
+        assert eng.strategies["ETH/USDT:USDT"].grid_step_pct == 0.006
+        assert eng.strategies["ETH/USDT:USDT"].grid_take_profit_pct == 0.0065
+        assert eng.strategies["SOL/USDT:USDT"].grid_take_profit_pct == 0.0065
+        # Open slot MUST remain OPEN and untouched!
+        assert eth_tracker.levels["L1"]["status"] == "OPEN"
+        assert eth_tracker.levels["L1"]["entry_price"] == 2988.0
+
+        # 3. Verify POST /api/risk/update handler preserves active kill_switch_active=True
+        from backend.main import update_risk
+
+        async def check_risk_kill_switch_preserved():
+            eng.risk_config.kill_switch_active = True
+            eng.risk_config.trading_mode = "LIVE"
+            with patch(
+                "backend.main._require_user_engine",
+                new=AsyncMock(return_value=({"id": 77, "can_use_live": True}, eng)),
+            ):
+                res = await update_risk(
+                    GlobalRiskConfig(kill_switch_active=False, max_daily_loss_usdt=222.0),
+                    authorization="Bearer dummy",
+                )
+            assert res["risk"]["kill_switch_active"] is True
+            assert res["risk"]["max_daily_loss_usdt"] == 222.0
+            assert eng.risk_config.kill_switch_active is True
+
+        asyncio.run(check_risk_kill_switch_preserved())
+
+
+
+
+
+
+

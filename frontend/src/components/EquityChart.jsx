@@ -1,16 +1,22 @@
 import React, { useMemo, useState } from 'react';
+import { getChartPointIndex, useContainerChartSize } from '../utils/useContainerChartSize';
 
 export default function EquityChart({ equityCurve = [], stats = {}, theme = 'dark' }) {
   const [hoverIdx, setHoverIdx] = useState(null);
 
-  const width = 640;
-  const height = 220;
-  const padL = 58;
-  const padR = 18;
-  const padT = 18;
-  const padB = 26;
-  const plotW = width - padL - padR;
-  const plotH = height - padT - padB;
+  const { containerRef, width, height, isCompact } = useContainerChartSize({
+    defaultWidth: 640,
+    mobileHeight: 195,
+    tabletHeight: 210,
+    desktopHeight: 220,
+  });
+
+  const padL = isCompact ? 46 : 58;
+  const padR = isCompact ? 10 : 18;
+  const padT = 16;
+  const padB = isCompact ? 20 : 24;
+  const plotW = Math.max(120, width - padL - padR);
+  const plotH = Math.max(80, height - padT - padB);
 
   const isLight = theme === 'light';
   const gridStroke = isLight ? '#e2e8f0' : '#1e293b';
@@ -72,61 +78,72 @@ export default function EquityChart({ equityCurve = [], stats = {}, theme = 'dar
       maxV: maxVal,
       coordPts: mapped,
     };
-  }, [equityCurve, plotW, plotH]);
+  }, [equityCurve, plotW, plotH, padL, padT]);
 
   const activePt =
     hoverIdx !== null && coordPts[hoverIdx] ? coordPts[hoverIdx] : coordPts[coordPts.length - 1] || null;
 
   const longTrades = stats.long_trades || 0;
   const shortTrades = stats.short_trades || 0;
+  const hasDirTrades = longTrades + shortTrades > 0;
   const totalDir = Math.max(1, longTrades + shortTrades);
-  const longPct = Math.round((longTrades / totalDir) * 100);
-  const shortPct = 100 - longPct;
+  const longPct = hasDirTrades ? Math.round((longTrades / totalDir) * 100) : 0;
+  const shortPct = hasDirTrades ? 100 - longPct : 0;
 
   const makerCount = stats.maker_tp_count || 0;
   const takerCount = stats.taker_exit_count || 0;
+  const hasExitTrades = makerCount + takerCount > 0;
   const totalExits = Math.max(1, makerCount + takerCount);
-  const makerPct = Math.round((makerCount / totalExits) * 100);
+  const makerPct = hasExitTrades ? Math.round((makerCount / totalExits) * 100) : 0;
+  const takerPct = hasExitTrades ? 100 - makerPct : 0;
+
+  const handleScrub = (clientX, target) => {
+    const idx = getChartPointIndex(clientX, target, width, padL, plotW, coordPts.length);
+    if (idx !== null) setHoverIdx(idx);
+  };
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-5">
       {/* Cumulative Equity Curve */}
-      <div className="lg:col-span-2 surface-card p-6">
-        <div className="flex flex-wrap items-center justify-between gap-2 mb-4 pb-3.5 border-b border-line">
+      <div className="lg:col-span-2 surface-card p-4 sm:p-6">
+        <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center sm:justify-between gap-2.5 mb-3.5 sm:mb-4 pb-3 border-b border-line">
           <div className="flex items-center gap-2.5">
-            <div className="icon-box w-9 h-9">
+            <div className="icon-box w-8 h-8 sm:w-9 sm:h-9">
               <svg className="w-4 h-4 text-emerald-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <polyline points="22 7 13.5 15.5 8.5 10.5 2 17" />
                 <polyline points="16 7 22 7 22 13" />
               </svg>
             </div>
-            <h3 className="text-base font-bold text-main">累计净收益与毛收益对比曲线</h3>
+            <h3 className="text-sm sm:text-base font-bold text-main">累计净收益与毛收益对比曲线</h3>
           </div>
 
-          <div className="flex items-center gap-4 text-xs font-mono">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] sm:text-xs font-mono">
             <span className="flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400 font-semibold">
               <span className="w-3 h-0.5 bg-emerald-500 inline-block"></span>
-              扣费净收益: {(activePt ? Number(activePt.raw.net_pnl) : stats.total_net_pnl ?? 0).toFixed(4)} USDT
+              扣费净收益: {(activePt ? Number(activePt.raw.net_pnl) : stats.total_net_pnl ?? 0).toFixed(4)} U
             </span>
             <span className="flex items-center gap-1.5 text-dim">
               <span className="w-3 h-0.5 bg-slate-400 inline-block"></span>
-              累计毛收益: {(activePt ? Number(activePt.raw.gross_pnl) : stats.total_gross_pnl ?? 0).toFixed(4)} USDT
+              累计毛收益: {(activePt ? Number(activePt.raw.gross_pnl) : stats.total_gross_pnl ?? 0).toFixed(4)} U
             </span>
           </div>
         </div>
 
-        <svg
-          viewBox={`0 0 ${width} ${height}`}
-          className="w-full h-48 select-none cursor-crosshair"
-          onMouseLeave={() => setHoverIdx(null)}
-          onMouseMove={(e) => {
-            if (!coordPts.length) return;
-            const rect = e.currentTarget.getBoundingClientRect();
-            const relX = ((e.clientX - rect.left) / rect.width) * width;
-            const ratio = Math.max(0, Math.min(1, (relX - padL) / plotW));
-            setHoverIdx(Math.round(ratio * (coordPts.length - 1)));
-          }}
-        >
+        <div ref={containerRef} className="relative w-full overflow-hidden">
+          <svg
+            viewBox={`0 0 ${width} ${height}`}
+            style={{ height: `${height}px` }}
+            className="w-full select-none cursor-crosshair touch-pan-y"
+            onMouseLeave={() => setHoverIdx(null)}
+            onMouseMove={(e) => handleScrub(e.clientX, e.currentTarget)}
+            onTouchStart={(e) => {
+              if (e.touches?.[0]) handleScrub(e.touches[0].clientX, e.currentTarget);
+            }}
+            onTouchMove={(e) => {
+              if (e.touches?.[0]) handleScrub(e.touches[0].clientX, e.currentTarget);
+            }}
+            onTouchEnd={() => setHoverIdx(null)}
+          >
           <defs>
             <linearGradient id="netEquityAreaGrad" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="#10b981" stopOpacity={isLight ? '0.22' : '0.28'} />
@@ -187,30 +204,31 @@ export default function EquityChart({ equityCurve = [], stats = {}, theme = 'dar
               <circle cx={activePt.x} cy={activePt.yn} r="4" fill="#10b981" stroke="#fff" strokeWidth="1.2" />
             </g>
           )}
-        </svg>
+          </svg>
+        </div>
       </div>
 
       {/* Directional & Fee Structure Breakdown */}
-      <div className="surface-card p-6 flex flex-col justify-between">
+      <div className="surface-card p-4 sm:p-6 flex flex-col justify-between">
         <div>
-          <div className="flex items-center gap-2.5 mb-4 pb-3.5 border-b border-line">
-            <div className="icon-box w-9 h-9">
+          <div className="flex items-center gap-2.5 mb-4 pb-3 border-b border-line">
+            <div className="icon-box w-8 h-8 sm:w-9 sm:h-9">
               <svg className="w-4 h-4 text-sky-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M21.21 15.89A10 10 0 1 1 8 2.83" />
                 <path d="M22 12A10 10 0 0 0 12 2v10z" />
               </svg>
             </div>
-            <h3 className="text-base font-bold text-main">多空收益与平仓费率分布</h3>
+            <h3 className="text-sm sm:text-base font-bold text-main">多空收益与平仓费率分布</h3>
           </div>
 
           {/* Long vs Short Breakdown */}
           <div className="mb-4">
-            <div className="flex justify-between text-xs font-mono mb-1.5">
+            <div className="flex flex-wrap justify-between gap-1 text-[11px] sm:text-xs font-mono mb-1.5">
               <span className="text-emerald-600 dark:text-emerald-400 font-medium">
-                多头成交 ({longTrades} 笔 · {(stats.long_net_pnl ?? 0).toFixed(3)} U)
+                多头 ({longTrades}笔 · {(stats.long_net_pnl ?? 0).toFixed(3)}U)
               </span>
               <span className="text-rose-600 dark:text-rose-400 font-medium">
-                空头成交 ({shortTrades} 笔 · {(stats.short_net_pnl ?? 0).toFixed(3)} U)
+                空头 ({shortTrades}笔 · {(stats.short_net_pnl ?? 0).toFixed(3)}U)
               </span>
             </div>
             <div className="w-full h-2.5 surface-subtle rounded-full overflow-hidden flex">
@@ -225,21 +243,21 @@ export default function EquityChart({ equityCurve = [], stats = {}, theme = 'dar
 
           {/* Post-Only Maker TP vs Taker IOC Exit */}
           <div>
-            <div className="flex justify-between text-xs font-mono mb-1.5">
+            <div className="flex flex-wrap justify-between gap-1 text-[11px] sm:text-xs font-mono mb-1.5">
               <span className="text-amber-600 dark:text-amber-400 font-medium">
-                被动挂单止盈 ({makerCount} 笔)
+                被动挂单止盈 ({makerCount}笔)
               </span>
               <span className="text-sky-600 dark:text-sky-400 font-medium">
-                主动吃单平仓 ({takerCount} 笔)
+                主动吃单平仓 ({takerCount}笔)
               </span>
             </div>
             <div className="w-full h-2.5 surface-subtle rounded-full overflow-hidden flex">
               <div className="bg-amber-500 h-full transition-all duration-300" style={{ width: `${makerPct}%` }} />
-              <div className="bg-sky-500 h-full transition-all duration-300" style={{ width: `${100 - makerPct}%` }} />
+              <div className="bg-sky-500 h-full transition-all duration-300" style={{ width: `${takerPct}%` }} />
             </div>
-            <div className="flex justify-between text-[11px] font-mono text-dim mt-1">
-              <span>被动挂单省费占比 {makerPct}%</span>
-              <span>累计手续费支出 {(stats.total_fees ?? 0).toFixed(4)} U</span>
+            <div className="flex flex-wrap justify-between gap-1 text-[11px] font-mono text-dim mt-1">
+              <span>被动省费占比 {makerPct}%</span>
+              <span>累计手续费 {(stats.total_fees ?? 0).toFixed(4)}U</span>
             </div>
           </div>
         </div>

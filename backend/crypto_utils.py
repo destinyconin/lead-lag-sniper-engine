@@ -4,14 +4,22 @@ Fixes Section 3.3 API security requirement: never store plaintext secrets in SQL
 """
 import base64
 import hashlib
+import logging
 import os
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+logger = logging.getLogger("sniper.crypto")
 
 
 class SecretVault:
     def __init__(self, master_key_str: str | None = None):
         env_key = master_key_str or os.environ.get("SNIPER_MASTER_KEY")
         self.using_ephemeral_key = env_key is None
+        if self.using_ephemeral_key:
+            logger.warning(
+                "[SECURITY] SNIPER_MASTER_KEY is unset; falling back to development key. "
+                "Set a strong random SNIPER_MASTER_KEY in .env for production!"
+            )
         raw_secret = env_key or "antigravity-lead-lag-sniper-dev-default-key-change-in-prod"
         # Derive a 256-bit (32-byte) key using SHA-256
         self._key = hashlib.sha256(raw_secret.encode("utf-8")).digest()
@@ -31,7 +39,8 @@ class SecretVault:
             raw = base64.b64decode(token.encode("ascii"))
             nonce, ciphertext = raw[:12], raw[12:]
             return self._aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")
-        except Exception:
+        except Exception as exc:
+            logger.error("[SECURITY] SecretVault decrypt failed (%s); check SNIPER_MASTER_KEY", type(exc).__name__)
             return ""
 
     @staticmethod
