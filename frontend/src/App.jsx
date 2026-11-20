@@ -2750,40 +2750,42 @@ export default function App() {
             </div>
 
             {/* Split Master-Detail Card (Matching Screenshot 3 `工单系统` 1:1) */}
-            <div className="surface-card overflow-hidden grid grid-cols-1 lg:grid-cols-12 lg:min-h-[580px]">
-              {/* Left Sidebar: Pill Search + Solid Black Add Button + Monitored Contract List */}
-              <div className="lg:col-span-4 border-b lg:border-b-0 lg:border-r border-line p-4 sm:p-6 flex flex-col justify-between">
-                <div className="space-y-3.5 sm:space-y-4">
-                  {/* Pill Search Input (Matching Screenshot 3 `搜索工单...`) */}
-                  <div className="relative">
-                    <Search className="w-4 h-4 text-dim absolute left-4 top-1/2 -translate-y-1/2" strokeWidth={1.75} />
-                    <input
-                      type="text"
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') handleAddSymbolByCode(searchQuery);
-                      }}
-                      placeholder="搜索或输入币种代号 (如 SUI / ARB / WIF)..."
-                      className="w-full rounded-full surface-subtle pl-10 pr-4 py-2.5 text-base sm:text-xs font-mono text-main outline-none"
-                    />
+            <div className="surface-card overflow-hidden grid grid-cols-1 lg:grid-cols-12 lg:min-h-[680px]">
+              {/* Left Sidebar: Pill Search + Solid Black Add Button + Full-Height Monitored Contract List */}
+              <div className="lg:col-span-4 lg:relative border-b lg:border-b-0 lg:border-r border-line">
+                <div className="lg:absolute lg:inset-0 p-4 sm:p-6 flex flex-col">
+                  <div className="shrink-0 space-y-3.5 sm:space-y-4">
+                    {/* Pill Search Input (Matching Screenshot 3 `搜索工单...`) */}
+                    <div className="relative">
+                      <Search className="w-4 h-4 text-dim absolute left-4 top-1/2 -translate-y-1/2" strokeWidth={1.75} />
+                      <input
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') handleAddSymbolByCode(searchQuery);
+                        }}
+                        placeholder="搜索或输入币种代号 (如 SUI / ARB / WIF)..."
+                        className="w-full rounded-full surface-subtle pl-10 pr-4 py-2.5 text-base sm:text-xs font-mono text-main outline-none"
+                      />
+                    </div>
+
+                    {/* Full-Width Solid Black Pill Button (Matching Screenshot 3 `+ 新建工单`) */}
+                    <button
+                      onClick={() => handleAddSymbolByCode(searchQuery)}
+                      className="btn-primary-pill w-full py-2.5 sm:py-3 text-xs"
+                    >
+                      <Plus className="w-4 h-4" strokeWidth={2} />
+                      <span>+ 添加并激活监控合约</span>
+                    </button>
                   </div>
 
-                  {/* Full-Width Solid Black Pill Button (Matching Screenshot 3 `+ 新建工单`) */}
-                  <button
-                    onClick={() => handleAddSymbolByCode(searchQuery)}
-                    className="btn-primary-pill w-full py-2.5 sm:py-3 text-xs"
-                  >
-                    <Plus className="w-4 h-4" strokeWidth={2} />
-                    <span>+ 添加并激活监控合约</span>
-                  </button>
-
-                  {/* Monitored Contracts List */}
-                  <div className="pt-1 sm:pt-2">
-                    <div className="text-xs font-bold text-dim mb-2 px-1">
+                  {/* Monitored Contracts List — fills remaining full height on desktop down to Quick-Add footer */}
+                  <div className="flex-1 min-h-0 flex flex-col pt-3.5 sm:pt-4">
+                    <div className="shrink-0 text-xs font-bold text-dim mb-2 px-1">
                       当前监控中合约 ({strategies.length})
                     </div>
-                    <div className="space-y-2 max-h-[220px] sm:max-h-[290px] lg:max-h-[340px] overflow-y-auto pr-1">
+                    <div className="flex-1 min-h-0 space-y-2 max-h-[380px] sm:max-h-[440px] lg:max-h-none overflow-y-auto pr-1">
                       {strategies.map((item) => {
                         const active = item.symbol === currentStrategy.symbol;
                         const st = item.strategy_type || 'LEAD_LAG';
@@ -2834,22 +2836,22 @@ export default function App() {
                       })}
                     </div>
                   </div>
-                </div>
 
-                {/* Quick-Add Recommended Contract Chips */}
-                <div className="pt-4 mt-4 border-t border-line">
-                  <div className="text-xs font-bold text-dim mb-2">一键快速添加推荐合约</div>
-                  <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
-                    {filteredCatalog.slice(0, 14).map((item) => (
-                      <button
-                        key={item.symbol}
-                        onClick={() => handleAddSymbolByCode(item.symbol)}
-                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full surface-subtle hover:opacity-80 text-xs font-mono transition"
-                      >
-                        <Plus className="w-3 h-3 text-main" strokeWidth={2} />
-                        <span className="font-bold text-main">{item.base}</span>
-                      </button>
-                    ))}
+                  {/* Quick-Add Recommended Contract Chips */}
+                  <div className="shrink-0 pt-4 mt-4 border-t border-line">
+                    <div className="text-xs font-bold text-dim mb-2">一键快速添加推荐合约</div>
+                    <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
+                      {filteredCatalog.slice(0, 14).map((item) => (
+                        <button
+                          key={item.symbol}
+                          onClick={() => handleAddSymbolByCode(item.symbol)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full surface-subtle hover:opacity-80 text-xs font-mono transition"
+                        >
+                          <Plus className="w-3 h-3 text-main" strokeWidth={2} />
+                          <span className="font-bold text-main">{item.base}</span>
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
               </div>
