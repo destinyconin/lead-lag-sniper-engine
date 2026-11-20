@@ -67,6 +67,156 @@ const STRATEGY_LABEL_MAP = {
 const isGridStrategyType = (st) =>
   st === 'LONG_SHORT_GRID' || st === 'TREND_GRID' || st === 'ADAPTIVE_GRID';
 
+const calcPyramidWeights = (count, decayEnabled = true) => {
+  const n = Math.max(1, Math.min(30, Math.round(Number(count) || 1)));
+  if (!decayEnabled || n === 1) return Array.from({ length: n }, () => 1 / n);
+  const presets = {
+    2: [0.6, 0.4],
+    3: [0.5, 0.3, 0.2],
+    4: [0.38, 0.27, 0.2, 0.15],
+    5: [0.3, 0.24, 0.19, 0.15, 0.12],
+  };
+  if (presets[n]) return presets[n];
+  const raw = Array.from({ length: n }, (_, i) => 0.65 ** i);
+  const total = raw.reduce((a, b) => a + b, 0);
+  return raw.map((w) => w / total);
+};
+
+const suggestLinkedGridRange = (levels, stepRatio) => {
+  const n = Math.max(1, Math.min(30, Math.round(Number(levels) || 3)));
+  const step = Math.max(0.0005, Number(stepRatio) || 0.006);
+  const span = n * step;
+  const buffered = Math.max(span * 1.15, span + 0.005);
+  // Round up cleanly to nearest 0.1% (0.001)
+  return Math.min(0.8, Math.ceil(buffered * 1000) / 1000);
+};
+
+const buildGridPreviewAndDiagnostics = (cfg, okxMinNotional = 0, followerMid = 0) => {
+  const n = Math.max(1, Math.min(30, Math.round(Number(cfg.grid_levels ?? 5) || 5)));
+  const step = Math.max(0.0001, Number(cfg.grid_step_pct ?? 0.006) || 0.006);
+  const tp = Math.max(0.0001, Number(cfg.grid_take_profit_pct ?? 0.0065) || 0.0065);
+  const rng = Math.max(0.001, Number(cfg.grid_range_pct ?? 0.05) || 0.05);
+  const sl = Math.max(0.002, Number(cfg.grid_stop_loss_pct ?? 0.08) || 0.08);
+  const lev = Math.max(1, Number(cfg.leverage ?? 5) || 5);
+  const orderUsdt = Math.max(1, Number(cfg.order_usdt ?? 10) || 10);
+  const dzMult = Math.max(0.5, Number(cfg.trend_dead_zone_mult ?? 2.0) || 2.0);
+  const st = cfg.strategy_type || 'LONG_SHORT_GRID';
+  const isTrendLike = st === 'TREND_GRID' || st === 'ADAPTIVE_GRID';
+  const decay = Boolean(cfg.trend_pyramid_decay ?? true);
+  const usePo = Boolean(cfg.use_post_only_tp ?? true);
+  const effRtFee = usePo && st !== 'TREND_GRID' ? 0.0007 : 0.001;
+
+  const totalSpan = n * step;
+  const sideBudget = orderUsdt * n;
+  const sideMargin = sideBudget / lev;
+  const weights = isTrendLike ? calcPyramidWeights(n, decay) : Array.from({ length: n }, () => 1 / n);
+  const legs = weights.map((w, idx) => {
+    const levelIdx = idx + 1;
+    const legUsdt = isTrendLike && decay ? Number((sideBudget * w).toFixed(2)) : Number(orderUsdt.toFixed(2));
+    const mrDistPct = levelIdx * step;
+    const clippedInMr = st !== 'TREND_GRID' && levelIdx > 1 && mrDistPct > rng + 1e-6;
+    const belowMin = okxMinNotional > 0 && legUsdt < okxMinNotional * 1.02;
+    return {
+      slot: `L${levelIdx}`,
+      levelIdx,
+      weightPct: Number((w * 100).toFixed(1)),
+      usdt: legUsdt,
+      mrDistPct,
+      clippedInMr,
+      belowMin,
+    };
+  });
+
+  const activeMrLegs = legs.filter((l) => !l.clippedInMr);
+  const thinnestLeg = legs.reduce((minL, l) => (l.usdt < minL.usdt ? l : minL), legs[0]);
+  // Estimate worst-case full-side stop-loss loss in USDT (average entry to center +/- SL in MR mode, or full budget * SL)
+  const worstSlLossUsdt =
+    st === 'TREND_GRID'
+      ? Number((orderUsdt * n * weights[0] * Math.min(sl, dzMult * step) + sideBudget * 0.001).toFixed(2))
+      : Number(
+          (
+            activeMrLegs.reduce((acc, l) => acc + l.usdt * Math.max(0, sl - l.mrDistPct), 0) +
+            activeMrLegs.reduce((acc, l) => acc + l.usdt, 0) * 0.001
+          ).toFixed(2)
+        );
+  const slRoePct = Number((sl * lev * 100).toFixed(1));
+  const minSuggestedOrderUsdt =
+    okxMinNotional > 0 && isTrendLike && decay && weights.length > 0
+      ? Math.ceil((okxMinNotional * 1.08) / (n * Math.min(...weights)))
+      : okxMinNotional > 0
+      ? Math.ceil(okxMinNotional * 1.08)
+      : 0;
+
+  const alerts = [];
+  if (st !== 'TREND_GRID' && totalSpan > rng + 1e-6) {
+    alerts.push({
+      severity: 'error',
+      msg: `层数×间距 (${n}×${(step * 100).toFixed(2)}%=${(totalSpan * 100).toFixed(2)}%) 超出区间总跨度 ±${(
+        rng * 100
+      ).toFixed(2)}%，外层 ${n - activeMrLegs.length} 格会被裁切不铺`,
+    });
+  }
+  if (st !== 'TREND_GRID' && tp < step - 1e-6) {
+    alerts.push({
+      severity: 'error',
+      msg: `单格止盈 (${(tp * 100).toFixed(2)}%) 低于每格间距 (${(step * 100).toFixed(2)}%)，存在止盈倒挂`,
+    });
+  }
+  if (st !== 'TREND_GRID' && tp <= effRtFee) {
+    alerts.push({
+      severity: 'error',
+      msg: `单格止盈 (${(tp * 100).toFixed(2)}%) 未覆盖双边手续费 (${(effRtFee * 100).toFixed(2)}%)`,
+    });
+  }
+  if (st !== 'TREND_GRID' && sl <= rng + 1e-6) {
+    alerts.push({
+      severity: 'error',
+      msg: `破网硬止损 (${(sl * 100).toFixed(2)}%) ≤ 区间总跨度 (±${(rng * 100).toFixed(2)}%)，未出区间即强平`,
+    });
+  }
+  if (isTrendLike && dzMult * step > rng + 1e-6) {
+    alerts.push({
+      severity: 'warn',
+      msg: `顺势死区 (${(dzMult * step * 100).toFixed(2)}%) 超出区间 (±${(rng * 100).toFixed(2)}%)`,
+    });
+  }
+  if (slRoePct > 35) {
+    alerts.push({
+      severity: 'warn',
+      msg: `${lev}x 杠杆折算保证金硬止损达 ${slRoePct.toFixed(1)}% (>35%)，单边极端行情回撤偏大`,
+    });
+  }
+  if (okxMinNotional > 0 && thinnestLeg.usdt < okxMinNotional * 1.02) {
+    alerts.push({
+      severity: 'error',
+      msg: `最薄单层 ${thinnestLeg.slot} (${thinnestLeg.usdt.toFixed(1)}U) 低于 OKX 实时最小开仓额 (${okxMinNotional.toFixed(
+        2
+      )}U)${minSuggestedOrderUsdt > orderUsdt ? `，建议单格金额 ≥ ${minSuggestedOrderUsdt}U` : ''}`,
+    });
+  }
+
+  return {
+    n,
+    step,
+    tp,
+    rng,
+    sl,
+    lev,
+    totalSpan,
+    sideBudget,
+    sideMargin,
+    legs,
+    activeMrCount: activeMrLegs.length,
+    thinnestLeg,
+    worstSlLossUsdt,
+    slRoePct,
+    okxMinNotional,
+    minSuggestedOrderUsdt,
+    followerMid,
+    alerts,
+  };
+};
+
 const strategyBadgeClass = (st, active = false) => {
   if (st === 'TREND_GRID') {
     return active ? 'bg-violet-500 text-white' : 'bg-violet-500/15 text-violet-600 dark:text-violet-300';
@@ -309,17 +459,21 @@ export default function App() {
   const [batchLoading, setBatchLoading] = useState(false);
   const [batchConfirmApply, setBatchConfirmApply] = useState(false);
   const [batchReport, setBatchReport] = useState(null);
+  const [autoLinkGridParams, setAutoLinkGridParams] = useState(true);
   const [batchForm, setBatchForm] = useState({
     strategy_filter: 'ALL_GRID',
     only_running: false,
     order_usdt_str: '',
+    grid_levels_str: '',
     grid_step_pct_str: '0.60',
     grid_take_profit_pct_str: '0.65',
+    grid_range_pct_str: '',
     grid_stop_loss_pct_str: '',
     trend_trailing_mult_str: '',
     use_post_only_tp_mode: 'keep',
     sl_trigger_px_type_mode: 'keep',
     auto_fix_anomalies: true,
+    auto_link_batch: true,
   });
 
   const toastTimerRef = useRef(null);
@@ -1169,6 +1323,10 @@ export default function App() {
       if (batchForm.order_usdt_str !== '' && Number.isFinite(ordU) && ordU >= 5) {
         payload.order_usdt = Number(ordU.toFixed(2));
       }
+      const lvls = Math.round(Number(batchForm.grid_levels_str));
+      if (batchForm.grid_levels_str !== '' && Number.isFinite(lvls) && lvls >= 1 && lvls <= 30) {
+        payload.grid_levels = lvls;
+      }
       const stepPct = Number(batchForm.grid_step_pct_str);
       if (batchForm.grid_step_pct_str !== '' && Number.isFinite(stepPct) && stepPct > 0) {
         payload.grid_step_pct = Number((stepPct / 100).toFixed(6));
@@ -1176,6 +1334,10 @@ export default function App() {
       const tpPct = Number(batchForm.grid_take_profit_pct_str);
       if (batchForm.grid_take_profit_pct_str !== '' && Number.isFinite(tpPct) && tpPct > 0) {
         payload.grid_take_profit_pct = Number((tpPct / 100).toFixed(6));
+      }
+      const rngPct = Number(batchForm.grid_range_pct_str);
+      if (batchForm.grid_range_pct_str !== '' && Number.isFinite(rngPct) && rngPct >= 0.1) {
+        payload.grid_range_pct = Number((rngPct / 100).toFixed(4));
       }
       const slPct = Number(batchForm.grid_stop_loss_pct_str);
       if (batchForm.grid_stop_loss_pct_str !== '' && Number.isFinite(slPct) && slPct >= 0.2) {
@@ -1317,6 +1479,96 @@ export default function App() {
     const next = [...strategies];
     next[activeStrategyIndex] = { ...currentStrategy, ...patch };
     setStrategies(next);
+  };
+
+  const updateGridParamWithLinkage = (field, rawVal) => {
+    if (!strategies.length) return;
+    const base = { ...currentStrategy };
+    if (!autoLinkGridParams || !isGridStrategyType(base.strategy_type)) {
+      updateCurrentStrategyField({ [field]: rawVal });
+      return;
+    }
+    const patch = { [field]: rawVal };
+    const n = field === 'grid_levels' ? Math.max(1, Math.min(30, Math.round(Number(rawVal) || 1))) : Math.max(1, Number(base.grid_levels ?? 5) || 5);
+    const step = field === 'grid_step_pct' ? Math.max(0.0005, Number(rawVal) || 0.006) : Math.max(0.0005, Number(base.grid_step_pct ?? 0.006) || 0.006);
+    const curTp = Number(base.grid_take_profit_pct ?? 0.0065) || 0.0065;
+    const curRng = Number(base.grid_range_pct ?? 0.05) || 0.05;
+    const curSl = Number(base.grid_stop_loss_pct ?? 0.08) || 0.08;
+
+    if (field === 'grid_levels' || field === 'grid_step_pct') {
+      const nextRng = suggestLinkedGridRange(n, step);
+      patch.grid_range_pct = nextRng;
+      if (field === 'grid_step_pct' || curTp < step) {
+        patch.grid_take_profit_pct = Number(Math.min(0.5, Math.max(step + 0.0005, 0.0012)).toFixed(6));
+      }
+      if (curSl <= nextRng + 1e-6) {
+        patch.grid_stop_loss_pct = Number(Math.min(0.9, Math.ceil((nextRng + 0.01) * 1000) / 1000).toFixed(4));
+      }
+    } else if (field === 'grid_stop_loss_pct') {
+      const nextSl = Math.max(0.002, Math.min(0.9, Number(rawVal) || 0.05));
+      if (curRng >= nextSl - 1e-6) {
+        patch.grid_range_pct = Number(Math.max(0.005, Math.floor(nextSl * 0.8 * 1000) / 1000).toFixed(4));
+      }
+    } else if (field === 'grid_range_pct') {
+      const nextRng = Math.max(0.001, Math.min(0.8, Number(rawVal) || 0.05));
+      if (curSl <= nextRng + 1e-6) {
+        patch.grid_stop_loss_pct = Number(Math.min(0.9, Math.ceil((nextRng + 0.01) * 1000) / 1000).toFixed(4));
+      }
+    }
+    updateCurrentStrategyField(patch);
+  };
+
+  const handleAutoAlignCurrentGrid = () => {
+    if (!currentStrategy || !isGridStrategyType(currentStrategy.strategy_type)) return;
+    const n = Math.max(1, Math.min(30, Math.round(Number(currentStrategy.grid_levels ?? 5) || 5)));
+    const step = Math.max(0.0005, Number(currentStrategy.grid_step_pct ?? 0.006) || 0.006);
+    const dz = Math.max(0.5, Number(currentStrategy.trend_dead_zone_mult ?? 2.0) || 2.0);
+    const minRng = Math.max(suggestLinkedGridRange(n, step), dz * step * 1.3);
+    const nextRng = Math.min(0.8, Math.ceil(minRng * 1000) / 1000);
+    const nextTp = Number(Math.max(Number(currentStrategy.grid_take_profit_pct ?? 0.0065) || 0.0065, step + 0.0005).toFixed(6));
+    const curSl = Number(currentStrategy.grid_stop_loss_pct ?? 0.08) || 0.08;
+    const nextSl = curSl <= nextRng + 0.002 ? Number(Math.min(0.9, Math.ceil((nextRng + 0.01) * 1000) / 1000).toFixed(4)) : curSl;
+    updateCurrentStrategyField({
+      grid_range_pct: nextRng,
+      grid_take_profit_pct: nextTp,
+      grid_stop_loss_pct: nextSl,
+    });
+    showToast(
+      `已对齐 ${currentStrategy.symbol}：区间 ±${(nextRng * 100).toFixed(1)}% · 止盈 ${(nextTp * 100).toFixed(2)}% · 止损 ${(nextSl * 100).toFixed(1)}%（请点击保存生效）`,
+      'success'
+    );
+  };
+
+  const updateBatchFieldWithLinkage = (field, value) => {
+    setBatchForm((prev) => {
+      const next = { ...prev, [field]: value };
+      if (!prev.auto_link_batch) return next;
+      const lvls = Math.round(Number(next.grid_levels_str));
+      const stepPct = Number(next.grid_step_pct_str);
+      if ((field === 'grid_levels_str' || field === 'grid_step_pct_str') && Number.isFinite(stepPct) && stepPct > 0) {
+        if (field === 'grid_step_pct_str') {
+          const curTp = Number(next.grid_take_profit_pct_str);
+          if (!Number.isFinite(curTp) || curTp < stepPct) {
+            next.grid_take_profit_pct_str = (stepPct + 0.05).toFixed(2);
+          }
+        }
+        if (next.grid_levels_str !== '' && Number.isFinite(lvls) && lvls >= 1 && lvls <= 30) {
+          const recRngPct = suggestLinkedGridRange(lvls, stepPct / 100) * 100;
+          next.grid_range_pct_str = recRngPct.toFixed(1);
+          const curSl = Number(next.grid_stop_loss_pct_str);
+          if (next.grid_stop_loss_pct_str !== '' && Number.isFinite(curSl) && curSl <= recRngPct) {
+            next.grid_stop_loss_pct_str = (recRngPct + 1.0).toFixed(1);
+          }
+        }
+      } else if (field === 'grid_stop_loss_pct_str') {
+        const slPct = Number(value);
+        const curRng = Number(next.grid_range_pct_str);
+        if (value !== '' && Number.isFinite(slPct) && slPct >= 0.5 && next.grid_range_pct_str !== '' && Number.isFinite(curRng) && curRng >= slPct) {
+          next.grid_range_pct_str = Math.max(0.5, Math.floor(slPct * 0.8 * 10) / 10).toFixed(1);
+        }
+      }
+      return next;
+    });
   };
 
   const currentTelemetry = snapshot.telemetry?.[selectedSymbol] || {};
@@ -2513,7 +2765,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2.5 items-end">
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5 items-end">
                 <div>
                   <label className="block text-[11px] font-semibold text-dim mb-1">作用范围</label>
                   <select
@@ -2541,6 +2793,19 @@ export default function App() {
                   />
                 </div>
                 <div>
+                  <label className="block text-[11px] font-semibold text-dim mb-1">单边层数 (N)</label>
+                  <input
+                    type="number"
+                    step="1"
+                    min="1"
+                    max="30"
+                    placeholder="留空不改 (如 3 或 5)"
+                    value={batchForm.grid_levels_str}
+                    onChange={(e) => updateBatchFieldWithLinkage('grid_levels_str', e.target.value)}
+                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                  />
+                </div>
+                <div>
                   <label className="block text-[11px] font-semibold text-dim mb-1">目标步长 (%)</label>
                   <input
                     type="number"
@@ -2549,7 +2814,7 @@ export default function App() {
                     max="20"
                     placeholder="留空不改"
                     value={batchForm.grid_step_pct_str}
-                    onChange={(e) => setBatchForm((prev) => ({ ...prev, grid_step_pct_str: e.target.value }))}
+                    onChange={(e) => updateBatchFieldWithLinkage('grid_step_pct_str', e.target.value)}
                     className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
                   />
                 </div>
@@ -2567,6 +2832,19 @@ export default function App() {
                   />
                 </div>
                 <div>
+                  <label className="block text-[11px] font-semibold text-dim mb-1">区间总跨度 ±(%)</label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0.5"
+                    max="80"
+                    placeholder="留空按层数自动匹配"
+                    value={batchForm.grid_range_pct_str}
+                    onChange={(e) => setBatchForm((prev) => ({ ...prev, grid_range_pct_str: e.target.value }))}
+                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                  />
+                </div>
+                <div>
                   <label className="block text-[11px] font-semibold text-dim mb-1">
                     价格止损 (%)
                     {batchForm.grid_stop_loss_pct_str !== '' && Number(batchForm.grid_stop_loss_pct_str) > 0 && (
@@ -2580,9 +2858,9 @@ export default function App() {
                     step="0.2"
                     min="0.2"
                     max="90"
-                    placeholder="留空不改 (如 3.0)"
+                    placeholder="留空不改 (如 4.5)"
                     value={batchForm.grid_stop_loss_pct_str}
-                    onChange={(e) => setBatchForm((prev) => ({ ...prev, grid_stop_loss_pct_str: e.target.value }))}
+                    onChange={(e) => updateBatchFieldWithLinkage('grid_stop_loss_pct_str', e.target.value)}
                     className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
                   />
                 </div>
@@ -2593,7 +2871,7 @@ export default function App() {
                     step="0.1"
                     min="0.3"
                     max="10"
-                    placeholder="留空不改 (如 2.0)"
+                    placeholder="留空不改 (如 2.2)"
                     value={batchForm.trend_trailing_mult_str}
                     onChange={(e) => setBatchForm((prev) => ({ ...prev, trend_trailing_mult_str: e.target.value }))}
                     className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
@@ -2626,6 +2904,15 @@ export default function App() {
               </div>
 
               <div className="flex flex-wrap items-center gap-4 pt-0.5">
+                <label className="flex items-center gap-2 text-xs text-sub cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={batchForm.auto_link_batch}
+                    onChange={(e) => setBatchForm((prev) => ({ ...prev, auto_link_batch: e.target.checked }))}
+                    className="rounded accent-emerald-600"
+                  />
+                  <span>输入层数/步长自动联动区间与止盈</span>
+                </label>
                 <label className="flex items-center gap-2 text-xs text-sub cursor-pointer select-none">
                   <input
                     type="checkbox"
@@ -2712,7 +2999,9 @@ export default function App() {
                               <div className="flex flex-wrap items-center gap-2 min-w-0">
                                 <span className="font-mono font-bold text-main">{it.symbol.replace('/USDT:USDT', '')}</span>
                                 <span className="font-mono text-[11px] text-dim">
-                                  {Number(it.order_usdt || 0).toFixed(0)}U · 步长 {(Number(it.grid_step_pct || 0) * 100).toFixed(2)}% · 止盈{' '}
+                                  {Number(it.order_usdt || 0).toFixed(0)}U · {it.grid_levels || 5}层 · 步长{' '}
+                                  {(Number(it.grid_step_pct || 0) * 100).toFixed(2)}% · 区间 ±
+                                  {(Number(it.grid_range_pct || 0) * 100).toFixed(1)}% · 止盈{' '}
                                   {(Number(it.grid_take_profit_pct || 0) * 100).toFixed(2)}% · 止损{' '}
                                   {(Number(it.grid_stop_loss_pct || 0) * 100).toFixed(1)}%
                                   {it.sl_roe_pct ? `(${it.leverage || 5}x≈${it.sl_roe_pct}%)` : ''}
@@ -2982,8 +3271,40 @@ export default function App() {
                       </div>
                     </div>
 
-                    {isGridStrategyType(currentStrategy.strategy_type) ? (
+                    {isGridStrategyType(currentStrategy.strategy_type) ? (() => {
+                      const symTel = snapshot?.telemetry?.[currentStrategy.symbol] || {};
+                      const gridDiag = buildGridPreviewAndDiagnostics(
+                        currentStrategy,
+                        Number(symTel.okx_min_notional_usdt || 0),
+                        Number(symTel.follower_mid || 0)
+                      );
+                      const fitLevelsByRange = Math.max(1, Math.min(30, Math.floor((gridDiag.rng + 1e-9) / gridDiag.step)));
+                      const fitStepByRange = Number(Math.max(0.0005, gridDiag.rng / gridDiag.n).toFixed(4));
+                      return (
                       <>
+                        {/* Auto-Linkage Control Bar */}
+                        <div className="flex flex-wrap items-center justify-between gap-2.5 px-3.5 py-2.5 rounded-2xl surface-subtle text-xs">
+                          <label className="flex items-center gap-2 cursor-pointer select-none font-semibold text-main">
+                            <input
+                              type="checkbox"
+                              checked={autoLinkGridParams}
+                              onChange={(e) => setAutoLinkGridParams(e.target.checked)}
+                              className="rounded accent-emerald-600"
+                            />
+                            <span>参数自动联动匹配</span>
+                            <span className="font-normal text-[11px] text-dim hidden sm:inline">
+                              （改层数/步长自动匹配区间±缓冲与止盈止损，关闭后可自由微调）
+                            </span>
+                          </label>
+                          <button
+                            type="button"
+                            onClick={handleAutoAlignCurrentGrid}
+                            className="btn-soft-pill px-3 py-1 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400"
+                          >
+                            一键规范对齐
+                          </button>
+                        </div>
+
                         {/* Common Grid Parameters */}
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 text-xs">
                           <div>
@@ -3017,9 +3338,15 @@ export default function App() {
                               min={1}
                               max={30}
                               value={currentStrategy.grid_levels ?? 5}
-                              onChange={(e) => updateCurrentStrategyField({ grid_levels: Number(e.target.value) })}
+                              onChange={(e) => updateGridParamWithLinkage('grid_levels', Number(e.target.value))}
                               className="input-field font-mono"
                             />
+                            <div className="text-[10px] text-dim mt-1 leading-snug">
+                              满网覆盖半径：{gridDiag.n}×{(gridDiag.step * 100).toFixed(2)}% ={' '}
+                              <span className="font-mono font-bold text-main">
+                                ±{(gridDiag.totalSpan * 100).toFixed(2)}%
+                              </span>
+                            </div>
                           </div>
 
                           <div>
@@ -3028,10 +3355,10 @@ export default function App() {
                               step="0.05"
                               valueRatio={currentStrategy.grid_step_pct}
                               defaultRatio={0.006}
-                              onChangeRatio={(v) => updateCurrentStrategyField({ grid_step_pct: v })}
+                              onChangeRatio={(v) => updateGridParamWithLinkage('grid_step_pct', v)}
                             />
                             <div className="text-[10px] text-dim mt-1 leading-snug">
-                              默认 0.60%（兼顾山寨防插针与趋势捕捉）；低波/主流可调 0.35%~0.45%，高波山寨可调 0.60%~0.80%
+                              默认 0.60%（低波/主流可调 0.35%~0.45%，高波山寨 0.60%~0.80%）
                             </div>
                           </div>
 
@@ -3054,11 +3381,37 @@ export default function App() {
                           <div>
                             <label className="font-bold text-main block mb-2">区间总跨度 ±(%)</label>
                             <PercentNumberInput
-                              step="0.5"
+                              step="0.1"
                               valueRatio={currentStrategy.grid_range_pct}
                               defaultRatio={0.05}
-                              onChangeRatio={(v) => updateCurrentStrategyField({ grid_range_pct: v })}
+                              onChangeRatio={(v) => updateGridParamWithLinkage('grid_range_pct', v)}
                             />
+                            <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                              <button
+                                type="button"
+                                onClick={() => updateCurrentStrategyField({ grid_levels: fitLevelsByRange })}
+                                className="px-2 py-0.5 rounded-full surface-subtle text-[10px] font-semibold text-sub hover:text-main transition"
+                              >
+                                按步长适配层数→{fitLevelsByRange}层
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  updateCurrentStrategyField({
+                                    grid_step_pct: fitStepByRange,
+                                    grid_take_profit_pct: Number(
+                                      Math.max(
+                                        Number(currentStrategy.grid_take_profit_pct ?? 0.0065),
+                                        fitStepByRange + 0.0005
+                                      ).toFixed(6)
+                                    ),
+                                  })
+                                }
+                                className="px-2 py-0.5 rounded-full surface-subtle text-[10px] font-semibold text-sub hover:text-main transition"
+                              >
+                                按层数适配步长→{(fitStepByRange * 100).toFixed(2)}%
+                              </button>
+                            </div>
                           </div>
 
                           <div>
@@ -3067,12 +3420,12 @@ export default function App() {
                               step="0.2"
                               valueRatio={currentStrategy.grid_stop_loss_pct}
                               defaultRatio={0.08}
-                              onChangeRatio={(v) => updateCurrentStrategyField({ grid_stop_loss_pct: v })}
+                              onChangeRatio={(v) => updateGridParamWithLinkage('grid_stop_loss_pct', v)}
                             />
                             <div className="text-[10px] text-amber-600 dark:text-amber-300 mt-1 leading-snug">
                               当前 {currentStrategy.leverage ?? 5}x 杠杆 → 保证金止损 ≈{' '}
-                              {((currentStrategy.grid_stop_loss_pct ?? 0.08) * (currentStrategy.leverage ?? 5) * 100).toFixed(1)}%
-                              （如欲控制保证金止损 5%，此处设 {(5 / Math.max(1, currentStrategy.leverage ?? 5)).toFixed(2)}%）
+                              {gridDiag.slRoePct.toFixed(1)}%
+                              （如欲控制保证金止损 15%，此处设 {(15 / Math.max(1, currentStrategy.leverage ?? 5)).toFixed(2)}%）
                             </div>
                           </div>
 
@@ -3097,16 +3450,101 @@ export default function App() {
                               onChangeRatio={(v) => updateCurrentStrategyField({ slippage_pct: v })}
                             />
                           </div>
+                        </div>
 
-                          <div className="surface-subtle p-3.5 flex flex-col justify-center">
-                            <div className="text-[11px] text-dim">预计单边满格保证金需求</div>
-                            <div className="font-mono font-bold text-sm text-main mt-0.5">
-                              {(
-                                ((currentStrategy.order_usdt ?? 10) * (currentStrategy.grid_levels ?? 5)) /
-                                Math.max(1, currentStrategy.leverage ?? 5)
-                              ).toFixed(2)}{' '}
-                              USDT
+                        {/* Live Risk, Thinnest-Leg & Per-Level Preview Panel */}
+                        <div className="rounded-2xl border border-line surface-subtle p-3.5 sm:p-4 space-y-3 text-xs">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="font-bold text-main">
+                              📊 实时风险、最薄层门槛与逐层铺网预览
                             </div>
+                            {gridDiag.alerts.length === 0 ? (
+                              <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
+                                ✓ 参数逻辑校验全部通过
+                              </span>
+                            ) : (
+                              <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-rose-500/15 text-rose-600 dark:text-rose-400">
+                                ⚠ 发现 {gridDiag.alerts.length} 项参数冲突/风险
+                              </span>
+                            )}
+                          </div>
+
+                          {gridDiag.alerts.length > 0 && (
+                            <div className="space-y-1.5">
+                              {gridDiag.alerts.map((al, idx) => (
+                                <div
+                                  key={idx}
+                                  className={`px-3 py-1.5 rounded-xl text-[11px] font-medium ${
+                                    al.severity === 'error'
+                                      ? 'bg-rose-500/10 text-rose-600 dark:text-rose-300 border border-rose-500/25'
+                                      : 'bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/25'
+                                  }`}
+                                >
+                                  {al.severity === 'error' ? '⛔ ' : '⚠️ '}
+                                  {al.msg}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+                            <div className="rounded-xl surface-card px-3 py-2.5">
+                              <div className="text-[10px] text-dim">单边满格名义 / 保证金</div>
+                              <div className="font-mono font-bold text-main mt-0.5">
+                                {gridDiag.sideBudget.toFixed(0)}U / {gridDiag.sideMargin.toFixed(1)}U
+                              </div>
+                            </div>
+                            <div className="rounded-xl surface-card px-3 py-2.5">
+                              <div className="text-[10px] text-dim">覆盖半径 vs 区间边界</div>
+                              <div className="font-mono font-bold text-main mt-0.5">
+                                ±{(gridDiag.totalSpan * 100).toFixed(2)}% / ±{(gridDiag.rng * 100).toFixed(1)}%
+                              </div>
+                            </div>
+                            <div className="rounded-xl surface-card px-3 py-2.5">
+                              <div className="text-[10px] text-dim">最坏单边满格硬止损估算</div>
+                              <div className="font-mono font-bold text-rose-600 dark:text-rose-400 mt-0.5">
+                                ≈ -{gridDiag.worstSlLossUsdt.toFixed(2)} USDT
+                              </div>
+                            </div>
+                            <div className="rounded-xl surface-card px-3 py-2.5">
+                              <div className="text-[10px] text-dim">
+                                最薄单层 ({gridDiag.thinnestLeg.slot}) vs OKX最小额
+                              </div>
+                              <div
+                                className={`font-mono font-bold mt-0.5 ${
+                                  gridDiag.okxMinNotional > 0 && gridDiag.thinnestLeg.usdt < gridDiag.okxMinNotional * 1.02
+                                    ? 'text-rose-600 dark:text-rose-400'
+                                    : 'text-emerald-600 dark:text-emerald-400'
+                                }`}
+                              >
+                                {gridDiag.thinnestLeg.usdt.toFixed(1)}U /{' '}
+                                {gridDiag.okxMinNotional > 0 ? `${gridDiag.okxMinNotional.toFixed(2)}U` : '待行情'}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap gap-1.5 pt-0.5">
+                            {gridDiag.legs.slice(0, 10).map((lg) => (
+                              <span
+                                key={lg.slot}
+                                className={`px-2.5 py-1 rounded-full font-mono text-[11px] font-semibold ${
+                                  lg.belowMin || lg.clippedInMr
+                                    ? 'bg-rose-500/15 text-rose-600 dark:text-rose-300 border border-rose-500/30'
+                                    : 'surface-card text-main border border-line'
+                                }`}
+                              >
+                                {lg.slot}: {lg.usdt.toFixed(1)}U
+                                {currentStrategy.strategy_type !== 'LONG_SHORT_GRID' && (currentStrategy.trend_pyramid_decay ?? true)
+                                  ? ` (${lg.weightPct}%)`
+                                  : ` (±${(lg.mrDistPct * 100).toFixed(2)}%)`}
+                                {lg.clippedInMr ? ' [被裁切]' : lg.belowMin ? ' [不足最小额]' : ''}
+                              </span>
+                            ))}
+                            {gridDiag.legs.length > 10 && (
+                              <span className="px-2 py-1 text-[11px] text-dim">
+                                ...共 {gridDiag.legs.length} 层
+                              </span>
+                            )}
                           </div>
                         </div>
 
@@ -3421,7 +3859,8 @@ export default function App() {
                           );
                         })()}
                       </>
-                    ) : (
+                      );
+                    })() : (
                       <>
                         {/* Lead-Lag 9 Numeric Parameters Grid */}
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 text-xs">

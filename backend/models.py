@@ -132,8 +132,10 @@ class BatchSymbolUpdateRequest(BaseModel):
     strategy_filter: Literal["ALL_GRID", "ADAPTIVE_GRID", "TREND_GRID", "LONG_SHORT_GRID", "ALL"] = "ALL_GRID"
     only_running: bool = False
     order_usdt: Optional[float] = Field(default=None, ge=5.0, le=500_000.0, allow_inf_nan=False)
+    grid_levels: Optional[int] = Field(default=None, ge=1, le=30)
     grid_step_pct: Optional[float] = Field(default=None, ge=0.0005, le=0.20, allow_inf_nan=False)
     grid_take_profit_pct: Optional[float] = Field(default=None, ge=0.0005, le=0.25, allow_inf_nan=False)
+    grid_range_pct: Optional[float] = Field(default=None, ge=0.001, le=0.80, allow_inf_nan=False)
     grid_stop_loss_pct: Optional[float] = Field(default=None, ge=0.002, le=0.90, allow_inf_nan=False)
     trend_trailing_mult: Optional[float] = Field(default=None, ge=0.3, le=10.0, allow_inf_nan=False)
     use_post_only_tp: Optional[bool] = None

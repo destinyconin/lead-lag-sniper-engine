@@ -13,7 +13,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 from backend.database import AsyncDatabaseManager
 from backend.executor import ExecutionAdapter, OkxPrivateWsClient, resolve_okx_spec
-from backend.grid_engine import LongShortGridTracker
+from backend.grid_engine import LongShortGridTracker, calc_pyramid_weights
 from backend.market_gateway import (
     MarketDataGateway,
     get_default_base_price,
@@ -1734,6 +1734,8 @@ class BidirectionalSniperEngine:
             new_cfg = cfg.model_copy(deep=True)
             changed = False
 
+            min_notional = 0.0
+            thinnest_leg_usdt = round(float(new_cfg.order_usdt), 2)
             if is_grid_strategy(new_cfg.strategy_type):
                 eff_rt_fee = maker_rt_fee if (new_cfg.use_post_only_tp and new_cfg.strategy_type != "TREND_GRID") else taker_rt_fee
                 # 1. Diagnose current config
@@ -1746,6 +1748,11 @@ class BidirectionalSniperEngine:
                 if new_cfg.grid_take_profit_pct <= eff_rt_fee:
                     issues.append(
                         f"止盈未覆盖双边费率 ({new_cfg.grid_take_profit_pct*100:.2f}% ≤ {eff_rt_fee*100:.2f}%)"
+                    )
+                total_span = int(new_cfg.grid_levels) * float(new_cfg.grid_step_pct)
+                if new_cfg.strategy_type != "TREND_GRID" and total_span > new_cfg.grid_range_pct + 1e-6:
+                    issues.append(
+                        f"层数×步长超出区间会裁层 ({new_cfg.grid_levels}层×{new_cfg.grid_step_pct*100:.2f}%={total_span*100:.2f}% > 区间±{new_cfg.grid_range_pct*100:.1f}%)"
                     )
                 if new_cfg.strategy_type != "TREND_GRID" and new_cfg.grid_stop_loss_pct <= new_cfg.grid_range_pct:
                     issues.append(
@@ -1762,6 +1769,9 @@ class BidirectionalSniperEngine:
                         issues.append(
                             f"顺势死区超出重锚区间 ({dz_span*100:.2f}% > {new_cfg.grid_range_pct*100:.1f}%)"
                         )
+                    if new_cfg.trend_pyramid_decay and int(new_cfg.grid_levels) > 1:
+                        w_list = calc_pyramid_weights(int(new_cfg.grid_levels), True)
+                        thinnest_leg_usdt = round(float(new_cfg.order_usdt) * int(new_cfg.grid_levels) * min(w_list), 2)
 
                 # 2. Check OKX contract spec / minimum notional / precision
                 if spec:
@@ -1769,6 +1779,16 @@ class BidirectionalSniperEngine:
                     if ref_px > 0 and min_notional > new_cfg.order_usdt * 1.35:
                         issues.append(
                             f"单格金额({new_cfg.order_usdt:.1f}U)低于OKX最小开仓额({min_notional:.1f}U)"
+                        )
+                    elif (
+                        ref_px > 0
+                        and min_notional > 0
+                        and new_cfg.strategy_type in ("TREND_GRID", "ADAPTIVE_GRID")
+                        and new_cfg.trend_pyramid_decay
+                        and min_notional > thinnest_leg_usdt * 1.05
+                    ):
+                        issues.append(
+                            f"顺势最薄层L{new_cfg.grid_levels}({thinnest_leg_usdt:.1f}U)低于OKX最小开仓额({min_notional:.1f}U)"
                         )
                     tick_str = str(spec.get("tickSz_str") or "")
                     if "." in tick_str:
@@ -1796,6 +1816,10 @@ class BidirectionalSniperEngine:
                         new_cfg.order_usdt = round(float(req.order_usdt), 2)
                         fixes.append(f"名义金额→{new_cfg.order_usdt:g}U")
                         changed = True
+                    if req.grid_levels is not None and int(new_cfg.grid_levels) != int(req.grid_levels):
+                        new_cfg.grid_levels = int(req.grid_levels)
+                        fixes.append(f"层数→{new_cfg.grid_levels}层")
+                        changed = True
                     if req.grid_step_pct is not None and abs(new_cfg.grid_step_pct - req.grid_step_pct) > 1e-7:
                         new_cfg.grid_step_pct = round(float(req.grid_step_pct), 6)
                         fixes.append(f"步长→{new_cfg.grid_step_pct*100:.2f}%")
@@ -1803,6 +1827,10 @@ class BidirectionalSniperEngine:
                     if req.grid_take_profit_pct is not None and abs(new_cfg.grid_take_profit_pct - req.grid_take_profit_pct) > 1e-7:
                         new_cfg.grid_take_profit_pct = round(float(req.grid_take_profit_pct), 6)
                         fixes.append(f"止盈→{new_cfg.grid_take_profit_pct*100:.2f}%")
+                        changed = True
+                    if req.grid_range_pct is not None and abs(new_cfg.grid_range_pct - req.grid_range_pct) > 1e-7:
+                        new_cfg.grid_range_pct = round(float(req.grid_range_pct), 4)
+                        fixes.append(f"区间→±{new_cfg.grid_range_pct*100:.2f}%")
                         changed = True
                     if req.grid_stop_loss_pct is not None and abs(new_cfg.grid_stop_loss_pct - req.grid_stop_loss_pct) > 1e-7:
                         new_cfg.grid_stop_loss_pct = round(float(req.grid_stop_loss_pct), 6)
@@ -1836,6 +1864,19 @@ class BidirectionalSniperEngine:
                             new_cfg.grid_take_profit_pct = min_safe_tp
                             fixes.append(f"修正倒挂止盈→{min_safe_tp*100:.2f}%")
                             changed = True
+                        # Auto-expand range when N * step > range (unless user explicitly set range or tight SL)
+                        new_span = int(new_cfg.grid_levels) * float(new_cfg.grid_step_pct)
+                        if (
+                            new_cfg.strategy_type != "TREND_GRID"
+                            and req.grid_range_pct is None
+                            and req.grid_stop_loss_pct is None
+                            and new_span > new_cfg.grid_range_pct + 1e-6
+                        ):
+                            new_rng_auto = round(min(0.80, max(new_span * 1.15, new_span + 0.005)), 4)
+                            if abs(new_cfg.grid_range_pct - new_rng_auto) > 1e-6:
+                                new_cfg.grid_range_pct = new_rng_auto
+                                fixes.append(f"联动扩宽区间→±{new_cfg.grid_range_pct*100:.2f}%")
+                                changed = True
                         # Honor explicit user-requested stop-loss: shrink range instead of overwriting their SL!
                         if new_cfg.strategy_type != "TREND_GRID" and new_cfg.grid_stop_loss_pct <= new_cfg.grid_range_pct:
                             if req.grid_stop_loss_pct is not None:
@@ -1845,7 +1886,7 @@ class BidirectionalSniperEngine:
                                     fixes.append(f"匹配区间→±{new_cfg.grid_range_pct*100:.2f}%")
                                     changed = True
                             else:
-                                new_cfg.grid_stop_loss_pct = round(min(0.90, new_cfg.grid_range_pct + 0.03), 4)
+                                new_cfg.grid_stop_loss_pct = round(min(0.90, new_cfg.grid_range_pct + 0.015), 4)
                                 fixes.append(f"修正止损→{new_cfg.grid_stop_loss_pct*100:.1f}%")
                                 changed = True
                         if new_cfg.strategy_type in ("TREND_GRID", "ADAPTIVE_GRID"):
@@ -1855,7 +1896,13 @@ class BidirectionalSniperEngine:
                                 fixes.append(f"扩宽区间→±{new_cfg.grid_range_pct*100:.1f}%")
                                 changed = True
                                 if req.grid_stop_loss_pct is None and new_cfg.grid_stop_loss_pct <= new_cfg.grid_range_pct:
-                                    new_cfg.grid_stop_loss_pct = round(min(0.90, new_cfg.grid_range_pct + 0.03), 4)
+                                    new_cfg.grid_stop_loss_pct = round(min(0.90, new_cfg.grid_range_pct + 0.015), 4)
+                    # Recompute post-apply thinnest leg for report accuracy
+                    if new_cfg.strategy_type in ("TREND_GRID", "ADAPTIVE_GRID") and new_cfg.trend_pyramid_decay and int(new_cfg.grid_levels) > 1:
+                        w_list2 = calc_pyramid_weights(int(new_cfg.grid_levels), True)
+                        thinnest_leg_usdt = round(float(new_cfg.order_usdt) * int(new_cfg.grid_levels) * min(w_list2), 2)
+                    else:
+                        thinnest_leg_usdt = round(float(new_cfg.order_usdt), 2)
 
             if issues:
                 anomaly_symbols += 1
@@ -1877,6 +1924,7 @@ class BidirectionalSniperEngine:
                     "is_running": new_cfg.is_running,
                     "has_open_position": has_open,
                     "leverage": new_cfg.leverage,
+                    "grid_levels": int(new_cfg.grid_levels),
                     "grid_step_pct": new_cfg.grid_step_pct,
                     "grid_take_profit_pct": new_cfg.grid_take_profit_pct,
                     "grid_range_pct": new_cfg.grid_range_pct,
@@ -1886,6 +1934,8 @@ class BidirectionalSniperEngine:
                     "use_post_only_tp": bool(new_cfg.use_post_only_tp),
                     "sl_trigger_px_type": str(new_cfg.sl_trigger_px_type or "mark"),
                     "order_usdt": new_cfg.order_usdt,
+                    "thinnest_leg_usdt": thinnest_leg_usdt,
+                    "okx_min_notional_usdt": round(min_notional, 2),
                     "issues": issues,
                     "fixes_applied": fixes,
                 }
@@ -3958,6 +4008,12 @@ class BidirectionalSniperEngine:
             )
 
             disp_prec = max(cfg.price_precision, 8) if (f_tick and 0 < f_tick.mid < 0.0005) else cfg.price_precision
+            spec_tel = get_okx_instrument_spec(sym)
+            okx_min_notional = (
+                round(float(spec_tel.get("minSz") or 0.0) * float(spec_tel.get("ctVal") or 1.0) * f_tick.mid, 2)
+                if (spec_tel and f_tick and f_tick.mid > 0)
+                else 0.0
+            )
 
             grid_tracker = self.grid_trackers.get(sym)
             grid_snap = grid_tracker.get_snapshot() if (is_grid_strategy(cfg.strategy_type) and grid_tracker) else None
@@ -3974,6 +4030,7 @@ class BidirectionalSniperEngine:
                 "strategy_type": cfg.strategy_type,
                 "grid_side_mode": cfg.grid_side_mode,
                 "grid": grid_snap,
+                "okx_min_notional_usdt": okx_min_notional,
                 "state": eff_state,
                 "leader_bid": l_tick.bid if l_tick else 0.0,
                 "leader_ask": l_tick.ask if l_tick else 0.0,

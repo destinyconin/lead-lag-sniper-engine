@@ -3203,6 +3203,80 @@ def test_audit_trend_anchor_stability_vcp_release_and_bb_cap():
     assert [e["slot_id"] for e in en_bounce] == ["S1"]
 
 
+def test_batch_grid_levels_range_auto_linkage_and_thinnest_leg_audit():
+    """
+    Verifies batch grid_levels + grid_range_pct support, level-clipping & thinnest-leg OKX min-notional audit,
+    auto-linkage range expansion, and live okx_min_notional_usdt telemetry exposure.
+    """
+    from backend.sniper_engine import BidirectionalSniperEngine
+    from backend.models import BatchSymbolUpdateRequest
+    from backend.market_gateway import _OKX_INSTRUMENT_CACHE
+
+    _OKX_INSTRUMENT_CACHE["ZEC-USDT-SWAP"] = {
+        "instId": "ZEC-USDT-SWAP", "ctVal": 0.01, "lotSz": 1.0, "lotSz_str": "1",
+        "minSz": 1.0, "tickSz": 0.01, "tickSz_str": "0.01", "maxLever": 50, "state": "live",
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        adb = AsyncDatabaseManager(db_path=os.path.join(tmpdir, "batch_link.db"))
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(96)
+        zec = SymbolStrategy(
+            symbol="ZEC/USDT:USDT",
+            strategy_type="ADAPTIVE_GRID",
+            grid_levels=5,
+            grid_step_pct=0.006,
+            grid_take_profit_pct=0.0065,
+            grid_range_pct=0.02,   # Too narrow for 5 * 0.6% = 3.0% -> should flag clipping!
+            grid_stop_loss_pct=0.035,
+            order_usdt=12.0,       # 5-level decay thinnest L5 = 12*5*0.12 = 7.2U < OKX min 8.5U!
+            leverage=5,
+            price_precision=2,
+            qty_precision=2,
+            trend_pyramid_decay=True,
+        )
+        adb.upsert_symbol_sync(zec, user_id=96)
+        eng = BidirectionalSniperEngine(adb, user_id=96)
+        eng._register_symbol_internal(zec)
+        eng.math_states["ZEC/USDT:USDT"].on_follower_tick(850.0, 850.2, 10.0, 10.0)
+
+        # 1) Telemetry exposes real-time okx_min_notional_usdt (1 * 0.01 * 850.1 = 8.50U)
+        snap = eng.build_dashboard_snapshot(radar_symbol="ZEC/USDT:USDT")
+        assert abs(snap["telemetry"]["ZEC/USDT:USDT"]["okx_min_notional_usdt"] - 8.50) <= 0.05
+
+        # 2) Validate flags BOTH level clipping (5*0.6%=3.0% > 2.0%) AND thinnest L5 (7.2U < 8.5U)!
+        v_res = eng.validate_and_batch_update_symbols(
+            BatchSymbolUpdateRequest(action="validate", strategy_filter="ALL_GRID")
+        )
+        assert v_res["anomaly_count"] == 1
+        it = v_res["items"][0]
+        assert it["grid_levels"] == 5
+        assert abs(it["thinnest_leg_usdt"] - 7.2) < 0.05
+        assert any("裁层" in x for x in it["issues"])
+        assert any("最薄层L5" in x for x in it["issues"])
+
+        # 3) Apply batch grid_levels=4 + grid_step_pct=0.008 with auto_fix_anomalies=True -> auto-expands range >= 3.2% and lifts SL > range!
+        a_res = eng.validate_and_batch_update_symbols(
+            BatchSymbolUpdateRequest(
+                action="apply",
+                strategy_filter="ALL_GRID",
+                grid_levels=4,
+                grid_step_pct=0.008,
+                order_usdt=20.0,
+                auto_fix_anomalies=True,
+            )
+        )
+        assert a_res["updated_count"] == 1
+        updated_zec = eng.strategies["ZEC/USDT:USDT"]
+        assert updated_zec.grid_levels == 4
+        assert updated_zec.grid_step_pct == 0.008
+        assert updated_zec.grid_range_pct >= 0.036  # 4 * 0.8% = 3.2% + buffer!
+        assert updated_zec.grid_stop_loss_pct > updated_zec.grid_range_pct
+        assert updated_zec.grid_take_profit_pct >= 0.008
+        assert a_res["items"][0]["thinnest_leg_usdt"] == 12.0  # 20 * 4 * 0.15 = 12U > 8.5U!
+
+
+
 
 
 
