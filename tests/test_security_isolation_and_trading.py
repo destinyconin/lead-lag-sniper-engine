@@ -553,6 +553,7 @@ def test_okx_live_execution_ctval_acct_lv_and_close():
 
         # 2. Entry IOC + Protective Orders + Exit Retry with acctLv="2" and ADA ctVal=100
         calls = []
+        canceled_orders = set()
 
         async def mock_okx_req(client, creds, method, path, payload=None):
             calls.append((method, path, payload))
@@ -570,8 +571,14 @@ def test_okx_live_execution_ctval_acct_lv_and_close():
             if path == "/api/v5/trade/order" and payload and payload.get("ordType") == "post_only":
                 return {"code": "0", "data": [{"ordId": "okx-tp-po-1", "sCode": "0"}]}
             if path.startswith("/api/v5/trade/order?instId=ADA-USDT-SWAP&ordId=okx-tp-po-1"):
+                if "okx-tp-po-1" in canceled_orders:
+                    return {"code": "0", "data": [{"accFillSz": "0", "avgPx": "", "state": "canceled"}]}
                 return {"code": "0", "data": [{"accFillSz": "0", "avgPx": "", "state": "live"}]}
-            if path in ("/api/v5/trade/cancel-order", "/api/v5/trade/cancel-algos"):
+            if path == "/api/v5/trade/cancel-order":
+                if payload and payload.get("ordId"):
+                    canceled_orders.add(payload["ordId"])
+                return {"code": "0", "data": [{"sCode": "0"}]}
+            if path == "/api/v5/trade/cancel-algos":
                 return {"code": "0", "data": [{"sCode": "0"}]}
             if path == "/api/v5/trade/order" and payload and payload.get("reduceOnly") is True:
                 return {"code": "0", "data": [{"ordId": "okx-exit-1", "sCode": "0"}]}
@@ -1231,7 +1238,8 @@ def test_zero_latency_db_persistence_http_pool_and_ws_radar_filter():
                 assert list(filtered_snap["radar_series"].keys()) == ["BTC/USDT:USDT"]
 
                 # 3. Structural size/margin rejection backs off 60s and stops spamming SQLite orders
-                eng.risk_config = GlobalRiskConfig(trading_mode="LIVE", user_started=True)
+                eng.risk_config = GlobalRiskConfig(trading_mode="LIVE")
+                eng.trading_active_by_mode["LIVE"] = True
                 tracker = eng.grid_trackers["ZEC/USDT:USDT"]
                 tracker.sync_config(zec_cfg, current_mid=400.0)
                 slot_info = {**tracker.levels["S1"], "reservation_price": 404.0, "trigger_exec_price": 404.0}
@@ -1482,20 +1490,20 @@ def test_trend_breakout_grid_and_adaptive_vcp_dual_mode_switching():
     # L1 initial SL sits at center_price (100.0) to cut false breakouts immediately
     assert tracker.levels["L1"]["sl_price"] == 100.0
 
-    # Price rallies to L2 (103.55) -> L2 opens and raises L1's SL to breakeven + fee!
+    # Price rallies to L2 (103.55) -> L2 opens and raises L1's SL to breakeven + fee, with monotonic L2 SL >= L1 SL!
     en2, _ = tracker.evaluate_tick(103.50, 103.55, 103.52, trend_cfg, is_net_mode=True, round_trip_fee=0.0007)
     assert [e["slot_id"] for e in en2] == ["L2"]
     tracker.mark_entry_filled("L2", entry_price=103.55, filled_qty=0.87, contracts=0.87, ct_val=1.0, cfg=trend_cfg, round_trip_fee=0.0007)
     assert tracker.levels["L1"]["sl_price"] >= round(102.55 * 1.0007, 2)  # Livermore breakeven protection!
-    assert tracker.levels["L2"]["sl_price"] == 102.55  # Previous leg entry
+    assert tracker.levels["L2"]["sl_price"] >= tracker.levels["L1"]["sl_price"]  # Monotonic: L2 SL never below L1 SL!
 
-    # Price rallies to L3 (104.55) -> L3 opens, L1 SL moves up to L2 entry (guaranteed profit!), L2 SL to breakeven
+    # Price rallies to L3 (104.55) -> L3 opens, L1 SL moves up to L2 entry (guaranteed profit!), L2 SL to breakeven, monotonic L3 SL >= L2 SL
     en3, _ = tracker.evaluate_tick(104.50, 104.55, 104.52, trend_cfg, is_net_mode=True, round_trip_fee=0.0007)
     assert [e["slot_id"] for e in en3] == ["L3"]
     tracker.mark_entry_filled("L3", entry_price=104.55, filled_qty=0.57, contracts=0.57, ct_val=1.0, cfg=trend_cfg, round_trip_fee=0.0007)
     assert tracker.levels["L1"]["sl_price"] == 103.55  # Locked profit!
     assert tracker.levels["L2"]["sl_price"] >= round(103.55 * 1.0007, 2)
-    assert tracker.levels["L3"]["sl_price"] == 103.55
+    assert tracker.levels["L3"]["sl_price"] >= tracker.levels["L2"]["sl_price"]
 
     # Let profits run to peak 110.00 (no fixed TP!) -> trail stop = 110 * (1 - 0.015) = 108.35
     _, ex_peak = tracker.evaluate_tick(110.00, 110.05, 110.02, trend_cfg, is_net_mode=True, round_trip_fee=0.0007)
@@ -1787,10 +1795,10 @@ def test_batch1_trend_grid_no_death_spiral_and_sync_cooldown():
     assert tracker.levels["L2"]["sl_price"] < 101.25
     assert tracker.levels["L1"]["sl_price"] < 101.25
 
-    # When L3 fills higher at 102.50, L1 & L2 SL lock breakeven + 2*taker_fee (0.0010) cleanly!
+    # When L3 fills higher at 102.50, L1 & L2 SL lock breakeven + 2*taker_fee (0.0010), and L3 SL is monotonic >= L2 SL!
     tracker.mark_entry_filled("L3", 102.50, 0.4, 0.4, 1.0, cfg, round_trip_fee=0.0010)
     assert tracker.levels["L2"]["sl_price"] >= round(101.25 * 1.0010, 2)
-    assert tracker.levels["L3"]["sl_price"] == 101.25
+    assert tracker.levels["L3"]["sl_price"] >= tracker.levels["L2"]["sl_price"]
 
     # Rally to 106.0 then pullback to 104.90 -> batch TREND_TRAIL_TP exit
     tracker.evaluate_tick(106.00, 106.05, 106.02, cfg, is_net_mode=True, round_trip_fee=0.0010)
@@ -2127,6 +2135,1005 @@ def test_batch_symbol_validate_and_apply_preserves_open_positions():
             assert eng.risk_config.kill_switch_active is True
 
         asyncio.run(check_risk_kill_switch_preserved())
+
+
+def test_grid_maker_post_only_tp_and_cond_sl_lifecycle():
+    from backend.sniper_engine import BidirectionalSniperEngine
+    from backend.executor import OrderResult
+    from backend.market_gateway import _OKX_INSTRUMENT_CACHE
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "grid_maker_tp_sl.db")
+        adb = AsyncDatabaseManager(db_path=db_file)
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(91)
+
+        eth_mr = SymbolStrategy(
+            symbol="ETH/USDT:USDT",
+            strategy_type="LONG_SHORT_GRID",
+            grid_side_mode="LONG_SHORT",
+            grid_levels=3,
+            grid_step_pct=0.006,
+            grid_take_profit_pct=0.0065,
+            grid_range_pct=0.05,
+            grid_stop_loss_pct=0.04,
+            order_usdt=100.0,
+            leverage=5,
+            price_precision=2,
+            qty_precision=3,
+            use_post_only_tp=True,
+        )
+        sol_trend = SymbolStrategy(
+            symbol="SOL/USDT:USDT",
+            strategy_type="TREND_GRID",
+            grid_side_mode="LONG_SHORT",
+            grid_levels=3,
+            grid_step_pct=0.01,
+            grid_take_profit_pct=0.01,
+            grid_range_pct=0.08,
+            grid_stop_loss_pct=0.05,
+            order_usdt=100.0,
+            leverage=5,
+            price_precision=2,
+            qty_precision=2,
+            trend_dead_zone_mult=2.0,
+            trend_trailing_mult=1.5,
+            trend_use_bb_breakout=False,
+            use_post_only_tp=True,
+        )
+        adb.upsert_symbol_sync(eth_mr, user_id=91)
+        adb.upsert_symbol_sync(sol_trend, user_id=91)
+
+        _OKX_INSTRUMENT_CACHE["ETH-USDT-SWAP"] = {
+            "instId": "ETH-USDT-SWAP",
+            "ctVal": 0.1,
+            "lotSz": 0.01,
+            "lotSz_str": "0.01",
+            "minSz": 0.01,
+            "tickSz": 0.01,
+            "tickSz_str": "0.01",
+            "maxLever": 50,
+            "state": "live",
+        }
+        _OKX_INSTRUMENT_CACHE["SOL-USDT-SWAP"] = {
+            "instId": "SOL-USDT-SWAP",
+            "ctVal": 1.0,
+            "lotSz": 0.01,
+            "lotSz_str": "0.01",
+            "minSz": 0.01,
+            "tickSz": 0.01,
+            "tickSz_str": "0.01",
+            "maxLever": 50,
+            "state": "live",
+        }
+
+        async def run_lifecycle():
+            eng = BidirectionalSniperEngine(adb, user_id=91)
+            eng.risk_config = GlobalRiskConfig(trading_mode="LIVE", feed_source="REAL_WS")
+            eng.trading_active_by_mode["LIVE"] = True
+            for cfg in adb.load_symbols_sync(user_id=91):
+                eng._register_symbol_internal(cfg)
+            # Configure mock live OKX follower creds
+            eng.exchanges["okx"] = {
+                **eng.exchanges.get("okx", {}),
+                "exchange_id": "okx",
+                "role": "follower",
+                "is_active": True,
+                "api_key": "k_test",
+                "_decrypted_secret": "s_test",
+                "_decrypted_passphrase": "p_test",
+                "auth_status": "VERIFIED",
+                "taker_fee": 0.0005,
+                "maker_fee": 0.0002,
+            }
+
+            calls = []
+            pending_orders = {}
+            pending_algos = {}
+            ord_seq = {"n": 0}
+
+            async def mock_okx_req(client, creds, method, path, payload=None):
+                calls.append((method, path, payload))
+                if method == "POST" and path == "/api/v5/trade/order-algo":
+                    ord_seq["n"] += 1
+                    aid = f"algo-{ord_seq['n']}"
+                    pending_algos[aid] = {"algoId": aid, **payload}
+                    return {"code": "0", "data": [{"algoId": aid, "sCode": "0"}]}
+                if method == "POST" and path == "/api/v5/trade/cancel-algos":
+                    out = []
+                    for item in payload:
+                        aid = item["algoId"]
+                        if aid in pending_algos:
+                            pending_algos.pop(aid, None)
+                            out.append({"algoId": aid, "sCode": "0"})
+                        else:
+                            out.append({"algoId": aid, "sCode": "51400"})
+                    return {"code": "0", "data": out}
+                if method == "POST" and path == "/api/v5/trade/order":
+                    ord_seq["n"] += 1
+                    oid = f"ord-{ord_seq['n']}"
+                    if payload.get("ordType") == "post_only":
+                        pending_orders[oid] = {"ordId": oid, "state": "live", "accFillSz": "0", **payload}
+                    return {"code": "0", "data": [{"ordId": oid, "sCode": "0"}]}
+                if method == "POST" and path == "/api/v5/trade/cancel-order":
+                    oid = payload["ordId"]
+                    pending_orders.pop(oid, None)
+                    return {"code": "0", "data": [{"ordId": oid, "sCode": "0"}]}
+                if method == "GET" and path.startswith("/api/v5/trade/orders-pending"):
+                    return {"code": "0", "data": list(pending_orders.values())}
+                if method == "GET" and path.startswith("/api/v5/trade/orders-algo-pending"):
+                    return {"code": "0", "data": list(pending_algos.values())}
+                if method == "GET" and path.startswith("/api/v5/trade/order?"):
+                    oid = path.split("ordId=")[1].split("&")[0]
+                    if oid in pending_orders:
+                        return {"code": "0", "data": [pending_orders[oid]]}
+                    # Simulate natural Maker TP fill for ord-2 and triggered SL child fill for sl-child-1!
+                    if oid == "ord-2":
+                        return {"code": "0", "data": [{"ordId": oid, "state": "filled", "accFillSz": "0.33", "avgPx": "3004.0"}]}
+                    if oid == "sl-child-1":
+                        return {"code": "0", "data": [{"ordId": oid, "state": "filled", "accFillSz": "0.33", "avgPx": "2880.0"}]}
+                    return {"code": "0", "data": [{"ordId": oid, "state": "canceled", "accFillSz": "0", "avgPx": "0"}]}
+                if method == "GET" and path.startswith("/api/v5/trade/orders-algo-history"):
+                    aid = path.split("algoId=")[1].split("&")[0]
+                    return {
+                        "code": "0",
+                        "data": [{"algoId": aid, "state": "effective", "actualSz": "0.33", "actualPx": "2880.0", "ordId": "sl-child-1"}],
+                    }
+                return {"code": "0", "data": []}
+
+            # Seed live book for ETH and SOL
+            eng.math_states["ETH/USDT:USDT"].on_follower_tick(2982.0, 2982.5, 50.0, 50.0)
+            eng.math_states["SOL/USDT:USDT"].on_follower_tick(102.0, 102.1, 50.0, 50.0)
+
+            with (
+                patch.object(eng.executor, "_okx_request", side_effect=mock_okx_req),
+                patch.object(
+                    eng.executor, "ensure_okx_account_meta", new=AsyncMock(return_value={"posMode": "net_mode", "acctLv": "2"})
+                ),
+            ):
+                # 1. MEAN_REVERSION entry places BOTH Maker Post-Only TP (ord-2) and Conditional SL (algo-1)
+                eth_tracker = eng.grid_trackers["ETH/USDT:USDT"]
+                eth_tracker.sync_config(eth_mr, current_mid=3000.0)
+                eth_tracker.levels["L1"]["status"] = "ENTERING"
+                with patch.object(
+                    eng.executor,
+                    "place_entry_ioc",
+                    new=AsyncMock(
+                        return_value=OrderResult(
+                            order_id="en-eth-1",
+                            status="FILLED",
+                            filled_qty=0.033,
+                            avg_price=2982.0,
+                            latency_ms=12.0,
+                            is_maker=False,
+                            contracts=0.33,
+                            ct_val=0.1,
+                        )
+                    ),
+                ):
+                    await eng._run_grid_entry(
+                        eth_mr,
+                        eth_tracker,
+                        {**eth_tracker.levels["L1"], "reservation_price": 2983.0, "trigger_exec_price": 2982.0},
+                        "LIVE",
+                    )
+
+                l1 = eth_tracker.levels["L1"]
+                assert l1["status"] == "OPEN"
+                assert l1["maker_tp_live"] is True and l1["maker_tp_order_id"] == "ord-2"
+                assert l1["cond_sl_live"] is True and l1["cond_sl_algo_id"] == "algo-1"
+                # Verify round_trip_fee used taker+maker (0.07%) for Mean-Reversion with use_post_only_tp=True
+                expected_tp = round(2982.0 * (1.0 + 0.0065 + 0.0007), 2)
+                assert l1["tp_price"] == expected_tp
+
+                # Verify persistence round-trip preserves order IDs
+                exported = eth_tracker.export_state()
+                assert exported["open_slots"][0]["maker_tp_order_id"] == "ord-2"
+                assert exported["open_slots"][0]["cond_sl_algo_id"] == "algo-1"
+
+                # Verify evaluate_tick respects Maker touch grace window (no instant Taker dump at first touch!)
+                _, ex_touch = eth_tracker.evaluate_tick(expected_tp, expected_tp + 0.5, expected_tp + 0.2, eth_mr, is_net_mode=True, round_trip_fee=0.0007)
+                assert ex_touch == []
+
+                # Simulate OKX naturally filling Maker Post-Only TP (`ord-2` disappears from pending_orders)
+                pending_orders.pop("ord-2")
+                settled = await eng.poll_grid_protective_orders()
+                assert settled == 1
+                assert l1["status"] == "IDLE"
+                assert "algo-1" not in pending_algos  # Paired Conditional SL cleanly cancelled!
+                # Verify Maker fee (0.02% exit) was booked, NOT Taker 0.05%!
+                assert eng.stats_by_mode["LIVE"]["maker_tp_count"] == 1
+                last_tr = eng.stats_by_mode["LIVE"]["recent_trades"][0]
+                assert last_tr["exit_order_type"] == "MAKER_POST_ONLY"
+                expected_fee = round(2982.0 * 0.033 * 0.0005 + 3004.0 * 0.033 * 0.0002, 4)
+                assert abs(last_tr["fee"] - expected_fee) <= 0.0002
+
+                # 2. Verify SL already-fired race guard in _run_grid_exits_batch: NO duplicate market close order!
+                eth_tracker.levels["L2"]["status"] = "OPEN"
+                eth_tracker.levels["L2"]["entry_price"] = 2964.0
+                eth_tracker.levels["L2"]["filled_qty"] = 0.033
+                eth_tracker.levels["L2"]["contracts"] = 0.33
+                eth_tracker.levels["L2"]["ct_val"] = 0.1
+                eth_tracker.levels["L2"]["sl_price"] = 2880.0
+                eth_tracker.levels["L2"]["cond_sl_live"] = True
+                eth_tracker.levels["L2"]["cond_sl_algo_id"] = "algo-already-fired"
+                eng.executor.restore_slot_protective_tracking(
+                    symbol="ETH/USDT:USDT",
+                    slot_key="ETH/USDT:USDT:L2",
+                    side="LONG",
+                    qty=0.033,
+                    contracts=0.33,
+                    ct_val=0.1,
+                    tp_price=0.0,
+                    sl_price=2880.0,
+                    cond_sl_algo_id="algo-already-fired",
+                    exchange_cfg=eng.exchanges["okx"],
+                )
+                eth_tracker.levels["L2"]["status"] = "EXITING"
+                calls_before = len(calls)
+                await eng._run_grid_exits_batch(
+                    eth_mr,
+                    eth_tracker,
+                    [{**eth_tracker.levels["L2"], "exit_reason": "GRID_SL", "target_price": 2879.0}],
+                    "LIVE",
+                )
+                new_order_posts = [c for c in calls[calls_before:] if c[0] == "POST" and c[1] == "/api/v5/trade/order"]
+                assert new_order_posts == []  # ZERO duplicate market close orders!
+                assert eth_tracker.levels["L2"]["status"] == "IDLE"
+
+                # 3. Verify TREND_BREAKOUT places Conditional SL (NO fixed Maker TP), and Livermore step-up updates SL algo!
+                sol_tracker = eng.grid_trackers["SOL/USDT:USDT"]
+                sol_tracker.sync_config(sol_trend, current_mid=100.0)
+                sol_tracker.levels["L1"]["status"] = "ENTERING"
+                with patch.object(
+                    eng.executor,
+                    "place_entry_ioc",
+                    new=AsyncMock(
+                        return_value=OrderResult(
+                            order_id="en-sol-1",
+                            status="FILLED",
+                            filled_qty=1.5,
+                            avg_price=102.05,
+                            latency_ms=10.0,
+                            is_maker=False,
+                            contracts=1.5,
+                            ct_val=1.0,
+                        )
+                    ),
+                ):
+                    await eng._run_grid_entry(
+                        sol_trend,
+                        sol_tracker,
+                        {**sol_tracker.levels["L1"], "reservation_price": 102.1, "trigger_exec_price": 102.05},
+                        "LIVE",
+                    )
+                assert sol_tracker.levels["L1"]["maker_tp_live"] is False  # No fixed TP cap in TREND_BREAKOUT
+                assert sol_tracker.levels["L1"]["cond_sl_live"] is True
+                old_sol_l1_algo = sol_tracker.levels["L1"]["cond_sl_algo_id"]
+
+                # Price rises to 103.5 -> L2 opens -> Livermore steps up L1 SL -> replaces L1's OKX SL algo!
+                eng.math_states["SOL/USDT:USDT"].on_follower_tick(103.4, 103.5, 50.0, 50.0)
+                sol_tracker.levels["L2"]["status"] = "ENTERING"
+                with patch.object(
+                    eng.executor,
+                    "place_entry_ioc",
+                    new=AsyncMock(
+                        return_value=OrderResult(
+                            order_id="en-sol-2",
+                            status="FILLED",
+                            filled_qty=0.9,
+                            avg_price=103.5,
+                            latency_ms=10.0,
+                            is_maker=False,
+                            contracts=0.9,
+                            ct_val=1.0,
+                        )
+                    ),
+                ):
+                    await eng._run_grid_entry(
+                        sol_trend,
+                        sol_tracker,
+                        {**sol_tracker.levels["L2"], "reservation_price": 103.55, "trigger_exec_price": 103.5},
+                        "LIVE",
+                    )
+                assert old_sol_l1_algo not in pending_algos  # Old SL algo cancelled!
+                assert sol_tracker.levels["L1"]["cond_sl_live"] is True
+                assert sol_tracker.levels["L1"]["cond_sl_algo_id"] != old_sol_l1_algo  # Updated SL algo live!
+
+        asyncio.run(run_lifecycle())
+
+
+def test_batch_update_order_usdt_stop_loss_and_maker_tp_honors_user_sl():
+    from backend.sniper_engine import BidirectionalSniperEngine
+    from backend.models import BatchSymbolUpdateRequest
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "batch_sl_notional.db")
+        adb = AsyncDatabaseManager(db_path=db_file)
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(92)
+
+        ada = SymbolStrategy(
+            symbol="ADA/USDT:USDT",
+            strategy_type="ADAPTIVE_GRID",
+            grid_levels=5,
+            grid_step_pct=0.006,
+            grid_take_profit_pct=0.0065,
+            grid_range_pct=0.05,
+            grid_stop_loss_pct=0.08,
+            order_usdt=20.0,
+            leverage=5,
+            use_post_only_tp=False,
+        )
+        adb.upsert_symbol_sync(ada, user_id=92)
+        eng = BidirectionalSniperEngine(adb, user_id=92)
+        for cfg in adb.load_symbols_sync(user_id=92):
+            eng._register_symbol_internal(cfg)
+
+        # Validate flags high leveraged SL ROE (8% * 5x = 40% > 35%)
+        v_res = eng.validate_and_batch_update_symbols(BatchSymbolUpdateRequest(action="validate"))
+        assert v_res["maker_round_trip_fee_pct"] == 0.07
+        assert any("杠杆折算保证金止损偏高" in x for x in v_res["items"][0]["issues"])
+
+        # Apply explicit order_usdt=35, stop_loss=3.0% (15% ROE at 5x), use_post_only_tp=True
+        a_res = eng.validate_and_batch_update_symbols(
+            BatchSymbolUpdateRequest(
+                action="apply",
+                order_usdt=35.0,
+                grid_stop_loss_pct=0.03,
+                use_post_only_tp=True,
+                auto_fix_anomalies=True,
+            )
+        )
+        assert a_res["ok"] is True
+        assert a_res["updated_count"] == 1
+        updated_ada = eng.strategies["ADA/USDT:USDT"]
+        assert updated_ada.order_usdt == 35.0
+        # Explicit 3.0% SL MUST be honored (NOT overwritten back to 8.0%!) and range matched down to 2.55%
+        assert updated_ada.grid_stop_loss_pct == 0.03
+        assert updated_ada.grid_range_pct < 0.03
+        assert updated_ada.use_post_only_tp is True
+        assert a_res["items"][0]["sl_roe_pct"] == 15.0
+
+
+def test_ema_trend_filter_breakout_switch_and_okx_long_short_mode():
+    from backend.grid_engine import LongShortGridTracker, calc_pyramid_weights
+    from backend.market_gateway import MarketDataGateway
+
+    # 1. Moderated 4-level & 5-level pyramid weights remain normalized while keeping 3-level exact
+    assert calc_pyramid_weights(3, decay_enabled=True) == [0.50, 0.30, 0.20]
+    assert calc_pyramid_weights(4, decay_enabled=True) == [0.38, 0.27, 0.20, 0.15]
+    assert calc_pyramid_weights(5, decay_enabled=True) == [0.30, 0.24, 0.19, 0.15, 0.12]
+    assert abs(sum(calc_pyramid_weights(5, decay_enabled=True)) - 1.0) < 1e-9
+
+    # 2. Compute real EMA20/60 trend_bias & breakout_expansion on downtrend vs uptrend candles
+    bear_closes = [120.0 - i * 0.25 for i in range(95)] + [95.0, 93.8, 92.2, 90.5, 88.0]
+    bear_bbw = MarketDataGateway.compute_bbw_metrics(bear_closes, period=20, num_std=2.0, timeframe="15m")
+    assert bear_bbw is not None
+    assert bear_bbw["trend_bias"] == "BEAR"
+    assert bear_bbw["ema_gap_pct"] < -0.22
+    assert bear_bbw["breakout_expansion"] == "DOWN_BREAKOUT"
+
+    bull_closes = [80.0 + i * 0.25 for i in range(95)] + [105.0, 106.5, 108.0, 109.8, 112.5]
+    bull_bbw = MarketDataGateway.compute_bbw_metrics(bull_closes, period=20, num_std=2.0, timeframe="15m")
+    assert bull_bbw is not None
+    assert bull_bbw["trend_bias"] == "BULL"
+    assert bull_bbw["ema_gap_pct"] > 0.22
+    assert bull_bbw["breakout_expansion"] == "UP_BREAKOUT"
+
+    # 3. MEAN_REVERSION pauses counter-trend LONG dip-buys in BEAR trend (no catching falling knives)
+    mr_cfg = SymbolStrategy(
+        symbol="ETH/USDT:USDT",
+        strategy_type="LONG_SHORT_GRID",
+        grid_side_mode="LONG_SHORT",
+        grid_levels=3,
+        grid_step_pct=0.006,
+        grid_take_profit_pct=0.0065,
+        grid_range_pct=0.028,
+        grid_stop_loss_pct=0.035,
+        order_usdt=20.0,
+        leverage=5,
+        price_precision=2,
+        qty_precision=3,
+    )
+    mr_tracker = LongShortGridTracker("ETH/USDT:USDT")
+    bear_info = {
+        "timeframe": "15m",
+        "bbw_pct": 2.4,
+        "bbw_percentile": 55.0,
+        "bb_upper": 102.0,
+        "bb_middle": 100.0,
+        "bb_lower": 98.0,
+        "ema_fast": 99.0,
+        "ema_slow": 100.5,
+        "ema_gap_pct": -1.49,
+        "trend_bias": "BEAR",
+        "breakout_expansion": "NONE",
+    }
+    mr_tracker.sync_config(mr_cfg, current_mid=100.0, bbw_info=bear_info)
+    # Dip to 99.30 (below L1=99.40) -> MUST NOT open counter-trend LONG in BEAR market!
+    en_dip, _ = mr_tracker.evaluate_tick(99.25, 99.30, 99.28, mr_cfg, is_net_mode=False, bbw_info=bear_info)
+    assert en_dip == []
+    # Bounce to 100.70 (above S1=100.60) -> MUST allow trend-aligned SHORT!
+    en_short, _ = mr_tracker.evaluate_tick(100.68, 100.72, 100.70, mr_cfg, is_net_mode=False, bbw_info=bear_info)
+    assert [e["slot_id"] for e in en_short] == ["S1"]
+
+    # 4. In RANGE market under OKX long_short_mode (is_net_mode=False), BOTH LONG and SHORT can hold simultaneously!
+    range_info = {**bear_info, "ema_gap_pct": 0.05, "trend_bias": "RANGE"}
+    mr_tracker2 = LongShortGridTracker("ETH/USDT:USDT")
+    mr_tracker2.sync_config(mr_cfg, current_mid=100.0, bbw_info=range_info)
+    en_l, _ = mr_tracker2.evaluate_tick(99.25, 99.30, 99.28, mr_cfg, is_net_mode=False, bbw_info=range_info)
+    assert [e["slot_id"] for e in en_l] == ["L1"]
+    mr_tracker2.mark_entry_filled("L1", 99.30, 0.2, 0.2, 1.0, mr_cfg, 0.0007)
+    # Price rallies to 100.70 while L1 is open -> in long_short_mode (is_net_mode=False), S1 ALSO opens!
+    en_s, _ = mr_tracker2.evaluate_tick(100.68, 100.72, 100.70, mr_cfg, is_net_mode=False, bbw_info=range_info)
+    assert [e["slot_id"] for e in en_s] == ["S1"]
+
+    # 5. ADAPTIVE_GRID switches to TREND_BREAKOUT on DOWN_BREAKOUT even when bbw_percentile=62% (expansion!)
+    adp_cfg = mr_cfg.model_copy(
+        update={
+            "strategy_type": "ADAPTIVE_GRID",
+            "trend_dead_zone_mult": 2.0,
+            "trend_trailing_mult": 2.2,
+            "trend_use_bb_breakout": True,
+        }
+    )
+    adp_tracker = LongShortGridTracker("ETH/USDT:USDT")
+    down_break_info = {
+        "timeframe": "15m",
+        "bbw_pct": 3.8,
+        "bbw_percentile": 62.0,
+        "bb_upper": 102.0,
+        "bb_middle": 100.0,
+        "bb_lower": 98.5,
+        "ema_fast": 99.0,
+        "ema_slow": 100.5,
+        "ema_gap_pct": -1.49,
+        "trend_bias": "BEAR",
+        "breakout_expansion": "DOWN_BREAKOUT",
+    }
+    adp_tracker.sync_config(adp_cfg, current_mid=100.0, bbw_info=down_break_info)
+    assert adp_tracker.active_grid_mode == "TREND_BREAKOUT"
+    snap = adp_tracker.get_snapshot()
+    assert snap["trend_bias"] == "BEAR"
+    assert snap["breakout_expansion"] == "DOWN_BREAKOUT"
+    # In BEAR breakout mode: upside fakeout above L1 (102.0) is blocked, downside breakdown below S1 (98.5) fires SHORT!
+    en_up, _ = adp_tracker.evaluate_tick(102.5, 102.6, 102.55, adp_cfg, is_net_mode=False, bbw_info=down_break_info)
+    assert en_up == []
+    en_dn, _ = adp_tracker.evaluate_tick(98.40, 98.45, 98.42, adp_cfg, is_net_mode=False, bbw_info=down_break_info)
+    assert [e["slot_id"] for e in en_dn] == ["S1"]
+
+
+def test_audit_option_a_long_short_mode_atomic_amend_and_order_audit():
+    """
+    Verifies Option A in OKX long_short_mode:
+    1) MEAN_REVERSION + use_post_only_tp=True places real Maker post_only TP (posSide='long', no reduceOnly)
+       and skips conflicting unlinked conditional SL so OKX availPos never conflicts.
+    2) TREND_BREAKOUT places OKX native conditional SL with slTriggerPxType='mark'/'last',
+       updates it atomically via POST /api/v5/trade/amend-algos, and never orphans SL on cancel failure.
+    3) Protective placements are persisted to SQLite orders table.
+    """
+    from backend.sniper_engine import BidirectionalSniperEngine
+    from backend.executor import OrderResult
+    from backend.market_gateway import _OKX_INSTRUMENT_CACHE
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "audit_option_a.db")
+        adb = AsyncDatabaseManager(db_path=db_file)
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(93)
+
+        mr_cfg = SymbolStrategy(
+            symbol="ETH/USDT:USDT",
+            strategy_type="LONG_SHORT_GRID",
+            grid_side_mode="LONG_SHORT",
+            grid_levels=3,
+            grid_step_pct=0.006,
+            grid_take_profit_pct=0.0065,
+            grid_range_pct=0.05,
+            grid_stop_loss_pct=0.04,
+            order_usdt=50.0,
+            leverage=5,
+            price_precision=2,
+            qty_precision=3,
+            use_post_only_tp=True,
+            sl_trigger_px_type="mark",
+        )
+        tr_cfg = SymbolStrategy(
+            symbol="SOL/USDT:USDT",
+            strategy_type="TREND_GRID",
+            grid_side_mode="LONG_SHORT",
+            grid_levels=3,
+            grid_step_pct=0.01,
+            grid_take_profit_pct=0.01,
+            grid_range_pct=0.08,
+            grid_stop_loss_pct=0.05,
+            order_usdt=100.0,
+            leverage=5,
+            price_precision=2,
+            qty_precision=2,
+            trend_dead_zone_mult=2.0,
+            trend_trailing_mult=1.5,
+            trend_use_bb_breakout=False,
+            use_post_only_tp=True,
+            sl_trigger_px_type="last",
+        )
+        adb.upsert_symbol_sync(mr_cfg, user_id=93)
+        adb.upsert_symbol_sync(tr_cfg, user_id=93)
+        # Verify sl_trigger_px_type SQLite round-trip
+        reloaded = {s.symbol: s for s in adb.load_symbols_sync(user_id=93)}
+        assert reloaded["ETH/USDT:USDT"].sl_trigger_px_type == "mark"
+        assert reloaded["SOL/USDT:USDT"].sl_trigger_px_type == "last"
+
+        _OKX_INSTRUMENT_CACHE["ETH-USDT-SWAP"] = {
+            "instId": "ETH-USDT-SWAP", "ctVal": 0.1, "lotSz": 0.01, "lotSz_str": "0.01",
+            "minSz": 0.01, "tickSz": 0.01, "tickSz_str": "0.01", "maxLever": 50, "state": "live",
+        }
+        _OKX_INSTRUMENT_CACHE["SOL-USDT-SWAP"] = {
+            "instId": "SOL-USDT-SWAP", "ctVal": 1.0, "lotSz": 0.01, "lotSz_str": "0.01",
+            "minSz": 0.01, "tickSz": 0.01, "tickSz_str": "0.01", "maxLever": 50, "state": "live",
+        }
+
+        async def run_check():
+            await adb.start_worker()
+            try:
+                eng = BidirectionalSniperEngine(adb, user_id=93)
+                eng.risk_config = GlobalRiskConfig(trading_mode="LIVE", feed_source="REAL_WS")
+                eng.trading_active_by_mode["LIVE"] = True
+                for cfg in adb.load_symbols_sync(user_id=93):
+                    eng._register_symbol_internal(cfg)
+                eng.exchanges["okx"] = {
+                    "exchange_id": "okx", "role": "follower", "is_active": True,
+                    "api_key": "k_opt_a", "_decrypted_secret": "s_opt_a", "_decrypted_passphrase": "p_opt_a",
+                    "auth_status": "VERIFIED", "taker_fee": 0.0005, "maker_fee": 0.0002,
+                }
+                eng.math_states["ETH/USDT:USDT"].on_follower_tick(2982.0, 2982.5, 50.0, 50.0)
+                eng.math_states["SOL/USDT:USDT"].on_follower_tick(102.0, 102.1, 50.0, 50.0)
+
+                calls = []
+                amend_fail_mode = {"fail": False}
+
+                async def mock_okx(client, creds, method, path, payload=None):
+                    calls.append((method, path, payload))
+                    if method == "POST" and path == "/api/v5/trade/order":
+                        return {"code": "0", "data": [{"ordId": "po-ls-1", "sCode": "0"}]}
+                    if method == "GET" and path.startswith("/api/v5/trade/order?"):
+                        return {"code": "0", "data": [{"ordId": "po-ls-1", "state": "live", "accFillSz": "0"}]}
+                    if method == "POST" and path == "/api/v5/trade/order-algo":
+                        return {"code": "0", "data": [{"algoId": "sl-ls-1", "sCode": "0"}]}
+                    if method == "POST" and path == "/api/v5/trade/amend-algos":
+                        if amend_fail_mode["fail"]:
+                            return {"code": "51000", "data": [{"sCode": "51000", "sMsg": "transient"}]}
+                        return {"code": "0", "data": [{"algoId": payload["algoId"], "sCode": "0"}]}
+                    if method == "POST" and path == "/api/v5/trade/cancel-algos":
+                        return {"code": "50011", "data": []}
+                    return {"code": "0", "data": []}
+
+                with (
+                    patch.object(eng.executor, "_okx_request", side_effect=mock_okx),
+                    patch.object(
+                        eng.executor,
+                        "ensure_okx_account_meta",
+                        new=AsyncMock(return_value={"posMode": "long_short_mode", "acctLv": "2", "_verified": True}),
+                    ),
+                ):
+                    # 1) MEAN_REVERSION in long_short_mode: Maker TP placed, conflicting conditional SL skipped!
+                    eth_trk = eng.grid_trackers["ETH/USDT:USDT"]
+                    eth_trk.sync_config(mr_cfg, current_mid=3000.0)
+                    eth_trk.levels["L1"]["status"] = "ENTERING"
+                    with patch.object(
+                        eng.executor, "place_entry_ioc",
+                        new=AsyncMock(return_value=OrderResult("en-1", "FILLED", 0.017, 2982.0, 10.0, False, contracts=0.17, ct_val=0.1, fee_usdt=0.025)),
+                    ):
+                        await eng._run_grid_entry(mr_cfg, eth_trk, {**eth_trk.levels["L1"], "reservation_price": 2983.0, "trigger_exec_price": 2982.0}, "LIVE")
+
+                    assert eth_trk.levels["L1"]["maker_tp_live"] is True
+                    assert eth_trk.levels["L1"]["cond_sl_live"] is False
+                    po_calls = [c for c in calls if c[1] == "/api/v5/trade/order" and c[2].get("ordType") == "post_only"]
+                    assert len(po_calls) == 1
+                    assert po_calls[0][2]["posSide"] == "long"
+                    assert "reduceOnly" not in po_calls[0][2]
+                    assert not any(c[1] == "/api/v5/trade/order-algo" for c in calls)
+
+                    # 2) TREND_BREAKOUT in long_short_mode: native conditional SL placed with slTriggerPxType='last', amended atomically via amend-algos!
+                    sol_trk = eng.grid_trackers["SOL/USDT:USDT"]
+                    sol_trk.sync_config(tr_cfg, current_mid=100.0)
+                    sol_trk.levels["L1"]["status"] = "ENTERING"
+                    with patch.object(
+                        eng.executor, "place_entry_ioc",
+                        new=AsyncMock(return_value=OrderResult("en-sol-1", "FILLED", 1.5, 102.05, 8.0, False, contracts=1.5, ct_val=1.0)),
+                    ):
+                        await eng._run_grid_entry(tr_cfg, sol_trk, {**sol_trk.levels["L1"], "reservation_price": 102.1, "trigger_exec_price": 102.05}, "LIVE")
+
+                    assert sol_trk.levels["L1"]["cond_sl_live"] is True
+                    algo_calls = [c for c in calls if c[1] == "/api/v5/trade/order-algo"]
+                    assert len(algo_calls) == 1
+                    assert algo_calls[0][2]["slTriggerPxType"] == "last"
+                    assert algo_calls[0][2]["posSide"] == "long"
+
+                    # L2 opens -> Livermore step-up uses atomic POST /api/v5/trade/amend-algos (zero unprotected gap!)
+                    eng.math_states["SOL/USDT:USDT"].on_follower_tick(103.4, 103.5, 50.0, 50.0)
+                    sol_trk.levels["L2"]["status"] = "ENTERING"
+                    with patch.object(
+                        eng.executor, "place_entry_ioc",
+                        new=AsyncMock(return_value=OrderResult("en-sol-2", "FILLED", 0.9, 103.5, 8.0, False, contracts=0.9, ct_val=1.0)),
+                    ):
+                        await eng._run_grid_entry(tr_cfg, sol_trk, {**sol_trk.levels["L2"], "reservation_price": 103.55, "trigger_exec_price": 103.5}, "LIVE")
+
+                    amend_calls = [c for c in calls if c[1] == "/api/v5/trade/amend-algos"]
+                    assert len(amend_calls) == 1
+                    assert amend_calls[0][2]["algoId"] == "sl-ls-1"
+                    assert sol_trk.levels["L1"]["cond_sl_live"] is True
+                    assert sol_trk.levels["L1"]["cond_sl_algo_id"] == "sl-ls-1"
+
+                    # 3) If both amend-algos & cancel-algos fail transiently, update_slot_sl_order returns kept_old & preserves live SL!
+                    amend_fail_mode["fail"] = True
+                    upd = await eng.executor.update_slot_sl_order(
+                        cfg=tr_cfg, slot_key="SOL/USDT:USDT:L1", side="LONG", qty=1.5, new_sl_price=103.0,
+                        exchange_cfg=eng.exchanges["okx"], contracts=1.5, ct_val=1.0,
+                    )
+                    assert upd["status"] == "kept_old"
+                    assert upd["sl_is_live"] is True and upd["algo_id"] == "sl-ls-1"
+
+                # Verify protective orders were audited in SQLite orders table
+                await asyncio.sleep(0.35)
+                conn = sqlite3.connect(db_file)
+                order_types = {r[0] for r in conn.execute("SELECT order_type FROM orders WHERE user_id = 93").fetchall()}
+                conn.close()
+                assert "POST_ONLY" in order_types
+                assert "CONDITIONAL_SL" in order_types
+                await eng.executor.aclose()
+            finally:
+                await adb.stop_worker()
+
+        asyncio.run(run_check())
+
+
+def test_audit_p0_grid_safety_all_or_nothing_trail_and_monotone_pyramid():
+    """
+    Verifies Batch 1+2 grid_engine safety fixes:
+    1) TREND_BREAKOUT places all N pyramid levels even when grid_range_pct < L1 distance, and eff_range > L1 avoids recenter deadlock.
+    2) Strict pyramid monotonicity: never re-enters L1 while L2 is OPEN.
+    3) All-or-Nothing TREND_TRAIL_TP: exits ALL same-side slots together on weighted positive net return (no 1.2s partial sweep).
+    4) Post-GRID_SL 120s recenter & re-entry cooldown prevents instant stop-out churn.
+    5) Kill Switch force_exit_all=True retries reverted OPEN slots on subsequent ticks.
+    """
+    from backend.grid_engine import LongShortGridTracker
+
+    cfg = SymbolStrategy(
+        symbol="ZEC/USDT:USDT",
+        strategy_type="ADAPTIVE_GRID",
+        grid_side_mode="LONG_SHORT",
+        grid_levels=3,
+        grid_step_pct=0.008,
+        grid_take_profit_pct=0.0085,
+        grid_range_pct=0.025,
+        grid_stop_loss_pct=0.035,
+        order_usdt=15.0,
+        leverage=5,
+        price_precision=2,
+        qty_precision=2,
+        trend_dead_zone_mult=2.0,
+        trend_trailing_mult=1.5,
+        trend_use_bb_breakout=True,
+        bbw_timeframe="15m",
+        bbw_squeeze_percentile=20.0,
+    )
+    squeeze_bb = {
+        "timeframe": "15m", "bbw_pct": 1.0, "bbw_percentile": 10.0,
+        "bb_upper": 104.5, "bb_middle": 100.0, "bb_lower": 95.5, "trend_bias": "RANGE",
+    }
+    trk = LongShortGridTracker("ZEC/USDT:USDT")
+    trk.sync_config(cfg, current_mid=100.0, bbw_info=squeeze_bb)
+    assert trk.active_grid_mode == "TREND_BREAKOUT"
+    # All 6 levels (L1..L3, S1..S3) MUST exist with zero clipping even though grid_range_pct=2.5% & bb_upper=4.5%!
+    # L1 is capped at max(dead_zone*1.5, min(rng, 0.03)) = 2.5% -> 102.50, and L2=103.30 / L3=104.10 are NOT clipped!
+    assert set(trk.levels.keys()) == {"L1", "L2", "L3", "S1", "S2", "S3"}
+    assert trk.levels["L1"]["trigger_price"] == 102.50
+    assert trk.levels["L2"]["trigger_price"] == 103.30
+    assert trk.levels["L3"]["trigger_price"] == 104.10
+
+    # Price breaks L1 at 102.60 (> grid_range_pct=2.5%!) -> MUST trigger L1 instead of recentering away!
+    en1, _ = trk.evaluate_tick(102.58, 102.62, 102.60, cfg, is_net_mode=False, bbw_info=squeeze_bb)
+    assert [e["slot_id"] for e in en1] == ["L1"]
+    trk.mark_entry_filled("L1", 102.62, 0.22, 0.22, 1.0, cfg, 0.001)
+
+    # Price breaks L2 at 103.35 -> L2 opens
+    en2, _ = trk.evaluate_tick(103.32, 103.36, 103.34, cfg, is_net_mode=False, bbw_info=squeeze_bb)
+    assert [e["slot_id"] for e in en2] == ["L2"]
+    trk.mark_entry_filled("L2", 103.36, 0.13, 0.13, 1.0, cfg, 0.001)
+
+    # Strict pyramid monotonicity: if L1 exits externally while L2 is OPEN, L1 MUST NOT re-enter!
+    trk.clear_external_exit("L1")
+    en_mono, _ = trk.evaluate_tick(103.40, 103.45, 103.42, cfg, is_net_mode=False, bbw_info=squeeze_bb)
+    assert "L1" not in [e["slot_id"] for e in en_mono]
+
+    # All-or-Nothing TREND_TRAIL_TP: restore L1 at 102.62 & L2 at 103.36, rally to 105.0 (trail=103.74)
+    # Pull back to 103.30 (L1 profitable, L2 slightly negative, weighted notional net > 0) -> exits BOTH L1 & L2!
+    trk.levels["L1"]["status"] = "OPEN"
+    trk.levels["L1"]["entry_price"] = 102.62
+    trk.levels["L1"]["filled_qty"] = 0.22
+    trk.levels["L1"]["sl_price"] = 102.73
+    trk.levels["L2"]["sl_price"] = 102.73
+    trk.evaluate_tick(105.00, 105.04, 105.02, cfg, is_net_mode=False, bbw_info=squeeze_bb)
+    _, ex_all = trk.evaluate_tick(103.30, 103.34, 103.32, cfg, is_net_mode=False, round_trip_fee=0.001, bbw_info=squeeze_bb)
+    assert {e["slot_id"] for e in ex_all} == {"L1", "L2"}
+    assert all(e["exit_reason"] == "TREND_TRAIL_TP" for e in ex_all)
+
+    # Kill Switch force_exit_all=True retries reverted OPEN slots once retry backoff expires!
+    trk.revert_exit_failed("L1", backoff_ms=5000.0)
+    trk.revert_exit_failed("L2", backoff_ms=5000.0)
+    trk.levels["L1"]["exit_retry_until_mono"] = 0.0
+    trk.levels["L2"]["exit_retry_until_mono"] = 0.0
+    _, ex_ks = trk.evaluate_tick(104.50, 104.54, 104.52, cfg, is_net_mode=False, allow_entries=False, force_exit_all=True)
+    assert {e["slot_id"] for e in ex_ks} == {"L1", "L2"}
+    assert all(e["exit_reason"] == "KILL_SWITCH" for e in ex_ks)
+
+    # Post-GRID_SL 120s cooldown prevents instant recenter/re-entry right after stop-loss!
+    mr_cfg = cfg.model_copy(update={"strategy_type": "LONG_SHORT_GRID"})
+    mr_trk = LongShortGridTracker("ZEC/USDT:USDT")
+    mr_trk.sync_config(mr_cfg, current_mid=100.0)
+    mr_trk.levels["L1"]["status"] = "OPEN"
+    mr_trk.levels["L1"]["entry_price"] = 99.2
+    mr_trk.mark_exited("L1", -0.5, is_sl=True)
+    en_cd, _ = mr_trk.evaluate_tick(95.0, 95.1, 95.05, mr_cfg, is_net_mode=False, allow_entries=True, allow_recenter=True)
+    assert en_cd == []
+    assert mr_trk.center_price == 100.0  # Did NOT recenter during 120s post-SL cooldown!
+
+
+def test_audit_p0_executor_short_pos_side_isolation_and_fail_closed_cancel():
+    """
+    Verifies Batch 1+2 executor safety fixes:
+    1) close_exchange_position in long_short_mode closing LONG cancels ONLY LONG pending orders & chunks >10 algos.
+    2) execute_exit_with_retry on SHORT in long_short_mode properly checks row_ps=='short' with positive OKX pos.
+    3) cancel_slot_protective_orders sets reconcile_uncertain=True when cancel fails -> _run_grid_exits_batch skips blind market close.
+    4) query_algo_final_status parses ordIdList and respects explicit accFillSz=='0'.
+    """
+    from backend.executor import ExecutionAdapter
+    from backend.sniper_engine import BidirectionalSniperEngine
+    from backend.market_gateway import _OKX_INSTRUMENT_CACHE
+
+    _OKX_INSTRUMENT_CACHE["ETH-USDT-SWAP"] = {
+        "instId": "ETH-USDT-SWAP", "ctVal": 0.1, "lotSz": 0.01, "lotSz_str": "0.01",
+        "minSz": 0.01, "tickSz": 0.01, "tickSz_str": "0.01", "maxLever": 50, "state": "live",
+    }
+
+    async def run_exec_audit():
+        rc = GlobalRiskConfig(trading_mode="LIVE")
+        ex = ExecutionAdapter(lambda _: None, lambda: rc)
+        ex_cfg = {"exchange_id": "okx", "api_key": "k_ex", "_decrypted_secret": "s_ex", "_decrypted_passphrase": "p_ex"}
+        cfg = SymbolStrategy(symbol="ETH/USDT:USDT", strategy_type="LONG_SHORT_GRID", order_usdt=50.0, leverage=5, price_precision=2, qty_precision=3)
+
+        # 1) close_exchange_position side-isolation + 10-item chunking
+        # Seed 12 tracked LONG SL algos + 1 SHORT SL algo, plus 1 LONG TP + 1 SHORT TP
+        for i in range(12):
+            ex._active_cond_sl_orders[f"ETH/USDT:USDT:L{i}"] = {
+                "order_id": f"sl-l-{i}", "is_live": True, "symbol": "ETH/USDT:USDT", "side": "sell",
+            }
+        ex._active_cond_sl_orders["ETH/USDT:USDT:S1"] = {
+            "order_id": "sl-s-1", "is_live": True, "symbol": "ETH/USDT:USDT", "side": "buy",
+        }
+        ex._active_maker_tp_orders["ETH/USDT:USDT:L1"] = {
+            "order_id": "tp-long-1", "is_live": True, "symbol": "ETH/USDT:USDT", "side": "sell",
+        }
+        ex._active_maker_tp_orders["ETH/USDT:USDT:S1"] = {
+            "order_id": "tp-short-1", "is_live": True, "symbol": "ETH/USDT:USDT", "side": "buy",
+        }
+        close_payloads = []
+        canceled_algo_batches = []
+
+        async def mock_close_iso(client, creds, method, path, payload=None):
+            if path == "/api/v5/trade/close-position":
+                close_payloads.append(payload)
+                return {"code": "0", "data": [{"instId": "ETH-USDT-SWAP"}]}
+            if path == "/api/v5/trade/cancel-algos":
+                canceled_algo_batches.append([x["algoId"] for x in payload])
+                return {"code": "0", "data": [{"sCode": "0"} for _ in payload]}
+            return {"code": "0", "data": []}
+
+        with (
+            patch.object(ex, "_okx_request", side_effect=mock_close_iso),
+            patch.object(ex, "ensure_okx_account_meta", new=AsyncMock(return_value={"posMode": "long_short_mode", "acctLv": "2", "_verified": True})),
+        ):
+            res = await ex.close_exchange_position("ETH/USDT:USDT", "LONG", mgn_mode="cross", exchange_cfg=ex_cfg)
+            assert res["ok"] is True
+        assert close_payloads[0]["posSide"] == "long" and close_payloads[0]["autoCxl"] is True
+        assert "ETH/USDT:USDT:L1" not in ex._active_maker_tp_orders
+        assert "ETH/USDT:USDT:S1" in ex._active_maker_tp_orders  # SHORT TP untouched!
+        assert "ETH/USDT:USDT:S1" in ex._active_cond_sl_orders   # SHORT SL untouched!
+        assert len(canceled_algo_batches) == 2
+        assert len(canceled_algo_batches[0]) == 10 and len(canceled_algo_batches[1]) == 2
+        assert "sl-s-1" not in [aid for b in canceled_algo_batches for aid in b]  # SHORT SL untouched!
+
+        # 2) execute_exit_with_retry on SHORT with positive OKX pos & posSide='short' does NOT falsely claim FILLED!
+        async def mock_short_still_open(client, creds, method, path, payload=None):
+            if path == "/api/v5/trade/order":
+                return {"code": "51169", "data": [{"sCode": "51169", "sMsg": "transient"}]}
+            if path.startswith("/api/v5/account/positions"):
+                # OKX long_short_mode returns positive pos="2.0" with posSide="short"!
+                return {"code": "0", "data": [{"instId": "ETH-USDT-SWAP", "pos": "2.0", "posSide": "short", "mgnMode": "cross"}]}
+            return {"code": "0", "data": []}
+
+        with (
+            patch.object(ex, "_okx_request", side_effect=mock_short_still_open),
+            patch.object(ex, "ensure_okx_account_meta", new=AsyncMock(return_value={"posMode": "long_short_mode", "acctLv": "2", "_verified": True})),
+        ):
+            short_res = await ex.execute_exit_with_retry(
+                cfg=cfg, side="SHORT", qty=0.2, exit_reason="GRID_SL", tp_price=3000.0,
+                exchange_cfg=ex_cfg, contracts=2.0, ct_val=0.1, allow_close_position_fallback=False,
+            )
+            assert short_res.status == "UNCERTAIN"  # Did NOT misclassify open SHORT as closed!
+
+        # 3) query_algo_final_status parses ordIdList and trusts explicit accFillSz=='0'
+        async def mock_algo_zero_fill(client, creds, method, path, payload=None):
+            if path.startswith("/api/v5/trade/order-algo?"):
+                return {"code": "0", "data": [{"algoId": "a1", "state": "effective", "actualSz": "1.0", "actualPx": "3000", "ordIdList": ["child-99"]}]}
+            if path.startswith("/api/v5/trade/order?instId=ETH-USDT-SWAP&ordId=child-99"):
+                return {"code": "0", "data": [{"ordId": "child-99", "state": "canceled", "accFillSz": "0", "avgPx": "", "fee": "0"}]}
+            return {"code": "0", "data": []}
+
+        with patch.object(ex, "_okx_request", side_effect=mock_algo_zero_fill):
+            ast = await ex.query_algo_final_status("ETH/USDT:USDT", "a1", ex_cfg)
+            assert ast["ok"] is True and ast["ord_id"] == "child-99" and ast["acc_fill_ct"] == 0.0
+
+        # 4) Fail-closed cancel_slot_protective_orders prevents double-close in _run_grid_exits_batch!
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adb = AsyncDatabaseManager(db_path=os.path.join(tmpdir, "fc.db"))
+            adb.init_sync()
+            adb.ensure_user_workspace_sync(94)
+            adb.upsert_symbol_sync(cfg, user_id=94)
+            eng = BidirectionalSniperEngine(adb, user_id=94)
+            eng.risk_config = GlobalRiskConfig(trading_mode="LIVE", feed_source="REAL_WS")
+            eng.exchanges["okx"] = {**ex_cfg, "role": "follower", "is_active": True, "auth_status": "VERIFIED"}
+            eng._register_symbol_internal(cfg)
+            trk = eng.grid_trackers["ETH/USDT:USDT"]
+            trk.sync_config(cfg, current_mid=3000.0)
+            trk.levels["L1"].update({"status": "EXITING", "entry_price": 2980.0, "filled_qty": 0.02, "contracts": 0.2, "ct_val": 0.1, "maker_tp_live": True, "maker_tp_order_id": "tp-stuck"})
+            eng.executor.restore_slot_protective_tracking(
+                "ETH/USDT:USDT", "ETH/USDT:USDT:L1", "LONG", 0.02, 0.2, 0.1, 3000.0, 2900.0,
+                maker_tp_order_id="tp-stuck", exchange_cfg=eng.exchanges["okx"],
+            )
+            market_posts = []
+
+            async def mock_stuck_cancel(client, creds, method, path, payload=None):
+                if path == "/api/v5/trade/order" and method == "POST":
+                    market_posts.append(payload)
+                if path.startswith("/api/v5/trade/order?"):
+                    return {"code": "0", "data": [{"ordId": "tp-stuck", "state": "live", "accFillSz": "0"}]}
+                if path == "/api/v5/trade/cancel-order":
+                    return {"code": "50011", "data": []}
+                return {"code": "0", "data": []}
+
+            with (
+                patch.object(eng.executor, "_okx_request", side_effect=mock_stuck_cancel),
+                patch.object(eng, "sync_live_exchange_positions", new=AsyncMock(return_value={"ok": True})),
+            ):
+                await eng._run_grid_exits_batch(cfg, trk, [{**trk.levels["L1"], "exit_reason": "GRID_TP"}], "LIVE")
+
+            assert market_posts == []  # ZERO blind market close orders while TP state is uncertain!
+            assert trk.levels["L1"]["status"] == "OPEN"
+            assert "ETH/USDT:USDT:L1" in eng.executor._active_maker_tp_orders  # Still tracked!
+            await eng.executor.aclose()
+        await ex.aclose()
+
+    asyncio.run(run_exec_audit())
+
+
+def test_audit_p0_engine_recovered_ll_vanished_slot_settlement_and_math_models():
+    """
+    Verifies:
+    1) _monitor_recovered_lead_lag_position completes cleanly without NameError: pos_rec.
+    2) sync_live_exchange_positions settles vanished slot's filled Maker TP (booking PnL) instead of wiping it silently.
+    3) math_engine rejects zero-volume ticks under require_volume_confirm, resets cleanly on >12% jump, and freezes stale basis.
+    4) models.py rejects NaN / Infinity floats.
+    """
+    from backend.sniper_engine import BidirectionalSniperEngine, SniperState
+    from backend.executor import OrderResult
+    from backend.math_engine import SymbolMathState
+    from pydantic import ValidationError
+
+    # 1) models.py NaN / Inf rejection
+    for bad_val in (float("nan"), float("inf"), float("-inf")):
+        try:
+            SymbolStrategy(symbol="BTC/USDT:USDT", order_usdt=bad_val)
+            assert False, f"Expected ValidationError for {bad_val}"
+        except ValidationError:
+            pass
+
+    # 2) math_engine zero-volume rejection + >12% jump reset + stale follower basis freeze
+    m = SymbolMathState("BTC/USDT:USDT")
+    ll_cfg = SymbolStrategy(
+        symbol="BTC/USDT:USDT", strategy_type="LEAD_LAG", require_volume_confirm=True,
+        min_jump_pct=0.002, adaptive_z_score=1.0, take_profit_pct=0.001, order_usdt=100.0,
+    )
+    t0 = 10000.0
+    for i in range(15):
+        m.on_follower_tick(100.0, 100.02, 50.0, 50.0, now_mono=t0 + i * 20.0)
+        m.on_leader_tick(100.0, 100.02, 50.0, 50.0, ll_cfg, is_locked=False, now_mono=t0 + i * 20.0)
+    # Jump leader +0.5% with ZERO trade volume -> MUST be rejected by require_volume_confirm!
+    m.on_leader_tick(100.50, 100.52, 50.0, 50.0, ll_cfg, is_locked=False, now_mono=t0 + 320.0)
+    assert m.evaluate_signal(ll_cfg, taker_fee=0.0005, maker_fee=0.0002, now_mono=t0 + 320.0) is None
+
+    # Stale follower tick (> max_book_staleness_ms) MUST freeze log_basis_ema
+    basis_before = m.log_basis_ema
+    m.on_leader_tick(101.0, 101.02, 50.0, 50.0, ll_cfg, is_locked=False, now_mono=t0 + 5000.0)
+    assert m.basis_frozen is True
+    assert m.log_basis_ema == basis_before
+
+    # >12% jump resets cleanly and returns early without poisoning basis
+    m.on_follower_tick(100.0, 100.02, 50.0, 50.0, now_mono=t0 + 5010.0)
+    m.on_leader_tick(125.0, 125.02, 50.0, 50.0, ll_cfg, is_locked=False, now_mono=t0 + 5015.0)
+    assert m.log_basis_ema is None
+
+    # 3) _monitor_recovered_lead_lag_position (no NameError!) + vanished slot Maker TP settlement in sync_live_exchange_positions
+    async def run_engine_audit():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adb = AsyncDatabaseManager(db_path=os.path.join(tmpdir, "eng_audit.db"))
+            adb.init_sync()
+            adb.ensure_user_workspace_sync(95)
+            ll_sym = SymbolStrategy(symbol="BTC/USDT:USDT", strategy_type="LEAD_LAG", order_usdt=100.0, leverage=5, price_precision=1, qty_precision=3)
+            gr_sym = SymbolStrategy(symbol="ETH/USDT:USDT", strategy_type="LONG_SHORT_GRID", order_usdt=50.0, leverage=5, price_precision=2, qty_precision=3)
+            adb.upsert_symbol_sync(ll_sym, user_id=95)
+            adb.upsert_symbol_sync(gr_sym, user_id=95)
+
+            eng = BidirectionalSniperEngine(adb, user_id=95)
+            eng.risk_config = GlobalRiskConfig(trading_mode="LIVE", feed_source="REAL_WS")
+            eng.exchanges["okx"] = {
+                "exchange_id": "okx", "role": "follower", "is_active": True,
+                "api_key": "k_eng", "_decrypted_secret": "s_eng", "_decrypted_passphrase": "p_eng",
+                "auth_status": "VERIFIED", "taker_fee": 0.0005, "maker_fee": 0.0002,
+            }
+            eng._register_symbol_internal(ll_sym)
+            eng._register_symbol_internal(gr_sym)
+
+            # Recovered LEAD_LAG position hits TP -> must execute cleanly with ZERO NameError!
+            pos_entry = {
+                "symbol": "BTC/USDT:USDT", "mode": "LIVE", "side": "LONG", "qty": 0.01, "contracts": 1.0, "ct_val": 0.01,
+                "entry_price": 60000.0, "tp_price": 60200.0, "sl_price": 59500.0, "opened_mono_ms": 1.0, "recovered": True,
+            }
+            eng.active_positions["BTC/USDT:USDT"] = pos_entry
+            eng.symbol_states["BTC/USDT:USDT"] = SniperState.HOLDING
+            eng.math_states["BTC/USDT:USDT"].on_follower_tick(60250.0, 60255.0, 10.0, 10.0)
+            with patch.object(
+                eng.executor, "execute_exit_with_retry",
+                new=AsyncMock(return_value=OrderResult("rec-ex-1", "FILLED", 0.01, 60250.0, 15.0, False, contracts=1.0, ct_val=0.01, fee_usdt=0.30)),
+            ):
+                await eng._monitor_recovered_lead_lag_position(ll_sym, pos_entry)
+            assert "BTC/USDT:USDT" not in eng.active_positions
+            assert eng.symbol_states["BTC/USDT:USDT"] == SniperState.IDLE
+            assert eng.stats_by_mode["LIVE"]["win_count"] == 1
+
+            # Vanished ETH grid slot whose Maker TP actually filled on OKX -> settles PnL instead of wiping silently!
+            eth_trk = eng.grid_trackers["ETH/USDT:USDT"]
+            eth_trk.sync_config(gr_sym, current_mid=3000.0)
+            eth_trk.levels["L1"].update({
+                "status": "OPEN", "entry_price": 2980.0, "tp_price": 3005.0, "sl_price": 2880.0,
+                "filled_qty": 0.02, "contracts": 0.2, "ct_val": 0.1,
+                "maker_tp_live": True, "maker_tp_order_id": "tp-vanish-1",
+            })
+            eng.active_grid_positions["ETH/USDT:USDT:L1"] = {
+                "symbol": "ETH/USDT:USDT", "grid_slot_id": "L1", "side": "LONG", "mode": "LIVE", "qty": 0.02, "opened_mono_ms": 1.0,
+            }
+            with (
+                patch.object(eng, "poll_grid_protective_orders", new=AsyncMock(return_value=0)),
+                patch.object(eng.executor, "fetch_live_positions", new=AsyncMock(return_value={"ok": True, "pos_mode": "long_short_mode", "positions": []})),
+                patch.object(
+                    eng.executor, "cancel_slot_protective_orders",
+                    new=AsyncMock(return_value={
+                        "tp_fully_filled": True, "tp_filled_ct": 0.2, "tp_avg_px": 3005.0, "tp_order_id": "tp-vanish-1", "tp_fee_usdt": 0.012,
+                        "sl_already_filled": False, "sl_filled_ct": 0.0, "sl_avg_px": 0.0, "sl_order_id": "", "sl_fee_usdt": 0.0, "reconcile_uncertain": False,
+                    }),
+                ),
+            ):
+                await eng.sync_live_exchange_positions(trigger="test_vanish")
+            assert eth_trk.levels["L1"]["status"] == "IDLE"
+            assert eng.stats_by_mode["LIVE"]["maker_tp_count"] == 1
+            await eng.executor.aclose()
+
+    asyncio.run(run_engine_audit())
+
+
 
 
 

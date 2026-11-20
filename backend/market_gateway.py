@@ -582,6 +582,7 @@ class MarketDataGateway:
             return None
 
         bbw_series: List[float] = []
+        mid_series: List[float] = []
         last_mid = 0.0
         last_upper = 0.0
         last_lower = 0.0
@@ -597,6 +598,7 @@ class MarketDataGateway:
             lower = max(1e-12, mid - num_std * std)
             bbw = (upper - lower) / mid
             bbw_series.append(bbw)
+            mid_series.append(mid)
             last_mid, last_upper, last_lower = mid, upper, lower
 
         if not bbw_series or last_mid <= 0:
@@ -613,6 +615,41 @@ class MarketDataGateway:
         recent_20 = sum(bbw_series[-20:]) / min(20, len(bbw_series))
         vcp_contraction = curr_bbw <= recent_5 * 1.05 and recent_5 < recent_20 * 0.92
 
+        # Compute SMA-seeded EMA20 / EMA60 directional trend filter & volatility-normalized Z-scores
+        def _calc_ema(arr: List[float], span: int) -> float:
+            eff_span = max(2, min(span, len(arr)))
+            k = 2.0 / (eff_span + 1.0)
+            ema_val = sum(arr[:eff_span]) / eff_span
+            for v in arr[eff_span:]:
+                ema_val = v * k + ema_val * (1.0 - k)
+            return ema_val
+
+        ema_fast = _calc_ema(vals, 20)
+        ema_slow = _calc_ema(vals, 60)
+        ema_gap_pct = (ema_fast - ema_slow) / max(1e-12, ema_slow)
+        ref_mid_prev = mid_series[-6] if len(mid_series) >= 6 else mid_series[0]
+        bb_slope_pct = (last_mid - ref_mid_prev) / max(1e-12, ref_mid_prev)
+        last_c = vals[-1]
+
+        # Volatility-normalized EMA separation & slope (adapts cleanly from low-vol BTC to high-vol PEPE/ZEC/SNDK)
+        bar_sigma = max((last_upper - last_mid) / max(1e-12, num_std), last_mid * 0.0015)
+        ema_gap_z = (ema_fast - ema_slow) / bar_sigma
+        bb_slope_z = (last_mid - ref_mid_prev) / bar_sigma
+
+        if (ema_gap_z >= 0.60 or ema_gap_pct >= 0.0025) and last_c > ema_fast and (bb_slope_z > 0.12 or bb_slope_pct > 0.0005):
+            trend_bias = "BULL"
+        elif (ema_gap_z <= -0.60 or ema_gap_pct <= -0.0025) and last_c < ema_fast and (bb_slope_z < -0.12 or bb_slope_pct < -0.0005):
+            trend_bias = "BEAR"
+        else:
+            trend_bias = "RANGE"
+
+        if trend_bias == "BULL" and (last_c > last_upper or ema_gap_z >= 1.35 or ema_gap_pct >= 0.0060) and pct_rank >= 45.0:
+            breakout_expansion = "UP_BREAKOUT"
+        elif trend_bias == "BEAR" and (last_c < last_lower or ema_gap_z <= -1.35 or ema_gap_pct <= -0.0060) and pct_rank >= 45.0:
+            breakout_expansion = "DOWN_BREAKOUT"
+        else:
+            breakout_expansion = "NONE"
+
         return {
             "timeframe": timeframe,
             "bbw": round(curr_bbw, 6),
@@ -621,7 +658,15 @@ class MarketDataGateway:
             "bb_upper": last_upper,
             "bb_middle": last_mid,
             "bb_lower": last_lower,
-            "last_close": vals[-1],
+            "last_close": last_c,
+            "ema_fast": ema_fast,
+            "ema_slow": ema_slow,
+            "ema_gap_pct": round(ema_gap_pct * 100.0, 3),
+            "ema_gap_z": round(ema_gap_z, 3),
+            "bb_slope_pct": round(bb_slope_pct * 100.0, 3),
+            "bb_slope_z": round(bb_slope_z, 3),
+            "trend_bias": trend_bias,
+            "breakout_expansion": breakout_expansion,
             "vcp_contraction": vcp_contraction,
             "samples": len(bbw_series),
             "updated_at_ms": int(time.time() * 1000),
@@ -632,8 +677,8 @@ class MarketDataGateway:
         cached = self.bbw_cache.get((symbol, tf))
         if not cached:
             return None
-        # Reject extremely stale BBW snapshots (> 30 min old)
-        if int(time.time() * 1000) - int(cached.get("updated_at_ms") or 0) > 1_800_000:
+        max_age_ms = 4_500_000 if tf == "1H" else 1_200_000  # 75m for 1H, 20m for 15m
+        if int(time.time() * 1000) - int(cached.get("updated_at_ms") or 0) > max_age_ms:
             return None
         return cached
 
@@ -644,7 +689,7 @@ class MarketDataGateway:
         client: Optional[httpx.AsyncClient] = None,
         force: bool = False,
     ) -> Optional[dict]:
-        """Fetches 15m/1H closed public candles (OKX primary, Binance fallback) with cross-tenant TTL dedup."""
+        """Fetches 200 closed 15m/1H public candles (OKX primary with 50011/429 retry, Binance fallback only if listed)."""
         tf = "1H" if str(timeframe or "15m").upper() == "1H" else "15m"
         cache_key = (symbol, tf)
         now_ms = int(time.time() * 1000)
@@ -657,76 +702,89 @@ class MarketDataGateway:
 
         okx_bar = "1H" if tf == "1H" else "15m"
         bn_interval = "1h" if tf == "1H" else "15m"
-        proxy = get_system_proxy()
         own_client = client is None
-        http_client = client or httpx.AsyncClient(proxy=proxy, timeout=6.0)
+        http_client = client or httpx.AsyncClient(proxy=get_system_proxy(), timeout=6.0)
         closes: List[float] = []
+        latest_candle_ts_ms: int = 0
         try:
             inst_id = to_okx_inst_id(symbol)
-            try:
-                resp = await http_client.get(
-                    f"https://www.okx.com/api/v5/market/candles?instId={inst_id}&bar={okx_bar}&limit=100"
-                )
-                if resp.status_code == 200:
-                    rows = resp.json().get("data", [])
-                    if len(rows) >= 25:
-                        # Drop unclosed forming candle (confirm == "0") to prevent repainting; reverse to oldest->newest
-                        closed_rows = [r for r in rows if len(r) >= 5 and (len(r) < 9 or str(r[8]) != "0")]
-                        if len(closed_rows) < 25:
-                            closed_rows = rows
-                        parsed = []
-                        for r in reversed(closed_rows):
-                            try:
-                                c = float(r[4])
-                                if math.isfinite(c) and c > 0:
-                                    parsed.append(c)
-                            except (TypeError, ValueError):
-                                continue
-                        closes = parsed
-                elif resp.status_code == 429:
-                    await asyncio.sleep(0.5)
-            except Exception:
-                pass
+            for attempt in range(2):
+                try:
+                    resp = await http_client.get(
+                        f"https://www.okx.com/api/v5/market/candles?instId={inst_id}&bar={okx_bar}&limit=200"
+                    )
+                    if resp.status_code == 429:
+                        await asyncio.sleep(0.6 * (attempt + 1))
+                        continue
+                    if resp.status_code == 200:
+                        j = resp.json()
+                        if str(j.get("code", "0")) == "50011":
+                            await asyncio.sleep(0.6 * (attempt + 1))
+                            continue
+                        rows = j.get("data", [])
+                        if len(rows) >= 25:
+                            # Drop unclosed forming candle (confirm == "0"); sort defensively oldest -> newest by ts
+                            closed_rows = [r for r in rows if len(r) >= 5 and (len(r) < 9 or str(r[8]) != "0")]
+                            if len(closed_rows) >= 25:
+                                closed_rows.sort(key=lambda r: int(float(r[0] or 0)))
+                                parsed = []
+                                for r in closed_rows:
+                                    try:
+                                        c = float(r[4])
+                                        if math.isfinite(c) and c > 0:
+                                            parsed.append(c)
+                                            latest_candle_ts_ms = max(latest_candle_ts_ms, int(float(r[0] or 0)))
+                                    except (TypeError, ValueError):
+                                        continue
+                                closes = parsed
+                    break
+                except Exception:
+                    if attempt == 0:
+                        await asyncio.sleep(0.3)
 
             if len(closes) < 25:
-                try:
-                    bn_sym = to_binance_stream_sym(symbol).upper()
-                    div = get_binance_price_divisor(symbol)
-                    resp = await http_client.get(
-                        f"https://fapi.binance.com/fapi/v1/klines?symbol={bn_sym}&interval={bn_interval}&limit=100"
-                    )
-                    if resp.status_code == 200:
-                        rows = resp.json()
-                        if isinstance(rows, list) and len(rows) >= 25:
-                            # Exclude forming last candle when enough closed bars exist
-                            use_rows = rows[:-1] if len(rows) > 25 else rows
-                            parsed = []
-                            for r in use_rows:
-                                if len(r) < 5:
-                                    continue
-                                try:
-                                    c = float(r[4]) / div
-                                    if math.isfinite(c) and c > 0:
-                                        parsed.append(c)
-                                except (TypeError, ValueError):
-                                    continue
-                            closes = parsed
-                except Exception:
-                    pass
+                bn_sym = to_binance_stream_sym(symbol).upper()
+                # Skip Binance fallback for OKX-only contracts (e.g. NVDA, SPCX, TSLA, SNDK, OKB) when cache is loaded
+                if not _BINANCE_INSTRUMENT_CACHE or bn_sym in _BINANCE_INSTRUMENT_CACHE:
+                    try:
+                        div = get_binance_price_divisor(symbol)
+                        resp = await http_client.get(
+                            f"https://fapi.binance.com/fapi/v1/klines?symbol={bn_sym}&interval={bn_interval}&limit=200"
+                        )
+                        if resp.status_code == 200:
+                            rows = resp.json()
+                            if isinstance(rows, list) and len(rows) >= 26:
+                                use_rows = sorted(rows[:-1], key=lambda r: int(float(r[0] or 0)))
+                                parsed = []
+                                for r in use_rows:
+                                    if len(r) < 5:
+                                        continue
+                                    try:
+                                        c = float(r[4]) / div
+                                        if math.isfinite(c) and c > 0:
+                                            parsed.append(c)
+                                            latest_candle_ts_ms = max(latest_candle_ts_ms, int(float(r[0] or 0)))
+                                    except (TypeError, ValueError):
+                                        continue
+                                closes = parsed
+                    except Exception:
+                        pass
         finally:
             self._bbw_refresh_in_progress.discard(cache_key)
             if own_client:
                 await http_client.aclose()
 
         if len(closes) < 25:
-            return cached
+            return None
         metrics = self.compute_bbw_metrics(closes, period=20, num_std=2.0, timeframe=tf)
         if metrics:
+            if latest_candle_ts_ms > 0:
+                metrics["latest_candle_ts_ms"] = latest_candle_ts_ms
             self.bbw_cache[cache_key] = metrics
         return metrics
 
     async def refresh_volatility_regime(self, pairs: List[Tuple[str, str]]) -> int:
-        """Staggered low-load refresh of 15m/1H BBW squeeze metrics for Adaptive/Trend grid symbols."""
+        """Paced low-load refresh of 15m/1H BBW + EMA metrics across grid symbols."""
         uniq_pairs = list(dict.fromkeys((s, "1H" if str(tf).upper() == "1H" else "15m") for s, tf in pairs))
         if not uniq_pairs:
             return 0
@@ -735,10 +793,11 @@ class MarketDataGateway:
         try:
             async with httpx.AsyncClient(proxy=proxy, timeout=6.0) as client:
                 for sym, tf in uniq_pairs:
+                    prev_ts = int((self.bbw_cache.get((sym, tf)) or {}).get("updated_at_ms") or 0)
                     res = await self.fetch_symbol_bbw(sym, tf, client=client)
-                    if res:
+                    if res and int(res.get("updated_at_ms") or 0) > prev_ts:
                         updated += 1
-                    await asyncio.sleep(0.06)
+                    await asyncio.sleep(0.09)
         except Exception:
             pass
         return updated
@@ -749,8 +808,14 @@ class MarketDataGateway:
         self._running = True
         for sym in self.symbols:
             self.prime_symbol_immediately(sym)
-        # Warm up instrument specs & real BBO cache in background immediately on startup
-        asyncio.create_task(self.fetch_exchange_instruments())
+        # Warm up instrument specs briefly before starting WS when REAL_WS is active (avoids cold-start ctVal=1 / invalid streams)
+        if self._has_mode_subscriber("REAL_WS"):
+            try:
+                await asyncio.wait_for(self.fetch_exchange_instruments(), timeout=2.5)
+            except Exception:
+                pass
+        else:
+            asyncio.create_task(self.fetch_exchange_instruments())
         asyncio.create_task(self.fetch_real_bbo_snapshot(emit_immediately=self._has_mode_subscriber("REAL_WS")))
         self._tasks = [
             asyncio.create_task(self._simulator_loop()),
@@ -825,9 +890,13 @@ class MarketDataGateway:
                     self.exchange_health["binanceusdm"]["ping_ms"] = round(min(42.0, (mono_ms() - t_conn) * 0.22), 1)
                     self.exchange_health["binanceusdm"]["status"] = "LIVE_WS"
 
-                    async for raw_msg in ws:
-                        if not self._running or sym_ver != self._symbols_version:
-                            break
+                    while self._running and sym_ver == self._symbols_version:
+                        try:
+                            raw_msg = await asyncio.wait_for(ws.recv(), timeout=20.0)
+                        except asyncio.TimeoutError:
+                            if sym_ver != self._symbols_version:
+                                break
+                            continue
                         self._last_binance_ws_mono = mono_ms()
                         data = orjson.loads(raw_msg).get("data")
                         if not data:
@@ -905,6 +974,9 @@ class MarketDataGateway:
                             payload = orjson.loads(raw_msg)
                         except Exception:
                             continue
+                        if payload.get("event") == "error":
+                            self.last_ws_error = f"OKX WS 订阅错误 ({payload.get('code')}): {payload.get('msg', '')}"
+                            continue
                         rows = payload.get("data")
                         if not rows:
                             continue
@@ -951,7 +1023,7 @@ class MarketDataGateway:
             ws_healthy = okx_ws_fresh and bn_ws_fresh
             has_real = self._has_mode_subscriber("REAL_WS")
 
-            inst_retry_ms = 5_000.0 if not _OKX_INSTRUMENT_CACHE else 300_000.0
+            inst_retry_ms = 5_000.0 if (not _OKX_INSTRUMENT_CACHE or not _BINANCE_INSTRUMENT_CACHE) else 300_000.0
             if now - last_inst_fetch_mono >= inst_retry_ms:
                 last_inst_fetch_mono = now
                 asyncio.create_task(self.fetch_exchange_instruments())
@@ -969,13 +1041,15 @@ class MarketDataGateway:
                     last_rest_fetch_mono = now
                     await self.fetch_real_bbo_snapshot(emit_immediately=True)
                 else:
-                    # Only keep quiet contracts fresh when that exchange's WS socket is genuinely alive!
+                    # Only re-stamp quiet contracts when that exchange's WS socket is alive AND symbol itself ticked within 15s
                     for sym in list(self.symbols):
-                        if okx_ws_fresh and now - self.real_follower_ts.get(sym, 0.0) > 300.0:
+                        f_age = now - self.real_follower_ts.get(sym, 0.0)
+                        if okx_ws_fresh and 300.0 < f_age <= 15_000.0:
                             f_bbo = self.real_follower_bbo.get(sym)
                             if f_bbo:
                                 self._dispatch_follower_bbo("REAL_WS", sym, f_bbo[0], f_bbo[1], f_bbo[2], f_bbo[3])
-                        if bn_ws_fresh and now - self.real_leader_ts.get(sym, 0.0) > 300.0:
+                        l_age = now - self.real_leader_ts.get(sym, 0.0)
+                        if bn_ws_fresh and 300.0 < l_age <= 15_000.0:
                             l_bbo = self.real_leader_bbo.get(sym)
                             if l_bbo:
                                 self._dispatch_leader_bbo("REAL_WS", sym, l_bbo[0], l_bbo[1], l_bbo[2], l_bbo[3])
@@ -1116,15 +1190,20 @@ class MarketDataGateway:
     async def _telemetry_loop(self):
         while self._running:
             await asyncio.sleep(1.0)
+            has_real = self._has_mode_subscriber("REAL_WS")
             for ex_id in ("binanceusdm", "okx"):
                 cnt = self._msg_counts.get(ex_id, 0)
                 self._msg_counts[ex_id] = 0
                 self.exchange_health[ex_id]["msg_rate_sec"] = cnt
                 is_conn = self.binance_connected if ex_id == "binanceusdm" else self.okx_connected
-                if not is_conn and self._has_mode_subscriber("REAL_WS"):
-                    self.exchange_health[ex_id]["ping_ms"] = 0.0
-                    self.exchange_health[ex_id]["status"] = "RECONNECTING"
-                else:
-                    self.exchange_health[ex_id]["status"] = "LIVE_WS" if is_conn else "CONNECTED"
-                    base_ping = 14.0 if ex_id == "binanceusdm" else 18.5
-                    self.exchange_health[ex_id]["ping_ms"] = round(base_ping + random.uniform(-1.5, 2.1), 1)
+                cur_status = self.exchange_health[ex_id].get("status", "")
+                if not is_conn and has_real:
+                    if cur_status != "REST_FALLBACK":
+                        self.exchange_health[ex_id]["ping_ms"] = 0.0
+                        self.exchange_health[ex_id]["status"] = "RECONNECTING"
+                elif is_conn:
+                    self.exchange_health[ex_id]["status"] = "LIVE_WS"
+                elif not has_real:
+                    self.exchange_health[ex_id]["status"] = "CONNECTED"
+                    if not self.exchange_health[ex_id].get("ping_ms"):
+                        self.exchange_health[ex_id]["ping_ms"] = 14.0 if ex_id == "binanceusdm" else 18.5

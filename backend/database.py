@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS symbol_configs (
     auto_beta_enabled BOOLEAN DEFAULT 1,
     require_volume_confirm BOOLEAN DEFAULT 1,
     use_post_only_tp BOOLEAN DEFAULT 1,
+    sl_trigger_px_type VARCHAR(8) DEFAULT 'mark',
     max_signal_age_ms INTEGER DEFAULT 80,
     max_book_staleness_ms INTEGER DEFAULT 600,
     contract_size DECIMAL(12, 6) DEFAULT 1.0,
@@ -377,6 +378,7 @@ class AsyncDatabaseManager:
             ("trend_use_bb_breakout", "ALTER TABLE symbol_configs ADD COLUMN trend_use_bb_breakout BOOLEAN DEFAULT 1"),
             ("bbw_timeframe", "ALTER TABLE symbol_configs ADD COLUMN bbw_timeframe VARCHAR(8) DEFAULT '15m'"),
             ("bbw_squeeze_percentile", "ALTER TABLE symbol_configs ADD COLUMN bbw_squeeze_percentile DECIMAL(6, 2) DEFAULT 20.00"),
+            ("sl_trigger_px_type", "ALTER TABLE symbol_configs ADD COLUMN sl_trigger_px_type VARCHAR(8) DEFAULT 'mark'"),
         ]
         for col, ddl in additions:
             if col not in existing:
@@ -706,6 +708,8 @@ class AsyncDatabaseManager:
                     d["grid_side_mode"] = "LONG_SHORT"
                 if d.get("bbw_timeframe") not in ("15m", "1H"):
                     d["bbw_timeframe"] = "15m"
+                if d.get("sl_trigger_px_type") not in ("mark", "last"):
+                    d["sl_trigger_px_type"] = "mark"
                 for k, dv in (
                     ("grid_levels", 5),
                     ("grid_step_pct", 0.0060),
@@ -733,14 +737,14 @@ class AsyncDatabaseManager:
                     adaptive_z_score, lag_confirm_max_pct, take_profit_pct, stop_loss_pct,
                     reversal_stop_ratio, trailing_stop_enabled, trailing_retracement_pct,
                     max_hold_ms, slippage_pct, beta_coeff, auto_beta_enabled,
-                    require_volume_confirm, use_post_only_tp, max_signal_age_ms,
+                    require_volume_confirm, use_post_only_tp, sl_trigger_px_type, max_signal_age_ms,
                     max_book_staleness_ms, contract_size, min_qty, qty_precision,
                     price_precision, grid_side_mode, grid_levels, grid_step_pct,
                     grid_take_profit_pct, grid_range_pct, grid_stop_loss_pct,
                     grid_recenter_enabled, trend_dead_zone_mult, trend_trailing_mult,
                     trend_pyramid_decay, trend_use_bb_breakout, bbw_timeframe,
                     bbw_squeeze_percentile, is_running, auto_disabled_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, symbol) DO UPDATE SET
                     strategy_type=excluded.strategy_type,
                     direction=excluded.direction,
@@ -761,6 +765,7 @@ class AsyncDatabaseManager:
                     auto_beta_enabled=excluded.auto_beta_enabled,
                     require_volume_confirm=excluded.require_volume_confirm,
                     use_post_only_tp=excluded.use_post_only_tp,
+                    sl_trigger_px_type=excluded.sl_trigger_px_type,
                     max_signal_age_ms=excluded.max_signal_age_ms,
                     max_book_staleness_ms=excluded.max_book_staleness_ms,
                     contract_size=excluded.contract_size,
@@ -805,6 +810,7 @@ class AsyncDatabaseManager:
                     1 if cfg.auto_beta_enabled else 0,
                     1 if cfg.require_volume_confirm else 0,
                     1 if cfg.use_post_only_tp else 0,
+                    cfg.sl_trigger_px_type,
                     cfg.max_signal_age_ms,
                     cfg.max_book_staleness_ms,
                     cfg.contract_size,

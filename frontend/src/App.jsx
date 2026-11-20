@@ -312,9 +312,13 @@ export default function App() {
   const [batchForm, setBatchForm] = useState({
     strategy_filter: 'ALL_GRID',
     only_running: false,
+    order_usdt_str: '',
     grid_step_pct_str: '0.60',
     grid_take_profit_pct_str: '0.65',
+    grid_stop_loss_pct_str: '',
     trend_trailing_mult_str: '',
+    use_post_only_tp_mode: 'keep',
+    sl_trigger_px_type_mode: 'keep',
     auto_fix_anomalies: true,
   });
 
@@ -332,6 +336,7 @@ export default function App() {
       grid_take_profit_pct: '单格止盈目标',
       grid_range_pct: '区间总跨度',
       grid_stop_loss_pct: '破网硬止损阈值',
+      sl_trigger_px_type: '止损触发价类型',
       window_ms: '脉冲检测窗口',
       min_jump_pct: '最小脉冲幅度',
       take_profit_pct: '目标净止盈',
@@ -755,6 +760,7 @@ export default function App() {
       grid_take_profit_pct: Math.min(0.5, Math.max(0.0001, Number(cfg.grid_take_profit_pct ?? 0.0065) || 0.0065)),
       grid_range_pct: Math.min(0.8, Math.max(0.001, Number(cfg.grid_range_pct ?? 0.05) || 0.05)),
       grid_stop_loss_pct: Math.min(0.9, Math.max(0.002, Number(cfg.grid_stop_loss_pct ?? 0.08) || 0.08)),
+      sl_trigger_px_type: cfg.sl_trigger_px_type === 'last' ? 'last' : 'mark',
     };
     try {
       const res = await fetch('/api/symbol/update', {
@@ -853,6 +859,7 @@ export default function App() {
         auto_beta_enabled: true,
         require_volume_confirm: true,
         use_post_only_tp: true,
+        sl_trigger_px_type: 'mark',
         max_signal_age_ms: 80,
         max_book_staleness_ms: 600,
         contract_size: 1.0,
@@ -1158,6 +1165,10 @@ export default function App() {
       auto_fix_anomalies: Boolean(batchForm.auto_fix_anomalies),
     };
     if (action === 'apply') {
+      const ordU = Number(batchForm.order_usdt_str);
+      if (batchForm.order_usdt_str !== '' && Number.isFinite(ordU) && ordU >= 5) {
+        payload.order_usdt = Number(ordU.toFixed(2));
+      }
       const stepPct = Number(batchForm.grid_step_pct_str);
       if (batchForm.grid_step_pct_str !== '' && Number.isFinite(stepPct) && stepPct > 0) {
         payload.grid_step_pct = Number((stepPct / 100).toFixed(6));
@@ -1166,9 +1177,21 @@ export default function App() {
       if (batchForm.grid_take_profit_pct_str !== '' && Number.isFinite(tpPct) && tpPct > 0) {
         payload.grid_take_profit_pct = Number((tpPct / 100).toFixed(6));
       }
+      const slPct = Number(batchForm.grid_stop_loss_pct_str);
+      if (batchForm.grid_stop_loss_pct_str !== '' && Number.isFinite(slPct) && slPct >= 0.2) {
+        payload.grid_stop_loss_pct = Number((slPct / 100).toFixed(6));
+      }
       const trailMult = Number(batchForm.trend_trailing_mult_str);
       if (batchForm.trend_trailing_mult_str !== '' && Number.isFinite(trailMult) && trailMult >= 0.3) {
         payload.trend_trailing_mult = Number(trailMult.toFixed(3));
+      }
+      if (batchForm.use_post_only_tp_mode === 'on') {
+        payload.use_post_only_tp = true;
+      } else if (batchForm.use_post_only_tp_mode === 'off') {
+        payload.use_post_only_tp = false;
+      }
+      if (batchForm.sl_trigger_px_type_mode === 'mark' || batchForm.sl_trigger_px_type_mode === 'last') {
+        payload.sl_trigger_px_type = batchForm.sl_trigger_px_type_mode;
       }
     }
     setBatchLoading(true);
@@ -1677,6 +1700,34 @@ export default function App() {
                 Binance {liveStatus.binance_ws_connected ? '已连接' : '重连中'} · OKX{' '}
                 {liveStatus.okx_ws_connected ? '已连接' : '重连中'}
               </span>
+              {liveStatus.follower_auth_status === 'VERIFIED' && (
+                <>
+                  <span
+                    className={`px-2.5 sm:px-3 py-1 rounded-full text-[11px] font-bold whitespace-nowrap ${
+                      liveStatus.okx_pos_mode === 'long_short_mode'
+                        ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                        : 'bg-amber-500/15 text-amber-600 dark:text-amber-300'
+                    }`}
+                  >
+                    {liveStatus.okx_pos_mode === 'long_short_mode' ? 'OKX 双向持仓' : 'OKX 单向持仓'}
+                  </span>
+                  <span
+                    title="OKX 私有 WebSocket 订单/条件单实时推送通道（毫秒级感知 Maker 止盈与条件止损成交）"
+                    className={`px-2.5 sm:px-3 py-1 rounded-full text-[11px] font-bold whitespace-nowrap ${
+                      liveStatus.okx_private_ws_connected
+                        ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                        : 'bg-slate-500/15 text-dim'
+                    }`}
+                  >
+                    私有推单WS {liveStatus.okx_private_ws_connected ? '实时在线' : '轮询兜底'}
+                  </span>
+                  {Number(liveStatus.usdt_avail_usdt || 0) > 0 && (
+                    <span className="px-2.5 sm:px-3 py-1 rounded-full surface-subtle text-[11px] font-mono font-semibold text-main whitespace-nowrap">
+                      可用 {Number(liveStatus.usdt_avail_usdt).toFixed(2)}U
+                    </span>
+                  )}
+                </>
+              )}
               <span
                 onClick={() => setActiveTab('exchanges')}
                 className="cursor-pointer px-2.5 sm:px-3 py-1 rounded-full surface-subtle text-main font-medium hover:opacity-85 transition truncate max-w-full sm:max-w-[340px]"
@@ -2205,6 +2256,18 @@ export default function App() {
                                 </span>
                               )}
 
+                              {pos.maker_tp_live && (
+                                <span className="px-2 py-0.5 rounded-md font-sans text-[10px] font-semibold bg-emerald-500/12 text-emerald-600 dark:text-emerald-300 border border-emerald-500/25">
+                                  Maker挂单止盈
+                                </span>
+                              )}
+
+                              {pos.cond_sl_live && (
+                                <span className="px-2 py-0.5 rounded-md font-sans text-[10px] font-semibold bg-amber-500/12 text-amber-600 dark:text-amber-300 border border-amber-500/25">
+                                  OKX条件止损
+                                </span>
+                              )}
+
                               <span className="text-main">
                                 均价: {formatPositionPrice(pos.entry_price, pos.symbol)}
                               </span>
@@ -2399,11 +2462,11 @@ export default function App() {
                     <Sliders className="w-4 h-4 text-main shrink-0" strokeWidth={1.9} />
                     <h3 className="text-sm font-bold text-main">存量参数体检与一键批量更新</h3>
                     <span className="text-[11px] font-medium px-2 py-0.5 rounded-full surface-subtle text-sub">
-                      网格按真实 2×Taker 市价/IOC 费率核算
+                      支持真实 Maker 挂单止盈省 60% 平仓费 · 价格止损 × 杠杆 = 保证金亏损%
                     </span>
                   </div>
                   <p className="text-xs text-dim mt-1">
-                    一键检测存量合约步长过窄、止盈倒挂（TP &lt; 步长）、止盈未覆盖双边吃单费、精度或最小开仓额异常；批量更新不强平在途持仓，空仓重锚后自动生效。
+                    一键检测并批量设置存量合约的名义金额、步长、止盈、止损、顺势追踪倍率与 Maker 挂单止盈开关；批量更新不强平在途持仓，空仓重锚后自动生效。
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
@@ -2450,7 +2513,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-2.5 items-end">
+              <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2.5 items-end">
                 <div>
                   <label className="block text-[11px] font-semibold text-dim mb-1">作用范围</label>
                   <select
@@ -2463,6 +2526,19 @@ export default function App() {
                     <option value="TREND_GRID">仅顺势突破网格</option>
                     <option value="LONG_SHORT_GRID">仅传统震荡网格</option>
                   </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-dim mb-1">名义金额 (USDT)</label>
+                  <input
+                    type="number"
+                    step="5"
+                    min="5"
+                    max="500000"
+                    placeholder="留空不改 (如 20)"
+                    value={batchForm.order_usdt_str}
+                    onChange={(e) => setBatchForm((prev) => ({ ...prev, order_usdt_str: e.target.value }))}
+                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                  />
                 </div>
                 <div>
                   <label className="block text-[11px] font-semibold text-dim mb-1">目标步长 (%)</label>
@@ -2491,6 +2567,26 @@ export default function App() {
                   />
                 </div>
                 <div>
+                  <label className="block text-[11px] font-semibold text-dim mb-1">
+                    价格止损 (%)
+                    {batchForm.grid_stop_loss_pct_str !== '' && Number(batchForm.grid_stop_loss_pct_str) > 0 && (
+                      <span className="ml-1 text-amber-600 dark:text-amber-300 font-mono">
+                        5x≈{(Number(batchForm.grid_stop_loss_pct_str) * 5).toFixed(1)}%
+                      </span>
+                    )}
+                  </label>
+                  <input
+                    type="number"
+                    step="0.2"
+                    min="0.2"
+                    max="90"
+                    placeholder="留空不改 (如 3.0)"
+                    value={batchForm.grid_stop_loss_pct_str}
+                    onChange={(e) => setBatchForm((prev) => ({ ...prev, grid_stop_loss_pct_str: e.target.value }))}
+                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                  />
+                </div>
+                <div>
                   <label className="block text-[11px] font-semibold text-dim mb-1">顺势追踪倍率 (x)</label>
                   <input
                     type="number"
@@ -2503,16 +2599,43 @@ export default function App() {
                     className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
                   />
                 </div>
-                <label className="flex items-center gap-2 text-xs text-sub cursor-pointer py-2 px-1 select-none">
+                <div>
+                  <label className="block text-[11px] font-semibold text-dim mb-1">Maker挂单止盈</label>
+                  <select
+                    value={batchForm.use_post_only_tp_mode}
+                    onChange={(e) => setBatchForm((prev) => ({ ...prev, use_post_only_tp_mode: e.target.value }))}
+                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
+                  >
+                    <option value="keep">保持原状</option>
+                    <option value="on">一键开启 (省费)</option>
+                    <option value="off">关闭 (仅Taker)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-dim mb-1">条件止损触发价</label>
+                  <select
+                    value={batchForm.sl_trigger_px_type_mode}
+                    onChange={(e) => setBatchForm((prev) => ({ ...prev, sl_trigger_px_type_mode: e.target.value }))}
+                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
+                  >
+                    <option value="keep">保持原状</option>
+                    <option value="mark">标记价 Mark (抗插针推荐)</option>
+                    <option value="last">最新价 Last</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-4 pt-0.5">
+                <label className="flex items-center gap-2 text-xs text-sub cursor-pointer select-none">
                   <input
                     type="checkbox"
                     checked={batchForm.auto_fix_anomalies}
                     onChange={(e) => setBatchForm((prev) => ({ ...prev, auto_fix_anomalies: e.target.checked }))}
                     className="rounded accent-emerald-600"
                   />
-                  <span>自动修复倒挂/精度</span>
+                  <span>自动修复倒挂/精度/区间匹配</span>
                 </label>
-                <label className="flex items-center gap-2 text-xs text-sub cursor-pointer py-2 px-1 select-none">
+                <label className="flex items-center gap-2 text-xs text-sub cursor-pointer select-none">
                   <input
                     type="checkbox"
                     checked={batchForm.only_running}
@@ -2521,6 +2644,9 @@ export default function App() {
                   />
                   <span>仅作用于运行中合约</span>
                 </label>
+                <span className="text-[11px] text-dim">
+                  提示：价格止损 1.0% 在 5x 杠杆下对应保证金亏损 5.0%（传统 5 格网建议价格止损 ≥ 3.5%，或缩小格数至 3 格）
+                </span>
               </div>
 
               {batchReport && (
@@ -2550,8 +2676,11 @@ export default function App() {
                             : ''}
                         </span>
                       )}
+                      <span className="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-300 font-mono">
+                        Maker挂单双边 {Number(batchReport.maker_round_trip_fee_pct ?? 0.07).toFixed(3)}%
+                      </span>
                       <span className="px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-600 dark:text-sky-300 font-mono">
-                        2×Taker 费率 {Number(batchReport.grid_round_trip_fee_pct ?? 0.1).toFixed(3)}%
+                        2×Taker {Number(batchReport.grid_round_trip_fee_pct ?? 0.1).toFixed(3)}%
                       </span>
                     </div>
                     <button
@@ -2580,11 +2709,13 @@ export default function App() {
                               onClick={() => setSelectedSymbol(it.symbol)}
                               className="px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs cursor-pointer hover:bg-black/5 dark:hover:bg-white/5 transition"
                             >
-                              <div className="flex items-center gap-2 min-w-0">
+                              <div className="flex flex-wrap items-center gap-2 min-w-0">
                                 <span className="font-mono font-bold text-main">{it.symbol.replace('/USDT:USDT', '')}</span>
                                 <span className="font-mono text-[11px] text-dim">
-                                  步长 {(Number(it.grid_step_pct || 0) * 100).toFixed(2)}% · 止盈{' '}
-                                  {(Number(it.grid_take_profit_pct || 0) * 100).toFixed(2)}%
+                                  {Number(it.order_usdt || 0).toFixed(0)}U · 步长 {(Number(it.grid_step_pct || 0) * 100).toFixed(2)}% · 止盈{' '}
+                                  {(Number(it.grid_take_profit_pct || 0) * 100).toFixed(2)}% · 止损{' '}
+                                  {(Number(it.grid_stop_loss_pct || 0) * 100).toFixed(1)}%
+                                  {it.sl_roe_pct ? `(${it.leverage || 5}x≈${it.sl_roe_pct}%)` : ''}
                                 </span>
                                 {it.has_open_position && (
                                   <span className="px-1.5 py-0.5 rounded text-[10px] bg-sky-500/15 text-sky-600 dark:text-sky-300">
@@ -2911,6 +3042,10 @@ export default function App() {
                                 defaultRatio={0.0065}
                                 onChangeRatio={(v) => updateCurrentStrategyField({ grid_take_profit_pct: v })}
                               />
+                              <div className="text-[10px] text-dim mt-1 leading-snug">
+                                标的价格涨幅 · {currentStrategy.leverage ?? 5}x 杠杆≈保证金收益{' '}
+                                {((currentStrategy.grid_take_profit_pct ?? 0.0065) * (currentStrategy.leverage ?? 5) * 100).toFixed(1)}%
+                              </div>
                             </div>
                           )}
 
@@ -2925,13 +3060,30 @@ export default function App() {
                           </div>
 
                           <div>
-                            <label className="font-bold text-main block mb-2">破网硬止损上限 (%)</label>
+                            <label className="font-bold text-main block mb-2">破网硬止损上限 (% · 标的价格)</label>
                             <PercentNumberInput
-                              step="0.5"
+                              step="0.2"
                               valueRatio={currentStrategy.grid_stop_loss_pct}
                               defaultRatio={0.08}
                               onChangeRatio={(v) => updateCurrentStrategyField({ grid_stop_loss_pct: v })}
                             />
+                            <div className="text-[10px] text-amber-600 dark:text-amber-300 mt-1 leading-snug">
+                              当前 {currentStrategy.leverage ?? 5}x 杠杆 → 保证金止损 ≈{' '}
+                              {((currentStrategy.grid_stop_loss_pct ?? 0.08) * (currentStrategy.leverage ?? 5) * 100).toFixed(1)}%
+                              （如欲控制保证金止损 5%，此处设 {(5 / Math.max(1, currentStrategy.leverage ?? 5)).toFixed(2)}%）
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="font-bold text-main block mb-2">OKX 条件止损触发价类型</label>
+                            <select
+                              value={currentStrategy.sl_trigger_px_type || 'mark'}
+                              onChange={(e) => updateCurrentStrategyField({ sl_trigger_px_type: e.target.value })}
+                              className="w-full rounded-xl surface-subtle px-3 py-2.5 text-xs font-semibold text-main outline-none"
+                            >
+                              <option value="mark">标记价 Mark（推荐 · 防单所插针误扫止损）</option>
+                              <option value="last">最新成交价 Last（更贴近盘口瞬时价）</option>
+                            </select>
                           </div>
 
                           <div>
@@ -3085,7 +3237,7 @@ export default function App() {
                           </div>
                         )}
 
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2">
                           {[
                             {
                               field: 'is_running',
@@ -3096,6 +3248,11 @@ export default function App() {
                               field: 'grid_recenter_enabled',
                               title: '空仓超出区间自动重锚网格中枢',
                               desc: '无持仓突破 ±区间或 VCP 波动率状态切换时自动重置网格',
+                            },
+                            {
+                              field: 'use_post_only_tp',
+                              title: '真实 Maker Post-Only 挂单止盈 + OKX 条件止损',
+                              desc: '成交即在交易所挂出被动限价止盈单（省 60% 平仓费）与条件止损单防断网插针',
                             },
                           ].map((opt) => (
                             <label
@@ -3148,6 +3305,31 @@ export default function App() {
                                       {gSnap.bbw_timeframe || currentStrategy.bbw_timeframe || '15m'} BBW{' '}
                                       {Number(gSnap.bbw_pct).toFixed(2)}% · 历史分位 {Number(gSnap.bbw_percentile).toFixed(1)}%
                                       {gSnap.vcp_contraction ? ' · VCP收窄' : ''}
+                                    </span>
+                                  )}
+                                  {gSnap.trend_bias && (
+                                    <span
+                                      className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                        gSnap.trend_bias === 'BULL'
+                                          ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                                          : gSnap.trend_bias === 'BEAR'
+                                          ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
+                                          : 'bg-slate-500/15 text-slate-600 dark:text-slate-300'
+                                      }`}
+                                    >
+                                      {gSnap.trend_bias === 'BULL'
+                                        ? '多头趋势 · 顺多禁逆空'
+                                        : gSnap.trend_bias === 'BEAR'
+                                        ? '空头趋势 · 顺空禁逆多'
+                                        : '震荡区间 · 多空双开'}
+                                      {gSnap.ema_gap_pct !== null && gSnap.ema_gap_pct !== undefined
+                                        ? ` (EMA ${Number(gSnap.ema_gap_pct) >= 0 ? '+' : ''}${Number(gSnap.ema_gap_pct).toFixed(2)}%)`
+                                        : ''}
+                                      {gSnap.breakout_expansion === 'UP_BREAKOUT'
+                                        ? ' · 放量上破'
+                                        : gSnap.breakout_expansion === 'DOWN_BREAKOUT'
+                                        ? ' · 放量破位'
+                                        : ''}
                                     </span>
                                   )}
                                 </div>
@@ -3214,6 +3396,20 @@ export default function App() {
                                     ) : (
                                       <div className="text-[10px] text-dim">
                                         止盈 {Number(lv.tp_price).toFixed(gridPrec)}
+                                      </div>
+                                    )}
+                                    {(lv.maker_tp_live || lv.cond_sl_live) && (
+                                      <div className="flex flex-wrap gap-1 mt-1 font-sans">
+                                        {lv.maker_tp_live && (
+                                          <span className="px-1.5 py-0.2 rounded text-[9px] bg-emerald-500/20 text-emerald-700 dark:text-emerald-300">
+                                            Maker止盈
+                                          </span>
+                                        )}
+                                        {lv.cond_sl_live && (
+                                          <span className="px-1.5 py-0.2 rounded text-[9px] bg-amber-500/20 text-amber-700 dark:text-amber-300">
+                                            条件止损
+                                          </span>
+                                        )}
                                       </div>
                                     )}
                                   </div>
@@ -3296,6 +3492,18 @@ export default function App() {
                               onChange={(e) => updateCurrentStrategyField({ max_hold_ms: Number(e.target.value) })}
                               className="input-field font-mono"
                             />
+                          </div>
+
+                          <div>
+                            <label className="font-bold text-main block mb-2">OKX 条件止损触发价类型</label>
+                            <select
+                              value={currentStrategy.sl_trigger_px_type || 'mark'}
+                              onChange={(e) => updateCurrentStrategyField({ sl_trigger_px_type: e.target.value })}
+                              className="w-full rounded-xl surface-subtle px-3 py-2.5 text-xs font-semibold text-main outline-none"
+                            >
+                              <option value="mark">标记价 Mark（推荐 · 防单所插针误扫止损）</option>
+                              <option value="last">最新成交价 Last（更贴近盘口瞬时价）</option>
+                            </select>
                           </div>
 
                           <div>

@@ -102,8 +102,9 @@ class SymbolMathState:
         self.last_basis_update_mono: float = 0.0
         self.basis_frozen: bool = False
 
-        # Rolling realized volatility of window jumps (for Section 3.1 adaptive Z-score)
+        # Rolling realized volatility of window jumps (time-decayed EMA, tau=15s)
         self.jump_var_ema: float = (0.0012) ** 2  # Initial sigma ~ 0.12%
+        self._last_jump_var_mono: float = 0.0
 
         # Rolling OLS Beta & Lead-Lag Information Share estimator (Fix #11 & Section 3.1)
         self.cov_lf_ema: float = 0.0000088
@@ -132,6 +133,7 @@ class SymbolMathState:
         self.basis_frozen = False
         self._pending_leader_jump = None
         self.jump_var_ema = (0.0012) ** 2
+        self._last_jump_var_mono = 0.0
         self.cov_lf_ema = 0.0000088
         self.var_l_ema = 0.0000100
         self.estimated_beta = 0.88
@@ -158,6 +160,8 @@ class SymbolMathState:
         if now_mono is None:
             now_mono = mono_ms()
         now_wall = wall_ms()
+        if not (math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask >= bid):
+            return self.latest_follower or TickSample(now_mono, now_wall, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         mid = (bid + ask) * 0.5
         micro = self.compute_microprice(bid, ask, bid_qty, ask_qty)
         sample = TickSample(now_mono, now_wall, bid, ask, bid_qty, ask_qty, mid, micro)
@@ -175,16 +179,16 @@ class SymbolMathState:
         # Check pending Leader jump to update rolling Beta convergence estimator (Fix #11)
         if self._pending_leader_jump is not None:
             sig_ts, l_ret, f_mid_0 = self._pending_leader_jump
-            if now_mono - sig_ts >= 350.0:  # Measure Follower convergence 350ms after Leader jump
+            age_ms = now_mono - sig_ts
+            if age_ms > 2500.0:
+                # Expired jump window (book paused too long) -> discard rather than corrupt beta
+                self._pending_leader_jump = None
+            elif age_ms >= 350.0:  # Measure Follower convergence 350ms after Leader jump
                 if f_mid_0 > 0 and abs(l_ret) > 1e-4:
                     f_ret = (mid - f_mid_0) / f_mid_0
-                    if l_ret * f_ret > 0:
-                        self.cov_lf_ema = 0.96 * self.cov_lf_ema + 0.04 * (l_ret * f_ret)
-                        self.var_l_ema = 0.96 * self.var_l_ema + 0.04 * (l_ret * l_ret)
-                    else:
-                        # Include non-converging samples in variance denominator so beta is not artificially inflated
-                        self.cov_lf_ema = 0.96 * self.cov_lf_ema
-                        self.var_l_ema = 0.96 * self.var_l_ema + 0.04 * (l_ret * l_ret)
+                    # Include both positive and adverse/non-converging covariance so beta is unbiased
+                    self.cov_lf_ema = 0.96 * self.cov_lf_ema + 0.04 * (l_ret * f_ret)
+                    self.var_l_ema = 0.96 * self.var_l_ema + 0.04 * (l_ret * l_ret)
                     if self.var_l_ema > 1e-10:
                         raw_beta = self.cov_lf_ema / self.var_l_ema
                         self.estimated_beta = max(0.50, min(1.05, raw_beta))
@@ -210,6 +214,8 @@ class SymbolMathState:
         if now_mono is None:
             now_mono = mono_ms()
         now_wall = wall_ms()
+        if not (math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask >= bid):
+            return (self.latest_leader or TickSample(now_mono, now_wall, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)), 0.0
         mid = (bid + ask) * 0.5
         micro = self.compute_microprice(bid, ask, bid_qty, ask_qty)
         sample = TickSample(now_mono, now_wall, bid, ask, bid_qty, ask_qty, mid, micro)
@@ -229,32 +235,42 @@ class SymbolMathState:
         if past_leader and past_leader.mid > 0:
             raw_jump = (mid - past_leader.mid) / past_leader.mid
             if abs(raw_jump) > 0.12:
-                # Guard against synthetic->real price scale transition (>12% in <500ms)
+                # Guard against synthetic->real price scale transition (>12% in <500ms):
+                # return early so this same dislocated tick does NOT poison log_basis_ema!
                 self.leader_ts = [now_mono]
                 self.leader_ticks = [sample]
+                self.follower_ts.clear()
+                self.follower_ticks.clear()
                 self.log_basis_ema = None
+                self._pending_leader_jump = None
                 self.last_instant_jump = 0.0
                 self.max_jump_seen = 0.0
+                return sample, 0.0
             else:
                 instant_jump = raw_jump
                 self.last_instant_jump = instant_jump
                 if abs(instant_jump) > self.max_jump_seen:
                     self.max_jump_seen = abs(instant_jump)
-                # Update rolling jump variance (clamped so extreme outliers don't blow up sigma)
+                # Time-decayed rolling jump variance (tau = 15s, invariant to tick arrival frequency)
                 clamped_jump = max(-0.015, min(0.015, instant_jump))
-                self.jump_var_ema = 0.995 * self.jump_var_ema + 0.005 * (clamped_jump ** 2)
+                dt_var = max(1.0, min(5000.0, now_mono - self._last_jump_var_mono)) if self._last_jump_var_mono > 0 else 50.0
+                alpha_var = 1.0 - math.exp(-dt_var / 15000.0)
+                self.jump_var_ema = (1.0 - alpha_var) * self.jump_var_ema + alpha_var * (clamped_jump ** 2)
+                self._last_jump_var_mono = now_mono
 
         # Update time-decayed proportional log-basis (Fixes #5, #6, #7)
         f_tick = self.latest_follower
+        f_fresh = bool(f_tick and f_tick.mid > 0 and (now_mono - f_tick.mono_ts) <= cfg.max_book_staleness_ms)
         if f_tick and f_tick.mid > 0 and mid > 0:
-            # Fix #7: Freeze basis if position is locked OR |jump| >= 0.5 * min_jump_pct
-            should_freeze = is_locked or (abs(instant_jump) >= 0.5 * cfg.min_jump_pct)
+            # Fix #7: Freeze basis if position is locked OR |jump| >= 0.5 * min_jump_pct OR Follower book is stale!
+            should_freeze = is_locked or (abs(instant_jump) >= 0.5 * cfg.min_jump_pct) or (not f_fresh)
             self.basis_frozen = should_freeze
             current_log_basis = math.log(mid / f_tick.mid)
 
             if self.log_basis_ema is None:
-                self.log_basis_ema = current_log_basis
-                self.last_basis_update_mono = now_mono
+                if f_fresh:
+                    self.log_basis_ema = current_log_basis
+                    self.last_basis_update_mono = now_mono
             elif not should_freeze:
                 dt_ms = max(0.0, now_mono - self.last_basis_update_mono)
                 alpha = 1.0 - math.exp(-dt_ms / self.tau_ms)
@@ -350,10 +366,12 @@ class SymbolMathState:
 
         if f_curr.bid <= 0 or f_curr.ask <= 0 or f_curr.ask < f_curr.bid:
             return None
+        if l_curr.bid <= 0 or l_curr.ask <= 0 or l_curr.ask < l_curr.bid:
+            return None
 
         # Fix #9: Exact bisect window sampling for Leader and Follower
         l_past = self.get_tick_at_or_before(self.leader_ts, self.leader_ticks, now_mono - cfg.window_ms)
-        if not l_past or l_past.mid <= 0:
+        if not l_past or l_past.mid <= 0 or l_past.microprice <= 0:
             return None
 
         f_past = self.get_tick_at_or_before(self.follower_ts, self.follower_ticks, now_mono - cfg.window_ms)
@@ -398,11 +416,11 @@ class SymbolMathState:
             if follower_change_pct >= cfg.lag_confirm_max_pct:
                 return None
 
-            # Fix #12: Microprice and active trade flow confirmation
+            # Fix #12: Microprice and active trade flow confirmation (reject zero-volume thin-book quote flicker!)
             if cfg.require_volume_confirm:
                 if micro_jump_pct < cfg.min_jump_pct * 0.65:
                     return None
-                if (buy_vol_usdt + sell_vol_usdt) > 0 and buy_vol_usdt < sell_vol_usdt:
+                if (buy_vol_usdt + sell_vol_usdt) <= 0 or buy_vol_usdt < sell_vol_usdt:
                     return None
 
             # Calibrated Leader bid mapped to Follower price space, scaled by partial convergence beta
@@ -456,11 +474,11 @@ class SymbolMathState:
             if (-follower_change_pct) >= cfg.lag_confirm_max_pct:
                 return None
 
-            # Fix #12: Microprice and active trade flow confirmation
+            # Fix #12: Microprice and active trade flow confirmation (reject zero-volume thin-book quote flicker!)
             if cfg.require_volume_confirm:
                 if (-micro_jump_pct) < cfg.min_jump_pct * 0.65:
                     return None
-                if (buy_vol_usdt + sell_vol_usdt) > 0 and sell_vol_usdt < buy_vol_usdt:
+                if (buy_vol_usdt + sell_vol_usdt) <= 0 or sell_vol_usdt < buy_vol_usdt:
                     return None
 
             full_calibrated_price = l_curr.ask * basis_factor
@@ -513,8 +531,13 @@ class SymbolMathState:
         if price <= 0:
             return 0.0
         target_raw_qty = cfg.order_usdt / (price * cfg.contract_size)
-        depth_cap_qty = top_book_qty * 0.85 if top_book_qty > 0 else target_raw_qty
-        raw_qty = min(target_raw_qty, max(cfg.min_qty, depth_cap_qty))
+        if top_book_qty > 0:
+            depth_cap_qty = top_book_qty * 0.85
+            if depth_cap_qty < cfg.min_qty:
+                return 0.0
+            raw_qty = min(target_raw_qty, depth_cap_qty)
+        else:
+            raw_qty = target_raw_qty
         if cfg.qty_precision == 0:
             return float(int(raw_qty))
         return round(raw_qty, cfg.qty_precision)

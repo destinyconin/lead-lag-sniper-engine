@@ -32,8 +32,8 @@ class ExchangeConfigModel(BaseModel):
     api_secret: str = ""        # Plaintext only on input; encrypted in DB, masked on GET
     passphrase: str = ""        # Plaintext only on input; encrypted in DB, masked on GET
     vip_level: str = "VIP 0"
-    taker_fee: float = Field(default=0.0005, description="Taker fee rate (e.g., 0.0005 = 0.05%)")
-    maker_fee: float = Field(default=0.0002, description="Maker fee rate (e.g., 0.0002 = 0.02%)")
+    taker_fee: float = Field(default=0.0005, ge=0.0, le=0.05, allow_inf_nan=False, description="Taker fee rate (e.g., 0.0005 = 0.05%)")
+    maker_fee: float = Field(default=0.0002, ge=-0.01, le=0.05, allow_inf_nan=False, description="Maker fee rate (e.g., 0.0002 = 0.02%)")
     is_active: bool = True
 
 
@@ -51,27 +51,30 @@ class SymbolStrategy(BaseModel):
         description="Per-symbol running strategy: LEAD_LAG, LONG_SHORT_GRID, TREND_GRID, or ADAPTIVE_GRID",
     )
     direction: Literal["BOTH", "LONG_ONLY", "SHORT_ONLY"] = "BOTH"
-    order_usdt: float = Field(default=300.0, gt=0, description="Notional order size in USDT")
+    order_usdt: float = Field(default=300.0, gt=0, le=1_000_000.0, allow_inf_nan=False, description="Notional order size in USDT")
     leverage: int = Field(default=5, ge=1, le=50, description="Leverage multiplier")
     window_ms: int = Field(default=150, ge=20, le=5000, description="Leader pulse detection window (ms)")
-    min_jump_pct: float = Field(default=0.0060, gt=0, description="Minimum Leader jump ratio (0.0060 = 0.60%)")
-    adaptive_z_score: float = Field(default=3.0, ge=0.0, description="Minimum realized volatility Z-score")
-    lag_confirm_max_pct: float = Field(default=0.0010, ge=0, description="Max Follower move in window to confirm lag (0.10%)")
-    take_profit_pct: float = Field(default=0.0025, gt=0, description="Target net profit ratio after fees (0.25%)")
-    stop_loss_pct: float = Field(default=0.0035, gt=0, description="Hard stop-loss ratio (0.35%)")
-    reversal_stop_ratio: float = Field(default=0.50, gt=0, le=1.0, description="Leader retracement ratio to trigger reversal stop (50%)")
+    min_jump_pct: float = Field(default=0.0060, gt=0, le=0.50, allow_inf_nan=False, description="Minimum Leader jump ratio (0.0060 = 0.60%)")
+    adaptive_z_score: float = Field(default=3.0, ge=0.0, le=50.0, allow_inf_nan=False, description="Minimum realized volatility Z-score")
+    lag_confirm_max_pct: float = Field(default=0.0010, ge=0, le=0.50, allow_inf_nan=False, description="Max Follower move in window to confirm lag (0.10%)")
+    take_profit_pct: float = Field(default=0.0025, gt=0, le=0.50, allow_inf_nan=False, description="Target net profit ratio after fees (0.25%)")
+    stop_loss_pct: float = Field(default=0.0035, gt=0, le=0.90, allow_inf_nan=False, description="Hard stop-loss ratio (0.35%)")
+    reversal_stop_ratio: float = Field(default=0.50, gt=0, le=1.0, allow_inf_nan=False, description="Leader retracement ratio to trigger reversal stop (50%)")
     trailing_stop_enabled: bool = Field(default=True, description="Enable trailing profit lock once TP threshold is reached")
-    trailing_retracement_pct: float = Field(default=0.0008, gt=0, description="Retracement from peak net profit to trigger trailing exit (0.08%)")
+    trailing_retracement_pct: float = Field(default=0.0008, gt=0, le=0.50, allow_inf_nan=False, description="Retracement from peak net profit to trigger trailing exit (0.08%)")
     max_hold_ms: int = Field(default=1500, ge=100, le=30000, description="Maximum holding duration before forced timeout exit (ms)")
-    slippage_pct: float = Field(default=0.0005, ge=0, description="IOC max tolerated slippage cap (0.05%)")
-    beta_coeff: float = Field(default=0.88, gt=0.1, le=1.5, description="Expected Follower-to-Leader convergence coefficient beta")
+    slippage_pct: float = Field(default=0.0005, ge=0, le=0.10, allow_inf_nan=False, description="IOC max tolerated slippage cap (0.05%)")
+    beta_coeff: float = Field(default=0.88, gt=0.1, le=1.5, allow_inf_nan=False, description="Expected Follower-to-Leader convergence coefficient beta")
     auto_beta_enabled: bool = Field(default=True, description="Dynamically update beta from rolling returns regression")
     require_volume_confirm: bool = Field(default=True, description="Require microprice & active trade flow confirmation")
     use_post_only_tp: bool = Field(default=True, description="Place Maker Post-Only limit order for Take Profit to save fees")
+    sl_trigger_px_type: Literal["mark", "last"] = Field(
+        default="mark", description="OKX conditional SL trigger price type: mark (anti-wick, default) or last"
+    )
     max_signal_age_ms: int = Field(default=80, ge=5, le=1000, description="Maximum allowed signal age before aborting order")
     max_book_staleness_ms: int = Field(default=600, ge=50, le=5000, description="Maximum Follower book age to prevent stale book false triggers")
-    contract_size: float = Field(default=1.0, gt=0, description="Contract multiplier / lot value")
-    min_qty: float = Field(default=0.1, gt=0, description="Minimum order quantity")
+    contract_size: float = Field(default=1.0, gt=0, le=1e12, allow_inf_nan=False, description="Contract multiplier / lot value")
+    min_qty: float = Field(default=0.1, gt=0, le=1e12, allow_inf_nan=False, description="Minimum order quantity")
     qty_precision: int = Field(default=2, ge=0, le=12, description="Quantity decimal places")
     price_precision: int = Field(default=4, ge=0, le=12, description="Price decimal places")
     # Long-Short Grid strategy parameters
@@ -128,16 +131,20 @@ class BatchSymbolUpdateRequest(BaseModel):
     action: Literal["validate", "apply"] = "validate"
     strategy_filter: Literal["ALL_GRID", "ADAPTIVE_GRID", "TREND_GRID", "LONG_SHORT_GRID", "ALL"] = "ALL_GRID"
     only_running: bool = False
+    order_usdt: Optional[float] = Field(default=None, ge=5.0, le=500_000.0, allow_inf_nan=False)
     grid_step_pct: Optional[float] = Field(default=None, ge=0.0005, le=0.20, allow_inf_nan=False)
     grid_take_profit_pct: Optional[float] = Field(default=None, ge=0.0005, le=0.25, allow_inf_nan=False)
+    grid_stop_loss_pct: Optional[float] = Field(default=None, ge=0.002, le=0.90, allow_inf_nan=False)
     trend_trailing_mult: Optional[float] = Field(default=None, ge=0.3, le=10.0, allow_inf_nan=False)
+    use_post_only_tp: Optional[bool] = None
+    sl_trigger_px_type: Optional[Literal["mark", "last"]] = None
     auto_fix_anomalies: bool = True
 
 
 class PulseInjectionRequest(BaseModel):
     symbol: str = "XRP/USDT:USDT"
     side: Literal["LONG", "SHORT"] = "LONG"
-    jump_pct: float = Field(default=0.0085, description="Simulated Leader jump magnitude, e.g., 0.0085 = +0.85%")
+    jump_pct: float = Field(default=0.0085, gt=0, le=0.25, allow_inf_nan=False, description="Simulated Leader jump magnitude, e.g., 0.0085 = +0.85%")
     follower_scenario: Literal["CONVERGE_TP", "REVERSAL_SL", "HARD_SL", "TIMEOUT", "MM_WITHDRAW_MISS"] = "CONVERGE_TP"
 
 
@@ -192,7 +199,7 @@ class AdminUpdateUserRequest(BaseModel):
 
 class AdminGrantVipRequest(BaseModel):
     user_id: int
-    add_days: int = Field(..., description="Days to add (positive to extend, 0 or negative to revoke)")
+    add_days: int = Field(..., ge=-3650, le=3650, description="Days to add (positive to extend, 0 or negative to revoke)")
     vip_tier: str = "专业版会员"
     revoke: bool = False
 
@@ -201,9 +208,9 @@ class AdminMembershipPlanModel(BaseModel):
     id: Optional[int] = None
     plan_code: str
     name: str
-    duration_days: int = Field(..., gt=0)
-    price_usdt: float = Field(..., ge=0)
-    original_price_usdt: float = Field(..., ge=0)
+    duration_days: int = Field(..., gt=0, le=3650)
+    price_usdt: float = Field(..., ge=0, le=1_000_000.0, allow_inf_nan=False)
+    original_price_usdt: float = Field(..., ge=0, le=1_000_000.0, allow_inf_nan=False)
     badge_text: str = ""
     features: list[str] = []
     is_enabled: bool = True
@@ -212,7 +219,7 @@ class AdminMembershipPlanModel(BaseModel):
 
 class AdminGenerateVipCodesRequest(BaseModel):
     plan_name: str = "季度旗舰版会员"
-    duration_days: int = Field(default=90, gt=0)
+    duration_days: int = Field(default=90, gt=0, le=3650)
     count: int = Field(default=5, ge=1, le=50)
 
 
