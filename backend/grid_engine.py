@@ -176,10 +176,15 @@ class LongShortGridTracker:
                 f"{tf} BBW={bbw_pct:.2f}%（分位 {pct_rank:.1f}% · {bias_cn}）→ 传统均值回归网格",
             )
         else:
-            if pct_rank >= release_thresh and breakout_exp == "NONE" and trend_bias == "RANGE":
+            if pct_rank >= release_thresh and breakout_exp == "NONE":
+                bias_cn = (
+                    "多头(停逆势空)"
+                    if trend_bias == "BULL"
+                    else ("空头(停逆势多)" if trend_bias == "BEAR" else "震荡双向")
+                )
                 return (
                     "MEAN_REVERSION",
-                    f"{tf} BBW={bbw_pct:.2f}% 扩张恢复至 {pct_rank:.1f}% 且均线回归震荡 → 切回传统震荡网格",
+                    f"{tf} BBW={bbw_pct:.2f}% 扩张恢复至 {pct_rank:.1f}% 且突破结束 → 切回传统震荡网格（EMA={bias_cn}）",
                 )
             if breakout_exp in ("UP_BREAKOUT", "DOWN_BREAKOUT"):
                 return (
@@ -231,8 +236,10 @@ class LongShortGridTracker:
             dz_ratio = dz_mult * step
             bb_upper = float(info.get("bb_upper") or 0.0) if (cfg.trend_use_bb_breakout and info) else 0.0
             bb_lower = float(info.get("bb_lower") or 0.0) if (cfg.trend_use_bb_breakout and info) else 0.0
-            # Cap ONLY L1/S1 distance from center; ALWAYS place all `count` pyramid legs beyond L1/S1 (no clipping L2..Ln!)
-            max_first_span = max(rng, dz_ratio * 1.5, step * 2.0)
+            # Cap ONLY L1/S1 distance from center (prevent wide historical BB from pushing L1/S1 >2.2% away);
+            # ALWAYS place all `count` pyramid legs beyond L1/S1 (no clipping L2..Ln!)
+            bb_cap = max(dz_ratio * 1.6, 0.022)
+            max_first_span = max(dz_ratio * 1.5, min(rng, bb_cap), step * 2.0)
 
             if cfg.grid_side_mode in ("LONG_SHORT", "LONG_ONLY"):
                 base_l1 = self.center_price * (1.0 + dz_ratio)
@@ -447,7 +454,8 @@ class LongShortGridTracker:
                 prev_mode = self.active_grid_mode
                 self.active_grid_mode = target_mode
                 bb_only_update = (not mode_changed) and (not user_changed)
-                if current_mid > 0 and (self.center_price <= 0 or mode_changed or bb_only_update):
+                # NEVER snap center_price to current_mid on routine BB refreshes — otherwise L1/S1 runs away from price!
+                if current_mid > 0 and (self.center_price <= 0 or mode_changed):
                     self.center_price = current_mid
                 if self.center_price > 0:
                     self._build_levels(cfg, bbw_info=valid_bbw, preserve_cooldowns=bb_only_update)
@@ -1325,7 +1333,7 @@ class LongShortGridTracker:
             "ema_fast": bbw.get("ema_fast"),
             "ema_slow": bbw.get("ema_slow"),
             "ema_gap_pct": bbw.get("ema_gap_pct"),
-            "trend_bias": bbw.get("trend_bias", "RANGE"),
+            "trend_bias": self._effective_trend_bias if self.last_bbw_info else bbw.get("trend_bias", "RANGE"),
             "breakout_expansion": bbw.get("breakout_expansion", "NONE"),
             "vcp_contraction": bool(bbw.get("vcp_contraction", False)),
             "open_long_count": open_long,

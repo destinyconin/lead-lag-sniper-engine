@@ -3134,6 +3134,76 @@ def test_audit_p0_engine_recovered_ll_vanished_slot_settlement_and_math_models()
     asyncio.run(run_engine_audit())
 
 
+def test_audit_trend_anchor_stability_vcp_release_and_bb_cap():
+    """
+    Verifies the 3 live trigger-starvation fixes:
+    1) Routine BB refreshes (bb_only_update) NEVER chase center_price to current_mid so L1/S1 stay reachable.
+    2) ADAPTIVE_GRID exits TREND_BREAKOUT back to MEAN_REVERSION once bbw_percentile >= release_thresh and
+       breakout_expansion == 'NONE' even if lagging EMA still reports BEAR (where MR EMA filter still blocks LONG).
+    3) Wide historical Bollinger Bands are capped at max(1.6*dz, 2.2%) so L1/S1 never drift 3%-4% away.
+    """
+    from backend.grid_engine import LongShortGridTracker
+
+    cfg = SymbolStrategy(
+        symbol="ARB/USDT:USDT",
+        strategy_type="ADAPTIVE_GRID",
+        grid_side_mode="LONG_SHORT",
+        grid_levels=5,
+        grid_step_pct=0.006,
+        grid_take_profit_pct=0.0065,
+        grid_range_pct=0.05,
+        grid_stop_loss_pct=0.06,
+        order_usdt=15.0,
+        leverage=5,
+        price_precision=4,
+        qty_precision=1,
+        trend_dead_zone_mult=2.0,
+        trend_trailing_mult=2.2,
+        trend_use_bb_breakout=True,
+        bbw_timeframe="15m",
+        bbw_squeeze_percentile=20.0,
+    )
+    trk = LongShortGridTracker("ARB/USDT:USDT")
+
+    # 1) Enter TREND_BREAKOUT on squeeze with wide historical BB -> L1/S1 capped at <= 2.2% (NOT 4%!)
+    sq_bb = {
+        "timeframe": "15m", "bbw_pct": 1.1, "bbw_percentile": 12.0,
+        "bb_upper": 1.045, "bb_middle": 1.000, "bb_lower": 0.955,
+        "ema_gap_z": -0.8, "trend_bias": "BEAR", "breakout_expansion": "NONE",
+    }
+    trk.sync_config(cfg, current_mid=1.0000, bbw_info=sq_bb)
+    assert trk.active_grid_mode == "TREND_BREAKOUT"
+    assert trk.center_price == 1.0000
+    assert trk.levels["L1"]["trigger_price"] == 1.0220  # Capped at +2.2%, not +4.5%!
+    assert trk.levels["S1"]["trigger_price"] == 0.9780  # Capped at -2.2%, not -4.5%!
+    assert trk.get_snapshot()["trend_bias"] == "BEAR"
+
+    # 2) Price slowly declines to 0.9850 and BB ticks slightly -> bb_only_update MUST keep center_price at 1.0000!
+    sq_bb2 = {**sq_bb, "bb_lower": 0.954, "bb_upper": 1.044}
+    trk.sync_config(cfg, current_mid=0.9850, bbw_info=sq_bb2)
+    assert trk.center_price == 1.0000  # Anchor held firm! Did NOT run away to 0.9850!
+    assert trk.levels["S1"]["trigger_price"] == 0.9780
+
+    # 3) BBW expands to 75% (>= 35%) with breakout_expansion='NONE' while lagging EMA is still BEAR (-0.45z):
+    #    MUST switch back to MEAN_REVERSION AND keep get_snapshot()['trend_bias'] == 'BEAR'!
+    exp_bear_bb = {
+        "timeframe": "15m", "bbw_pct": 3.5, "bbw_percentile": 75.0,
+        "bb_upper": 1.020, "bb_middle": 1.000, "bb_lower": 0.980,
+        "ema_gap_z": -0.45, "trend_bias": "RANGE", "breakout_expansion": "NONE",
+    }
+    trk.sync_config(cfg, current_mid=0.9850, bbw_info=exp_bear_bb)
+    assert trk.active_grid_mode == "MEAN_REVERSION"
+    assert trk.get_snapshot()["trend_bias"] == "BEAR"
+    # In MEAN_REVERSION with BEAR bias: S1 sits at +0.60% (not +1.2%~3.9%) and triggers on bounce while LONG dips stay blocked!
+    s1_px = trk.levels["S1"]["trigger_price"]
+    assert abs((s1_px - 0.9850) / 0.9850 - 0.006) < 0.0005
+    en_dip, _ = trk.evaluate_tick(0.9780, 0.9785, 0.9782, cfg, is_net_mode=False, bbw_info=exp_bear_bb)
+    assert en_dip == []  # Falling-knife LONG still safely paused by BEAR bias!
+    en_bounce, _ = trk.evaluate_tick(s1_px + 0.0002, s1_px + 0.0004, s1_px + 0.0003, cfg, is_net_mode=False, bbw_info=exp_bear_bb)
+    assert [e["slot_id"] for e in en_bounce] == ["S1"]
+
+
+
 
 
 
