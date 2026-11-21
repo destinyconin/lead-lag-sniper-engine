@@ -1850,6 +1850,14 @@ class BidirectionalSniperEngine:
                         )
                         changed = True
                     if (
+                        req.trend_dead_zone_mult is not None
+                        and new_cfg.strategy_type in ("TREND_GRID", "ADAPTIVE_GRID")
+                        and abs(new_cfg.trend_dead_zone_mult - req.trend_dead_zone_mult) > 1e-6
+                    ):
+                        new_cfg.trend_dead_zone_mult = round(float(req.trend_dead_zone_mult), 3)
+                        fixes.append(f"死区倍率→{new_cfg.trend_dead_zone_mult:g}x")
+                        changed = True
+                    if (
                         req.trend_trailing_mult is not None
                         and new_cfg.strategy_type in ("TREND_GRID", "ADAPTIVE_GRID")
                         and abs(new_cfg.trend_trailing_mult - req.trend_trailing_mult) > 1e-6
@@ -2321,13 +2329,23 @@ class BidirectionalSniperEngine:
         regime_msg = tracker.consume_regime_log()
         if regime_msg:
             self.append_log("INFO", sym, regime_msg, mode=cur_mode)
-        # Keep live trailing stop synchronized on active_grid_positions immediately after evaluate_tick
+        # Keep live trailing stop & solo breakeven SL step-ups synchronized on active_grid_positions immediately after evaluate_tick
         if tracker.active_grid_mode == "TREND_BREAKOUT":
+            amend_slots: List[str] = []
+            for lv_chk in tracker.levels.values():
+                if lv_chk.get("status") == "OPEN" and lv_chk.pop("sl_needs_amend", False):
+                    amend_slots.append(str(lv_chk["slot_id"]))
             for gk, gpos in list(self.active_grid_positions.items()):
                 if gpos.get("symbol") == sym:
+                    lv_ref = tracker.levels.get(gpos.get("grid_slot_id", ""))
+                    if lv_ref and float(lv_ref.get("sl_price") or 0.0) > 0:
+                        gpos["sl_price"] = float(lv_ref["sl_price"])
                     gpos["trail_stop_price"] = (
                         tracker.long_trail_stop_price if gpos["side"] == "LONG" else tracker.short_trail_stop_price
                     )
+            if amend_slots and cur_mode == "LIVE" and not self.risk_config.kill_switch_active:
+                for sid_amend in amend_slots:
+                    self._spawn_task(self._amend_live_slot_sl(cfg, tracker, sid_amend, cur_mode))
 
         # Group simultaneous same-side exits into a single aggregated exit order so sibling slots never race!
         if exits:
@@ -2883,6 +2901,83 @@ class BidirectionalSniperEngine:
             if not entry_filled_done:
                 tracker.mark_entry_missed(slot_id, backoff_ms=3000.0)
             self.append_log("WARN", sym, f"[网格开仓异常] {sym} [{slot_id}] {type(e).__name__}: {str(e)[:120]}", mode=exec_mode)
+
+    async def _amend_live_slot_sl(
+        self,
+        cfg: SymbolStrategy,
+        tracker: LongShortGridTracker,
+        slot_id: str,
+        exec_mode: str,
+    ):
+        sym = cfg.symbol
+        _, follower_ex = self.get_leader_And_follower_cfg()
+        try:
+            async with self._get_symbol_exec_lock(sym):
+                lv = tracker.levels.get(slot_id)
+                if not lv or lv.get("status") != "OPEN":
+                    return
+                new_sl = float(lv.get("sl_price") or 0.0)
+                if new_sl <= 0:
+                    return
+                side = str(lv.get("side") or "LONG")
+                upd = await self.executor.update_slot_sl_order(
+                    cfg=cfg,
+                    slot_key=f"{sym}:{slot_id}",
+                    side=side,
+                    qty=float(lv.get("filled_qty") or 0.0),
+                    new_sl_price=new_sl,
+                    exchange_cfg=follower_ex,
+                    contracts=float(lv.get("contracts") or 0.0) or None,
+                    ct_val=float(lv.get("ct_val") or 1.0) or None,
+                    mgn_mode=str(lv.get("mgn_mode") or "cross"),
+                )
+                upd_st = str(upd.get("status") or "")
+                if upd_st == "updated":
+                    lv["cond_sl_algo_id"] = str(upd.get("algo_id") or "")
+                    lv["cond_sl_live"] = bool(upd.get("sl_is_live", False))
+                    if not self.is_guest_preview and lv["cond_sl_live"] and lv["cond_sl_algo_id"]:
+                        self.db.record_order_async(
+                            order_id=lv["cond_sl_algo_id"],
+                            symbol=sym,
+                            exchange_id=follower_ex["exchange_id"],
+                            purpose=f"GRID_SL_AMEND_{slot_id}",
+                            side="SHORT" if side == "LONG" else "LONG",
+                            order_type="CONDITIONAL_SL",
+                            price=new_sl,
+                            requested_qty=float(lv.get("filled_qty") or 0.0),
+                            filled_qty=0.0,
+                            avg_price=0.0,
+                            status="LIVE",
+                            latency_ms=0.0,
+                            user_id=self.user_id,
+                        )
+                elif upd_st == "old_triggered":
+                    fi = upd.get("fill_info") or {}
+                    lv["cond_sl_algo_id"] = ""
+                    lv["cond_sl_live"] = False
+                    avg_px = float(fi.get("avg_px") or new_sl or lv.get("entry_price") or 0.0)
+                    self._finalize_grid_slot_trade(
+                        cfg=cfg,
+                        tracker=tracker,
+                        lv=dict(lv),
+                        exit_avg=avg_px,
+                        is_maker=False,
+                        exit_reason="TREND_BE_SL",
+                        order_id=str(fi.get("ord_id") or "cond-sl"),
+                        latency_ms=0.0,
+                        exec_mode=exec_mode,
+                        actual_exit_fee_usdt=float(fi.get("fee_usdt") or 0.0),
+                    )
+                elif upd_st != "kept_old":
+                    lv["cond_sl_algo_id"] = ""
+                    lv["cond_sl_live"] = False
+                gk = f"{sym}:{slot_id}"
+                if gk in self.active_grid_positions and lv.get("status") == "OPEN":
+                    self.active_grid_positions[gk]["sl_price"] = float(lv.get("sl_price") or new_sl)
+                    self.active_grid_positions[gk]["cond_sl_live"] = bool(lv.get("cond_sl_live", False))
+                self._save_open_strategy_state()
+        except Exception:
+            pass
 
     def _finalize_grid_slot_trade(
         self,

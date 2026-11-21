@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import {
   Activity,
   AlertCircle,
+  AlertTriangle,
   ArrowDownRight,
   ArrowUpRight,
   BarChart2,
@@ -9,6 +10,8 @@ import {
   Cpu,
   CreditCard,
   DollarSign,
+  Grid,
+  Layers,
   Lock,
   LogOut,
   Moon,
@@ -23,10 +26,12 @@ import {
   Sun,
   Terminal,
   Trash2,
+  TrendingUp,
   User,
   Users,
   Wallet,
   Wifi,
+  Zap,
 } from 'lucide-react';
 import RadarChart from './components/RadarChart';
 import EquityChart from './components/EquityChart';
@@ -3229,7 +3234,10 @@ export default function App() {
                               : 'surface-card text-sub hover:text-main'
                           }`}
                         >
-                          <div>⚡ 跨所脉冲狙击</div>
+                          <div className="flex items-center gap-1.5">
+                            <Zap className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                            <span>跨所脉冲狙击</span>
+                          </div>
                           <div className="text-[10px] opacity-75 font-normal mt-0.5">LEAD_LAG 高频价差</div>
                         </button>
                         <button
@@ -3241,7 +3249,10 @@ export default function App() {
                               : 'surface-card text-sub hover:text-main'
                           }`}
                         >
-                          <div>🕸️ 传统震荡网格</div>
+                          <div className="flex items-center gap-1.5">
+                            <Grid className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                            <span>传统震荡网格</span>
+                          </div>
                           <div className="text-[10px] opacity-80 font-normal mt-0.5">跌破接多 / 涨破开空</div>
                         </button>
                         <button
@@ -3253,7 +3264,10 @@ export default function App() {
                               : 'surface-card text-sub hover:text-main'
                           }`}
                         >
-                          <div>🚀 顺势突破网格</div>
+                          <div className="flex items-center gap-1.5">
+                            <TrendingUp className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                            <span>顺势突破网格</span>
+                          </div>
                           <div className="text-[10px] opacity-80 font-normal mt-0.5">涨破追多 / 追踪止盈</div>
                         </button>
                         <button
@@ -3265,7 +3279,10 @@ export default function App() {
                               : 'surface-card text-sub hover:text-main'
                           }`}
                         >
-                          <div>🧠 VCP 双模式切换</div>
+                          <div className="flex items-center gap-1.5">
+                            <Activity className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                            <span>VCP 双模式切换</span>
+                          </div>
                           <div className="text-[10px] opacity-80 font-normal mt-0.5">BBW极缩自动切顺势</div>
                         </button>
                       </div>
@@ -3455,16 +3472,19 @@ export default function App() {
                         {/* Live Risk, Thinnest-Leg & Per-Level Preview Panel */}
                         <div className="rounded-2xl border border-line surface-subtle p-3.5 sm:p-4 space-y-3 text-xs">
                           <div className="flex flex-wrap items-center justify-between gap-2">
-                            <div className="font-bold text-main">
-                              📊 实时风险、最薄层门槛与逐层铺网预览
+                            <div className="font-bold text-main flex items-center gap-1.5">
+                              <BarChart2 className="w-3.5 h-3.5 shrink-0 text-sub" strokeWidth={1.75} />
+                              <span>实时风险、最薄层门槛与逐层铺网预览</span>
                             </div>
                             {gridDiag.alerts.length === 0 ? (
-                              <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
-                                ✓ 参数逻辑校验全部通过
+                              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
+                                <Check className="w-3 h-3 shrink-0" strokeWidth={2} />
+                                <span>参数逻辑校验全部通过</span>
                               </span>
                             ) : (
-                              <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-rose-500/15 text-rose-600 dark:text-rose-400">
-                                ⚠ 发现 {gridDiag.alerts.length} 项参数冲突/风险
+                              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-rose-500/15 text-rose-600 dark:text-rose-400">
+                                <AlertTriangle className="w-3 h-3 shrink-0" strokeWidth={2} />
+                                <span>发现 {gridDiag.alerts.length} 项参数冲突/风险</span>
                               </span>
                             )}
                           </div>
@@ -3474,14 +3494,18 @@ export default function App() {
                               {gridDiag.alerts.map((al, idx) => (
                                 <div
                                   key={idx}
-                                  className={`px-3 py-1.5 rounded-xl text-[11px] font-medium ${
+                                  className={`flex items-start gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-medium ${
                                     al.severity === 'error'
                                       ? 'bg-rose-500/10 text-rose-600 dark:text-rose-300 border border-rose-500/25'
                                       : 'bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/25'
                                   }`}
                                 >
-                                  {al.severity === 'error' ? '⛔ ' : '⚠️ '}
-                                  {al.msg}
+                                  {al.severity === 'error' ? (
+                                    <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" strokeWidth={1.75} />
+                                  ) : (
+                                    <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" strokeWidth={1.75} />
+                                  )}
+                                  <span>{al.msg}</span>
                                 </div>
                               ))}
                             </div>
@@ -3554,8 +3578,9 @@ export default function App() {
                           <div className="p-4 rounded-2xl border border-violet-500/25 bg-violet-500/[0.04] space-y-4 text-xs">
                             <div className="flex flex-wrap items-center justify-between gap-2">
                               <div>
-                                <div className="font-bold text-main">
-                                  🚀 顺势突破（反向网格）与 VCP 波动率切换参数
+                                <div className="font-bold text-main flex items-center gap-1.5">
+                                  <TrendingUp className="w-3.5 h-3.5 shrink-0 text-violet-500" strokeWidth={1.75} />
+                                  <span>顺势突破（反向网格）与 VCP 波动率切换参数</span>
                                 </div>
                                 <div className="text-[11px] text-dim mt-0.5">
                                   取消固定止盈封顶，使用移动追踪止盈一键全平盈利槽位；每加一格自动将前序仓位止损上移至保本/上一格位

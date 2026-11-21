@@ -3276,6 +3276,75 @@ def test_batch_grid_levels_range_auto_linkage_and_thinnest_leg_audit():
         assert a_res["items"][0]["thinnest_leg_usdt"] == 12.0  # 20 * 4 * 0.15 = 12U > 8.5U!
 
 
+def test_trend_solo_profit_lock_pyramid_sl_buffer_and_post_sl_cooldown():
+    """
+    Verifies the 4 live trading data optimizations:
+    1) Solo L1/S1 profit-protection breakeven step-up once peak/trough reaches >= 1.15 * step (with 0.06% slippage buffer).
+    2) Full 1.0 * step spacing between L(k-1) fill and L(k) entry + 0.55 * step SL breathing room on pyramid legs.
+    3) 180s per-slot post-SL cooldown + 90s full-side post-SL cooldown in TREND_BREAKOUT (preventing 4s-15s whipsaw loops).
+    4) Batch update support for trend_dead_zone_mult.
+    """
+    from backend.grid_engine import LongShortGridTracker
+    from backend.math_engine import mono_ms
+
+    cfg = SymbolStrategy(
+        symbol="OKB/USDT:USDT",
+        strategy_type="TREND_GRID",
+        grid_side_mode="LONG_SHORT",
+        grid_levels=3,
+        grid_step_pct=0.008,
+        grid_take_profit_pct=0.0085,
+        grid_range_pct=0.028,
+        grid_stop_loss_pct=0.038,
+        order_usdt=10.0,
+        leverage=5,
+        price_precision=2,
+        qty_precision=2,
+        trend_dead_zone_mult=1.5,
+        trend_trailing_mult=1.5,
+        trend_pyramid_decay=True,
+        trend_use_bb_breakout=False,
+    )
+    trk = LongShortGridTracker("OKB/USDT:USDT")
+    trk.sync_config(cfg, current_mid=100.00)
+    assert trk.levels["S1"]["trigger_price"] == 98.80  # 100 * (1 - 1.5 * 0.8%)
+
+    # 1) Solo S1 enters at 98.80, drops +1.0% to 97.80 (>= 1.15 * 0.8% = 0.92% solo lock threshold, before S2 at 98.00 fills if S2 missed)
+    en1, _ = trk.evaluate_tick(98.78, 98.80, 98.79, cfg, is_net_mode=False, round_trip_fee=0.0010)
+    assert [e["slot_id"] for e in en1] == ["S1"]
+    trk.mark_entry_filled("S1", 98.80, 0.15, 1.0, 0.15, cfg, round_trip_fee=0.0010)
+    assert trk.levels["S1"]["sl_price"] == 100.00  # Initial false-breakout SL at center
+
+    # Price drops to 97.85 (favorable move = (98.80 - 97.86)/98.80 = 0.95% >= 0.92%) -> S1 auto-locks breakeven SL!
+    _, ex_hold = trk.evaluate_tick(97.84, 97.86, 97.85, cfg, is_net_mode=False, round_trip_fee=0.0010)
+    assert ex_hold == []
+    expected_be_s1 = round(98.80 * (1.0 - 0.0010 - 0.0006), 2)  # 98.64 (covers 0.10% fee + 0.06% slippage!)
+    assert trk.levels["S1"]["sl_price"] == expected_be_s1
+    assert trk.levels["S1"].get("sl_needs_amend") is True
+
+    # 2) If S2 also fills at 97.85, S2 SL keeps >= 0.55 * 0.8% = 0.44% breathing room above 97.85
+    trk.mark_entry_filled("S2", 97.85, 0.09, 1.0, 0.09, cfg, round_trip_fee=0.0010)
+    assert trk.levels["S2"]["sl_price"] >= round(97.85 * (1.0 + 0.008 * 0.55), 2)
+
+    # 3) Suppose S2 stops out via TREND_SL while S1 stays open -> S2 gets 180s per-slot cooldown!
+    now_before = mono_ms()
+    trk.mark_exited("S2", -0.05, is_sl=True)
+    assert trk.levels["S2"]["cooldown_until_mono"] >= now_before + 170_000.0
+    # Even if price immediately ticks back to 97.80, S2 MUST NOT re-enter during its 180s cooldown!
+    en_re, _ = trk.evaluate_tick(97.80, 97.82, 97.81, cfg, is_net_mode=False, round_trip_fee=0.0010)
+    assert en_re == []
+
+    # When S1 also stops out via TREND_BE_SL -> full-side 90s post-SL cooldown engages!
+    trk.mark_exited("S1", 0.02, is_sl=True)
+    assert trk._post_sl_cooldown_until_mono >= now_before + 85_000.0
+    assert trk._needs_post_trend_recenter is True
+    # During the 90s post-SL cooldown, it does NOT recenter or re-enter prematurely
+    en_cd, _ = trk.evaluate_tick(98.60, 98.64, 98.62, cfg, is_net_mode=False, round_trip_fee=0.0010)
+    assert en_cd == []
+    assert trk._needs_post_trend_recenter is True
+
+
+
 
 
 

@@ -561,7 +561,11 @@ class LongShortGridTracker:
 
         # 1. Check exits on currently OPEN grid slots first
         if self.active_grid_mode == "TREND_BREAKOUT":
-            trail_ratio = max(0.0005, float(cfg.trend_trailing_mult) * float(cfg.grid_step_pct))
+            step_now = max(0.0001, float(cfg.grid_step_pct))
+            trail_ratio = max(0.0005, float(cfg.trend_trailing_mult) * step_now)
+            solo_lock_move = max(1.15 * step_now, round_trip_fee + 0.0045)
+            be_slip_buf = 0.0006
+            sl_room_buf = max(0.0035, step_now * 0.55)
 
             open_longs = [lv for lv in self.levels.values() if lv["side"] == "LONG" and lv["status"] == "OPEN"]
             if open_longs:
@@ -569,6 +573,17 @@ class LongShortGridTracker:
                 self.long_peak_price = max(self.long_peak_price, bid, max_entry_l)
                 long_trail_px = round(self.long_peak_price * max(0.05, 1.0 - trail_ratio), prec)
                 self.long_trail_stop_price = long_trail_px
+
+                # Solo L1 Profit-Protection Breakeven Step-Up once peak move >= 1.15 * step (when L2 has not been reached)
+                if len(open_longs) == 1:
+                    lv = open_longs[0]
+                    e_entry = float(lv.get("entry_price") or 0.0)
+                    if e_entry > 0 and self.long_peak_price >= e_entry * (1.0 + solo_lock_move):
+                        be_px = round(e_entry * (1.0 + round_trip_fee + be_slip_buf), prec)
+                        cur_sl = float(lv.get("sl_price") or 0.0)
+                        if cur_sl < be_px - 1e-12 and bid >= be_px * (1.0 + sl_room_buf):
+                            lv["sl_price"] = be_px
+                            lv["sl_needs_amend"] = True
 
                 # 1a. Per-slot false-breakout / Livermore breakeven stop-loss (with cond_sl_live grace)
                 for lv in open_longs:
@@ -618,6 +633,17 @@ class LongShortGridTracker:
                     self.short_trough_price = min(self.short_trough_price, ask, min_entry_s)
                 short_trail_px = round(self.short_trough_price * (1.0 + trail_ratio), prec)
                 self.short_trail_stop_price = short_trail_px
+
+                # Solo S1 Profit-Protection Breakeven Step-Down once trough move >= 1.15 * step (when S2 has not been reached)
+                if len(open_shorts) == 1:
+                    lv = open_shorts[0]
+                    e_entry = float(lv.get("entry_price") or 0.0)
+                    if e_entry > 0 and self.short_trough_price > 0 and self.short_trough_price <= e_entry * max(0.05, 1.0 - solo_lock_move):
+                        be_px = round(e_entry * max(0.05, 1.0 - round_trip_fee - be_slip_buf), prec)
+                        cur_sl = float(lv.get("sl_price") or 0.0)
+                        if (cur_sl <= 0 or cur_sl > be_px + 1e-12) and ask <= be_px * max(0.05, 1.0 - sl_room_buf):
+                            lv["sl_price"] = be_px
+                            lv["sl_needs_amend"] = True
 
                 for lv in open_shorts:
                     if now_m < float(lv.get("exit_retry_until_mono") or 0.0):
@@ -730,7 +756,7 @@ class LongShortGridTracker:
                 and self.center_price > 0
                 and abs(mid - self.center_price) / self.center_price > eff_range
             )
-            post_trend_recenter = self._needs_post_trend_recenter
+            post_trend_recenter = self._needs_post_trend_recenter and (now_m >= self._post_sl_cooldown_until_mono)
             if mode_switched or drifted_out or post_trend_recenter:
                 prev_mode = self.active_grid_mode
                 self.active_grid_mode = target_mode
@@ -746,7 +772,7 @@ class LongShortGridTracker:
                     )
                 return [], exits
 
-        if not allow_entries:
+        if not allow_entries or now_m < self._post_sl_cooldown_until_mono:
             return [], exits
 
         # 3. Check IDLE slots for new grid entries (with 15m/1H EMA trend direction filter!)
@@ -912,7 +938,8 @@ class LongShortGridTracker:
         lv["cond_sl_touched_mono"] = 0.0
         prec = self._calc_prec(cfg)
         step = max(0.0001, float(cfg.grid_step_pct))
-        sl_buf = max(0.0015, step * 0.25)
+        sl_buf = max(0.0035, step * 0.55)
+        be_slip_buf = 0.0006
         tick_unit = 10.0 ** (-prec)
 
         if self.active_grid_mode == "TREND_BREAKOUT":
@@ -942,7 +969,7 @@ class LongShortGridTracker:
                             e_entry = float(earlier.get("entry_price") or 0.0)
                             if e_entry <= 0:
                                 continue
-                            be_px = round(e_entry * (1.0 + round_trip_fee), prec)
+                            be_px = round(e_entry * (1.0 + round_trip_fee + be_slip_buf), prec)
                             step_px = round(prev_anchor, prec) if earlier["level_idx"] < lvl_idx - 1 else be_px
                             target_sl = max(float(earlier.get("sl_price") or 0.0), be_px, step_px)
                             earlier["sl_price"] = min(target_sl, safe_cap_l)
@@ -969,7 +996,7 @@ class LongShortGridTracker:
                             e_entry = float(earlier.get("entry_price") or 0.0)
                             if e_entry <= 0:
                                 continue
-                            be_px = round(e_entry * max(0.05, 1.0 - round_trip_fee), prec)
+                            be_px = round(e_entry * max(0.05, 1.0 - round_trip_fee - be_slip_buf), prec)
                             step_px = round(prev_anchor, prec) if earlier["level_idx"] < lvl_idx - 1 else be_px
                             cur_sl = float(earlier.get("sl_price") or 0.0)
                             target_sl = min(cur_sl, be_px, step_px) if cur_sl > 0 else min(be_px, step_px)
@@ -1272,7 +1299,8 @@ class LongShortGridTracker:
                 lv["contracts"] = 0.0
                 lv["opened_mono_ms"] = 0.0
                 lv["last_closed_mono"] = now_m
-                lv["cooldown_until_mono"] = now_m + 1200.0
+                slot_cd_ms = 180_000.0 if (is_sl and self.active_grid_mode == "TREND_BREAKOUT") else 1200.0
+                lv["cooldown_until_mono"] = now_m + slot_cd_ms
                 lv["exit_retry_until_mono"] = 0.0
                 lv["maker_tp_order_id"] = ""
                 lv["maker_tp_live"] = False
@@ -1280,10 +1308,14 @@ class LongShortGridTracker:
                 lv["cond_sl_algo_id"] = ""
                 lv["cond_sl_live"] = False
                 lv["cond_sl_touched_mono"] = 0.0
+                lv.pop("sl_needs_amend", None)
                 lv.pop("recovered", None)
         if is_sl and self.active_grid_mode == "MEAN_REVERSION":
             # Prevent instant crash-low recenter & second falling-knife SL (120s cooloff)
             self._post_sl_cooldown_until_mono = max(self._post_sl_cooldown_until_mono, now_m + 120_000.0)
+        elif is_sl and self.active_grid_mode == "TREND_BREAKOUT" and not self._has_active_slots():
+            # Prevent instant re-entry / whipsaw recenter on an exhausted false breakout (90s cooloff)
+            self._post_sl_cooldown_until_mono = max(self._post_sl_cooldown_until_mono, now_m + 90_000.0)
         if not is_sl:
             self.completed_cycles += 1
         self.total_net_pnl = round(self.total_net_pnl + net_pnl, 4)

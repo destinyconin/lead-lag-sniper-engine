@@ -137,6 +137,7 @@ class BatchSymbolUpdateRequest(BaseModel):
     grid_take_profit_pct: Optional[float] = Field(default=None, ge=0.0005, le=0.25, allow_inf_nan=False)
     grid_range_pct: Optional[float] = Field(default=None, ge=0.001, le=0.80, allow_inf_nan=False)
     grid_stop_loss_pct: Optional[float] = Field(default=None, ge=0.002, le=0.90, allow_inf_nan=False)
+    trend_dead_zone_mult: Optional[float] = Field(default=None, ge=0.5, le=10.0, allow_inf_nan=False)
     trend_trailing_mult: Optional[float] = Field(default=None, ge=0.3, le=10.0, allow_inf_nan=False)
     use_post_only_tp: Optional[bool] = None
     sl_trigger_px_type: Optional[Literal["mark", "last"]] = None
