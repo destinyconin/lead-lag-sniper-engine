@@ -148,6 +148,10 @@ class BidirectionalSniperEngine:
             "SHADOW": 0,
             "LIVE": 0,
         }
+        self._last_loss_mono_by_mode: Dict[str, float] = {
+            "SHADOW": 0.0,
+            "LIVE": 0.0,
+        }
         self._last_live_cred_warn_mono: float = 0.0
         self._grid_block_log_ts: Dict[str, float] = {}
 
@@ -1612,8 +1616,8 @@ class BidirectionalSniperEngine:
             if has_grid_active or has_ll_active:
                 raise ValueError(f"{cfg.symbol} 当前存在在途持仓或未完成挂单，请先平仓后再切换策略大类（网格 ↔ 狙击）")
 
-        # Clearing rolling loss memory when user explicitly re-enables an auto-disabled symbol
-        if prev_cfg and not prev_cfg.is_running and cfg.is_running:
+        # Clear rolling loss memory whenever user enables or updates a symbol's strategy parameters
+        if cfg.is_running:
             for mk in ("SHADOW", "LIVE"):
                 dq = self.symbol_rolling_pnls.get((mk, cfg.symbol))
                 if dq is not None:
@@ -1916,6 +1920,10 @@ class BidirectionalSniperEngine:
                 anomaly_symbols += 1
 
             if req.action == "apply" and changed:
+                for mk in ("SHADOW", "LIVE"):
+                    dq = self.symbol_rolling_pnls.get((mk, sym))
+                    if dq is not None:
+                        dq.clear()
                 self.strategies[sym] = new_cfg
                 if tracker is not None:
                     tracker.sync_config(new_cfg, current_mid=ref_px)
@@ -2511,7 +2519,11 @@ class BidirectionalSniperEngine:
         if cur_stats["daily_net_pnl"] <= -abs(risk.max_daily_loss_usdt):
             return False
         if cur_stats["consecutive_losses"] >= risk.max_consecutive_losses:
-            return False
+            last_loss_m = float(self._last_loss_mono_by_mode.get(cur_mode, 0.0) or 0.0)
+            if last_loss_m > 0.0 and (mono_ms() - last_loss_m < 180_000.0):
+                return False
+            # Cool-off expired: auto-reset consecutive_losses so the system never permanently deadlocks!
+            cur_stats["consecutive_losses"] = 0
         add_usdt = float(extra_order_usdt) if extra_order_usdt is not None else float(cfg.order_usdt)
         current_exposure = self._compute_current_exposure(
             cur_mode, exclude_slot=exclude_slot, exclude_slots=exclude_slots
@@ -2531,12 +2543,17 @@ class BidirectionalSniperEngine:
             rolling = deque(maxlen=100)
             self.symbol_rolling_pnls[r_key] = rolling
         rolling.append(net_pnl)
+        if not cfg.is_running or net_pnl >= 0:
+            return
         win_n = max(1, int(self.risk_config.auto_disable_rolling_trades))
         if len(rolling) >= win_n:
             recent_slice = list(rolling)[-win_n:]
-            if sum(recent_slice) < 0:
+            rolling_sum = sum(recent_slice)
+            loss_cnt = sum(1 for x in recent_slice if x < 0)
+            min_loss_thresh = round(max(0.50, float(cfg.order_usdt) * 0.05), 2)
+            if rolling_sum < -min_loss_thresh and loss_cnt >= math.ceil(win_n * 0.55):
                 cfg.is_running = False
-                cfg.auto_disabled_reason = f"滚动 {win_n} 笔累计净利为负 ({sum(recent_slice):.2f} USDT)，触发自动熔断停用"
+                cfg.auto_disabled_reason = f"滚动 {win_n} 笔累计净利为负 ({rolling_sum:.2f} USDT)，触发自动熔断停用"
                 if not self.is_guest_preview:
                     self.db.upsert_symbol_sync(cfg, user_id=self.user_id)
                     self.db.record_risk_event_async("WARN", "AUTO_DISABLE", sym, cfg.auto_disabled_reason, user_id=self.user_id)
@@ -3295,7 +3312,11 @@ class BidirectionalSniperEngine:
                 exit_avg = exit_res.avg_price
                 total_rem_qty_sum = max(1e-12, sum(max(0.0, float(it.get("_rem_qty") or 0.0)) for it in remaining_items))
                 batch_exit_fee = float(exit_res.fee_usdt or 0.0)
-                for it in remaining_items:
+                # Finalize outer add-on legs (L3/S3) first and heavy base leg (L1/S1) last so a winning batch ends on L1/S1's win!
+                ordered_remaining = sorted(
+                    remaining_items, key=lambda x: int(x.get("level_idx") or 1), reverse=True
+                )
+                for it in ordered_remaining:
                     slot_reason = str(it.get("exit_reason") or primary_reason)
                     p_ct = float(it.get("_partial_maker_ct") or 0.0)
                     r_ct = float(it.get("_rem_contracts") or 0.0)
@@ -3345,7 +3366,10 @@ class BidirectionalSniperEngine:
         if cur_stats["daily_net_pnl"] <= -abs(risk.max_daily_loss_usdt):
             return False
         if cur_stats["consecutive_losses"] >= risk.max_consecutive_losses:
-            return False
+            last_loss_m = float(self._last_loss_mono_by_mode.get(cur_mode, 0.0) or 0.0)
+            if last_loss_m > 0.0 and (mono_ms() - last_loss_m < 180_000.0):
+                return False
+            cur_stats["consecutive_losses"] = 0
         open_count = sum(1 for p in self.active_positions.values() if p.get("mode", cur_mode) == cur_mode)
         in_flight_ll = sum(
             1
@@ -3827,16 +3851,10 @@ class BidirectionalSniperEngine:
             bucket["loss_count"] += 1
             bucket["gross_loss_sum"] = round(bucket["gross_loss_sum"] + abs(net), 4)
             bucket["consecutive_losses"] += 1
+            if not is_historical:
+                self._last_loss_mono_by_mode[target_mode] = mono_ms()
         else:
             bucket["consecutive_losses"] = 0
-
-        if is_historical:
-            r_key = (target_mode, tr["symbol"])
-            dq = self.symbol_rolling_pnls.get(r_key)
-            if dq is None:
-                dq = deque(maxlen=100)
-                self.symbol_rolling_pnls[r_key] = dq
-            dq.append(net)
 
         # Update per-symbol statistics
         sym_stat = _get_or_init_symbol_stat(bucket, tr["symbol"])

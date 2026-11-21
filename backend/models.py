@@ -81,18 +81,18 @@ class SymbolStrategy(BaseModel):
     grid_side_mode: Literal["LONG_SHORT", "LONG_ONLY", "SHORT_ONLY"] = Field(
         default="LONG_SHORT", description="Grid directional mode: symmetrical LONG_SHORT, LONG_ONLY, or SHORT_ONLY"
     )
-    grid_levels: int = Field(default=5, ge=1, le=30, description="Number of grid levels per active side")
-    grid_step_pct: float = Field(default=0.0060, ge=0.0001, le=0.50, allow_inf_nan=False, description="Price step between adjacent grid levels (0.006 = 0.60%)")
-    grid_take_profit_pct: float = Field(default=0.0065, ge=0.0001, le=0.50, allow_inf_nan=False, description="Per-grid take-profit target ratio")
-    grid_range_pct: float = Field(default=0.05, ge=0.001, le=0.80, allow_inf_nan=False, description="Outer boundary +/- ratio around center price")
-    grid_stop_loss_pct: float = Field(default=0.08, ge=0.002, le=0.90, allow_inf_nan=False, description="Breakout hard stop-loss ratio from grid center")
+    grid_levels: int = Field(default=3, ge=1, le=30, description="Number of grid levels per active side")
+    grid_step_pct: float = Field(default=0.0080, ge=0.0001, le=0.50, allow_inf_nan=False, description="Price step between adjacent grid levels (0.008 = 0.80%)")
+    grid_take_profit_pct: float = Field(default=0.0085, ge=0.0001, le=0.50, allow_inf_nan=False, description="Per-grid take-profit target ratio")
+    grid_range_pct: float = Field(default=0.028, ge=0.001, le=0.80, allow_inf_nan=False, description="Outer boundary +/- ratio around center price")
+    grid_stop_loss_pct: float = Field(default=0.038, ge=0.002, le=0.90, allow_inf_nan=False, description="Breakout hard stop-loss ratio from grid center")
     grid_recenter_enabled: bool = Field(default=True, description="Auto-recenter grid when flat and price leaves range")
     # Reverse / Trend Breakout Grid & Adaptive VCP/BBW Dual-Mode parameters
     trend_dead_zone_mult: float = Field(
-        default=2.0, ge=0.5, le=10.0, allow_inf_nan=False, description="First-level breakout dead-zone multiplier of grid_step_pct"
+        default=1.25, ge=0.5, le=10.0, allow_inf_nan=False, description="First-level breakout dead-zone multiplier of grid_step_pct"
     )
     trend_trailing_mult: float = Field(
-        default=1.5, ge=0.3, le=10.0, allow_inf_nan=False, description="Trailing-stop pullback multiplier of grid_step_pct from peak/trough"
+        default=1.25, ge=0.3, le=10.0, allow_inf_nan=False, description="Trailing-stop pullback multiplier of grid_step_pct from peak/trough"
     )
     trend_pyramid_decay: bool = Field(
         default=True, description="Use front-loaded decaying pyramid sizing (e.g. 50%/30%/20%) in trend grid mode"
@@ -116,11 +116,11 @@ class GlobalRiskConfig(BaseModel):
     feed_source: Literal["AUTO", "REAL_WS", "SIMULATOR"] = "AUTO"
     dynamic_leader_enabled: bool = False
     max_daily_loss_usdt: float = Field(default=150.0, ge=1.0, le=1_000_000.0, allow_inf_nan=False)
-    max_consecutive_losses: int = Field(default=5, ge=1, le=500)
+    max_consecutive_losses: int = Field(default=12, ge=1, le=500)
     max_concurrent_positions: int = Field(default=2, ge=1, le=200)
     max_exposure_usdt: float = Field(default=1500.0, ge=10.0, le=10_000_000.0, allow_inf_nan=False)
     latency_circuit_breaker_ms: float = Field(default=250.0, ge=20.0, le=30_000.0, allow_inf_nan=False)
-    auto_disable_rolling_trades: int = Field(default=8, ge=1, le=100)
+    auto_disable_rolling_trades: int = Field(default=15, ge=1, le=100)
     cooldown_ms: int = Field(default=500, ge=0, le=60_000)
     shadow_base_latency_ms: float = Field(default=26.0, ge=0.0, le=5_000.0, allow_inf_nan=False)
     shadow_latency_jitter_ms: float = Field(default=12.0, ge=0.0, le=5_000.0, allow_inf_nan=False)

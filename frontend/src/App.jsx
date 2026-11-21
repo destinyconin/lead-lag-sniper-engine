@@ -97,14 +97,14 @@ const suggestLinkedGridRange = (levels, stepRatio) => {
 };
 
 const buildGridPreviewAndDiagnostics = (cfg, okxMinNotional = 0, followerMid = 0) => {
-  const n = Math.max(1, Math.min(30, Math.round(Number(cfg.grid_levels ?? 5) || 5)));
-  const step = Math.max(0.0001, Number(cfg.grid_step_pct ?? 0.006) || 0.006);
-  const tp = Math.max(0.0001, Number(cfg.grid_take_profit_pct ?? 0.0065) || 0.0065);
-  const rng = Math.max(0.001, Number(cfg.grid_range_pct ?? 0.05) || 0.05);
-  const sl = Math.max(0.002, Number(cfg.grid_stop_loss_pct ?? 0.08) || 0.08);
+  const n = Math.max(1, Math.min(30, Math.round(Number(cfg.grid_levels ?? 3) || 3)));
+  const step = Math.max(0.0001, Number(cfg.grid_step_pct ?? 0.008) || 0.008);
+  const tp = Math.max(0.0001, Number(cfg.grid_take_profit_pct ?? 0.0085) || 0.0085);
+  const rng = Math.max(0.001, Number(cfg.grid_range_pct ?? 0.028) || 0.028);
+  const sl = Math.max(0.002, Number(cfg.grid_stop_loss_pct ?? 0.038) || 0.038);
   const lev = Math.max(1, Number(cfg.leverage ?? 5) || 5);
   const orderUsdt = Math.max(1, Number(cfg.order_usdt ?? 10) || 10);
-  const dzMult = Math.max(0.5, Number(cfg.trend_dead_zone_mult ?? 2.0) || 2.0);
+  const dzMult = Math.max(0.5, Number(cfg.trend_dead_zone_mult ?? 1.25) || 1.25);
   const st = cfg.strategy_type || 'LONG_SHORT_GRID';
   const isTrendLike = st === 'TREND_GRID' || st === 'ADAPTIVE_GRID';
   const decay = Boolean(cfg.trend_pyramid_decay ?? true);
@@ -3596,7 +3596,7 @@ export default function App() {
                                   step="0.25"
                                   min={0.5}
                                   max={10}
-                                  value={currentStrategy.trend_dead_zone_mult ?? 2.0}
+                                  value={currentStrategy.trend_dead_zone_mult ?? 1.25}
                                   onChange={(e) =>
                                     updateCurrentStrategyField({ trend_dead_zone_mult: Number(e.target.value) })
                                   }
@@ -3604,10 +3604,10 @@ export default function App() {
                                 />
                                 <div className="text-[10px] text-dim mt-1 leading-snug">
                                   L1 ≥ 中枢 ±{(
-                                    (currentStrategy.trend_dead_zone_mult ?? 2.0) *
-                                    (currentStrategy.grid_step_pct ?? 0.006) *
+                                    (currentStrategy.trend_dead_zone_mult ?? 1.25) *
+                                    (currentStrategy.grid_step_pct ?? 0.008) *
                                     100
-                                  ).toFixed(2)}%，过滤盘整假突破（默认 2.0x）
+                                  ).toFixed(2)}%，过滤盘整假突破（默认 1.25x）
                                 </div>
                               </div>
 
@@ -3618,7 +3618,7 @@ export default function App() {
                                   step="0.1"
                                   min={0.3}
                                   max={10}
-                                  value={currentStrategy.trend_trailing_mult ?? 1.5}
+                                  value={currentStrategy.trend_trailing_mult ?? 1.25}
                                   onChange={(e) =>
                                     updateCurrentStrategyField({ trend_trailing_mult: Number(e.target.value) })
                                   }
@@ -3626,10 +3626,10 @@ export default function App() {
                                 />
                                 <div className="text-[10px] text-dim mt-1 leading-snug">
                                   极值回撤 {(
-                                    (currentStrategy.trend_trailing_mult ?? 1.5) *
-                                    (currentStrategy.grid_step_pct ?? 0.006) *
+                                    (currentStrategy.trend_trailing_mult ?? 1.25) *
+                                    (currentStrategy.grid_step_pct ?? 0.008) *
                                     100
-                                  ).toFixed(2)}% 全平盈利槽 · 低波默认 1.5x，山寨防插针洗出建议 2.0~2.5x
+                                  ).toFixed(2)}% 全平盈利槽（内置组合均价 25% 锁利保护 · 默认 1.25x）
                                 </div>
                               </div>
 

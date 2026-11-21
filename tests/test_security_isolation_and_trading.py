@@ -3343,6 +3343,28 @@ def test_trend_solo_profit_lock_pyramid_sl_buffer_and_post_sl_cooldown():
     assert en_cd == []
     assert trk._needs_post_trend_recenter is True
 
+    # 4) Combined-VWAP 25% Profit-Lock Floor: prevents S1+S2 moderate waves from round-tripping into TREND_BE_SL_S1 + TREND_SL_S2 loss!
+    trk2 = LongShortGridTracker("ARB/USDT:USDT")
+    cfg2 = cfg.model_copy(update={"symbol": "ARB/USDT:USDT", "trend_dead_zone_mult": 1.25, "trend_trailing_mult": 1.25, "order_usdt": 20.0})
+    # High-vol blown-out BB (bbw_percentile=94.2%, bb_lower=95.0): S1 MUST cap tightly near 1.15*dz (-1.15%), NOT -2.2%!
+    high_vol_bb = {"timeframe": "15m", "bbw_pct": 8.7, "bbw_percentile": 94.2, "bb_upper": 105.0, "bb_middle": 100.0, "bb_lower": 95.0, "trend_bias": "BEAR"}
+    trk2.sync_config(cfg2, current_mid=100.00, bbw_info=high_vol_bb)
+    assert trk2.levels["S1"]["trigger_price"] >= 98.80  # Tight 1.15% cap, NOT 97.80 (-2.2%)!
+
+    # Open S1 (30U @ 100.00) and S2 (18U @ 99.20) -> combined VWAP = 99.70, VWAP_BE = 99.54
+    trk2.mark_entry_filled("S1", 100.00, 0.30, 3.0, 0.1, cfg2, round_trip_fee=0.0010)
+    trk2.mark_entry_filled("S2", 99.20, 0.18, 1.8, 0.1, cfg2, round_trip_fee=0.0010)
+    # Trough reaches 98.90 (+0.64% net beyond VWAP_BE=99.54, though raw trail 98.90*1.01=99.89 would be ABOVE VWAP_BE!)
+    _, ex_trough = trk2.evaluate_tick(98.88, 98.90, 98.89, cfg2, is_net_mode=False, round_trip_fee=0.0010, bbw_info=high_vol_bb)
+    assert ex_trough == []
+    # Profit-lock floor clamps short_trail_stop_price <= 99.38 (well below VWAP_BE 99.54 and S1.be_px 99.84!)
+    assert trk2.short_trail_stop_price <= 99.40
+    # When price bounces to 99.42, TREND_TRAIL_TP harvests BOTH S1 & S2 for a combined net PROFIT instead of waiting for 99.84 SL!
+    _, ex_lock = trk2.evaluate_tick(99.40, 99.42, 99.41, cfg2, is_net_mode=False, round_trip_fee=0.0010, bbw_info=high_vol_bb)
+    assert {e["slot_id"] for e in ex_lock} == {"S1", "S2"}
+    assert all(e["exit_reason"] == "TREND_TRAIL_TP" for e in ex_lock)
+
+
 
 
 
