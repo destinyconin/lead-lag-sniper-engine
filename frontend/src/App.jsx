@@ -220,13 +220,6 @@ const buildGridPreviewAndDiagnostics = (cfg, okxMinNotional = 0, followerMid = 0
       severity: 'error',
       msg: `单格硬止损 (${(sl * 100).toFixed(2)}%) ≤ 每格间距 (${(step * 100).toFixed(2)}%)，轻微回撤即触发止损`,
     });
-  } else if (st === 'REVERSE_GRID' && sl > Math.max(step * 3.2, tp * 3.0, 0.026)) {
-    alerts.push({
-      severity: 'warn',
-      msg: `单格硬止损 (${(sl * 100).toFixed(2)}%) 远宽于单格止盈 (${(tp * 100).toFixed(2)}%)，易造成多空对锁且亏多赚少，建议设为 ${(
-        Math.max(step * 2, step + 0.005) * 100
-      ).toFixed(2)}%`,
-    });
   }
   if (isTrendLike && dzMult * step > rng + 1e-6) {
     alerts.push({
@@ -1569,9 +1562,9 @@ export default function App() {
       const curSl = Math.max(0.002, Number(currentStrategy.grid_stop_loss_pct ?? 0.038) || 0.038);
       if (
         patch.strategy_type === 'REVERSE_GRID' &&
-        (curSl <= step + 1e-6 || curSl > Math.max(step * 3.2, 0.026))
+        curSl <= step + 1e-6
       ) {
-        mergedPatch.grid_stop_loss_pct = Number(Math.min(0.9, Math.max(step * 2, step + 0.005)).toFixed(4));
+        mergedPatch.grid_stop_loss_pct = Number(Math.min(0.9, Math.max(curRng + 0.003, step * 2.5, step + 0.005)).toFixed(4));
       } else if (
         (patch.strategy_type === 'LONG_SHORT_GRID' || patch.strategy_type === 'ADAPTIVE_GRID') &&
         curSl <= curRng + 1e-6
@@ -1609,8 +1602,8 @@ export default function App() {
       }
       if (isCenterAnchoredSl && curSl <= nextRng + 1e-6) {
         patch.grid_stop_loss_pct = Number(Math.min(0.9, Math.ceil((nextRng + 0.01) * 1000) / 1000).toFixed(4));
-      } else if (base.strategy_type === 'REVERSE_GRID' && (curSl <= step + 1e-6 || curSl > Math.max(step * 3.2, 0.026))) {
-        patch.grid_stop_loss_pct = Number(Math.min(0.9, Math.max(step * 2, step + 0.005)).toFixed(4));
+      } else if (base.strategy_type === 'REVERSE_GRID' && curSl <= step + 1e-6) {
+        patch.grid_stop_loss_pct = Number(Math.min(0.9, Math.max(nextRng + 0.003, step * 2.5, step + 0.005)).toFixed(4));
       }
     } else if (field === 'grid_stop_loss_pct') {
       const nextSl = Math.max(0.002, Math.min(0.9, Number(rawVal) || 0.05));
@@ -1644,8 +1637,8 @@ export default function App() {
       ? curSl <= nextRng + 0.002
         ? Number(Math.min(0.9, Math.ceil((nextRng + 0.01) * 1000) / 1000).toFixed(4))
         : curSl
-      : st === 'REVERSE_GRID' && (curSl <= step + 1e-6 || curSl > Math.max(step * 3.2, 0.026))
-      ? Number(Math.min(0.9, Math.max(step * 2, step + 0.005)).toFixed(4))
+      : st === 'REVERSE_GRID' && curSl <= step + 1e-6
+      ? Number(Math.min(0.9, Math.max(nextRng + 0.003, step * 2.5, step + 0.005)).toFixed(4))
       : curSl;
     updateCurrentStrategyField({
       grid_range_pct: nextRng,
@@ -4119,14 +4112,18 @@ export default function App() {
                                   {gSnap.trend_bias && (
                                     <span
                                       className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                                        gSnap.trend_bias === 'BULL'
+                                        isReverseOscActive
+                                          ? 'bg-teal-500/15 text-teal-700 dark:text-teal-300'
+                                          : gSnap.trend_bias === 'BULL'
                                           ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
                                           : gSnap.trend_bias === 'BEAR'
                                           ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
                                           : 'bg-slate-500/15 text-slate-600 dark:text-slate-300'
                                       }`}
                                     >
-                                      {gSnap.trend_bias === 'BULL'
+                                      {isReverseOscActive
+                                        ? '多空双向网格套利 · 涨破多/跌破空均生效'
+                                        : gSnap.trend_bias === 'BULL'
                                         ? '多头趋势 · 顺多禁逆空'
                                         : gSnap.trend_bias === 'BEAR'
                                         ? '空头趋势 · 顺空禁逆多'

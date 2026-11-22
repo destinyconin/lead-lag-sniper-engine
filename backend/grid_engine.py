@@ -850,12 +850,12 @@ class LongShortGridTracker:
                     if e_px > 0:
                         if lv["side"] == "LONG":
                             target_rev_sl = round(e_px * max(0.05, 1.0 - rev_sl_pct), prec)
-                            if cur_sl_px < target_rev_sl - 1e-12 and bid >= target_rev_sl * (1.0 + rev_room_buf):
+                            if abs(cur_sl_px - target_rev_sl) > 1e-9 and bid >= target_rev_sl * (1.0 + rev_room_buf):
                                 lv["sl_price"] = target_rev_sl
                                 lv["sl_needs_amend"] = True
                         else:
                             target_rev_sl = round(e_px * (1.0 + rev_sl_pct), prec)
-                            if (cur_sl_px <= 0 or cur_sl_px > target_rev_sl + 1e-12) and ask <= target_rev_sl * max(0.05, 1.0 - rev_room_buf):
+                            if (cur_sl_px <= 0 or abs(cur_sl_px - target_rev_sl) > 1e-9) and ask <= target_rev_sl * max(0.05, 1.0 - rev_room_buf):
                                 lv["sl_price"] = target_rev_sl
                                 lv["sl_needs_amend"] = True
                 if now_m < float(lv.get("exit_retry_until_mono") or 0.0):
@@ -1043,21 +1043,24 @@ class LongShortGridTracker:
                 lv.get("status") == "EXITING" and lv.get("exiting_is_sl") for lv in self.levels.values()
             ):
                 return [], exits
-            # Reverse Oscillating Grid (多空震荡网格: 跌破开空 / 涨破开多):
+            # Reverse Oscillating Grid (多空震荡网格: 跌破开空 / 涨破开多 双向网格套利):
             # - L1..Ln above center trigger LONG when ask breaks >= trigger_price
             # - S1..Sn below center trigger SHORT when bid breaks <= trigger_price
-            # - Slots disarm on fill/exit and re-arm once price crosses back past trigger_price
-            #   by a small hysteresis buffer, preventing instant re-stacking after TP!
-            rearm_buf = min(step * 0.25, 0.0020)
+            # - Unrestricted by lagging EMA trend_bias so both upward and downward oscillations
+            #   continuously execute grid arbitrage cycles!
+            # - Slots disarm on fill/exit and immediately re-arm once price pulls back across
+            #   trigger_price by a tiny hysteresis buffer, preventing same-tick re-stacking after TP
+            #   while never missing shallow grid pullbacks!
+            rearm_buf = min(step * 0.05, 0.0003)
             for lv in self.levels.values():
                 if lv["status"] != "IDLE":
                     continue
                 if not lv.get("armed", True):
                     t_px = float(lv.get("trigger_price") or 0.0)
                     if t_px > 0:
-                        if lv["side"] == "LONG" and ask <= t_px * max(0.05, 1.0 - rearm_buf):
+                        if lv["side"] == "LONG" and mid <= t_px * max(0.05, 1.0 - rearm_buf):
                             lv["armed"] = True
-                        elif lv["side"] == "SHORT" and bid >= t_px * (1.0 + rearm_buf):
+                        elif lv["side"] == "SHORT" and mid >= t_px * (1.0 + rearm_buf):
                             lv["armed"] = True
 
             eff_rng = max(float(cfg.grid_range_pct), step)
@@ -1079,7 +1082,6 @@ class LongShortGridTracker:
             if (
                 not has_entering_long
                 and cfg.grid_side_mode in ("LONG_SHORT", "LONG_ONLY")
-                and trend_bias != "BEAR"
                 and not (is_net_mode and has_short_active)
                 and self.center_price < mid <= range_upper
             ):
@@ -1097,7 +1099,7 @@ class LongShortGridTracker:
                         continue
                     if ask >= float(lv["trigger_price"]):
                         long_cands.append(lv)
-                if long_cands and all(abs(ask - ep) / ep >= step * 0.80 for ep in open_long_entries):
+                if long_cands and all(abs(ask - ep) / ep >= step * 0.55 for ep in open_long_entries):
                     chosen = max(long_cands, key=lambda x: (float(x["trigger_price"]), int(x["level_idx"])))
                     chosen["status"] = "ENTERING"
                     has_long_active = True
@@ -1107,7 +1109,6 @@ class LongShortGridTracker:
             if (
                 not has_entering_short
                 and cfg.grid_side_mode in ("LONG_SHORT", "SHORT_ONLY")
-                and trend_bias != "BULL"
                 and not (is_net_mode and has_long_active)
                 and range_lower <= mid < self.center_price
             ):
@@ -1125,7 +1126,7 @@ class LongShortGridTracker:
                         continue
                     if bid <= float(lv["trigger_price"]):
                         short_cands.append(lv)
-                if short_cands and all(abs(bid - ep) / ep >= step * 0.80 for ep in open_short_entries):
+                if short_cands and all(abs(bid - ep) / ep >= step * 0.55 for ep in open_short_entries):
                     chosen = min(short_cands, key=lambda x: (float(x["trigger_price"]), -int(x["level_idx"])))
                     chosen["status"] = "ENTERING"
                     has_short_active = True

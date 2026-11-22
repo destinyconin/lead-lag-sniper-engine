@@ -3542,14 +3542,17 @@ def test_reverse_oscillating_grid_core_lifecycle():
     trk_gap.mark_entry_filled("L2", 101.70, 0.20, 2.0, 0.1, cfg, round_trip_fee=0.0007)
     assert trk_gap.levels["L1"]["armed"] is False  # Bypassed inner L1 disarmed!
 
-    # 8) EMA trend_bias filter: BEAR suppresses upward LONG breakouts but allows downward SHORT breakdowns
+    # 8) Unrestricted two-way grid arbitrage under BEAR/BULL trend_bias: BOTH upward LONG (涨破开多)
+    #    and downward SHORT (跌破开空) trigger cleanly in LONG_SHORT mode!
     trk_bias = LongShortGridTracker("SOL/USDT:USDT")
     trk_bias.sync_config(cfg, current_mid=100.00)
     bear_bbw = {"timeframe": "15m", "bbw_pct": 2.5, "bbw_percentile": 45.0, "trend_bias": "BEAR"}
     en_bear_up, _ = trk_bias.evaluate_tick(100.82, 100.85, 100.835, cfg, is_net_mode=False, bbw_info=bear_bbw)
-    assert en_bear_up == []
-    en_bear_dn, _ = trk_bias.evaluate_tick(99.15, 99.18, 99.165, cfg, is_net_mode=False, bbw_info=bear_bbw)
-    assert [e["slot_id"] for e in en_bear_dn] == ["S1"]
+    assert [e["slot_id"] for e in en_bear_up] == ["L1"]
+    trk_bias.mark_entry_filled("L1", 100.85, 0.20, 2.0, 0.1, cfg, round_trip_fee=0.0007)
+    bull_bbw = {"timeframe": "15m", "bbw_pct": 2.5, "bbw_percentile": 45.0, "trend_bias": "BULL"}
+    en_bull_dn, _ = trk_bias.evaluate_tick(99.15, 99.18, 99.165, cfg, is_net_mode=False, bbw_info=bull_bbw)
+    assert [e["slot_id"] for e in en_bull_dn] == ["S1"]
 
 
 def test_reverse_grid_engine_db_api_and_batch_e2e():
@@ -4187,6 +4190,12 @@ def test_reverse_grid_sl_tightening_trend_pyramid_lock_and_follower_priority():
     trk.evaluate_tick(100.55, 100.56, 100.555, rev_cfg, is_net_mode=False, round_trip_fee=0.0007)
     assert trk.levels["L1"]["sl_price"] == round(100.60 * (1.0 - 0.012), 2)
     assert trk.levels["L1"]["sl_needs_amend"] is True
+    # And widening grid_stop_loss_pct back to 3.80% (grid-range SL) dynamically widens open L1 sl_price back so it won't stop out inside the grid!
+    trk.levels["L1"]["sl_needs_amend"] = False
+    rev_cfg.grid_stop_loss_pct = 0.038
+    trk.evaluate_tick(100.55, 100.56, 100.555, rev_cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert trk.levels["L1"]["sl_price"] == round(100.60 * (1.0 - 0.038), 2)
+    assert trk.levels["L1"]["sl_needs_amend"] is True
 
     # 2) TREND_BREAKOUT multi-leg pyramid floors profit_lock_l at L2 breakeven once peak >= L2 * (1 + 0.45 * step)
     trend_cfg = SymbolStrategy(
@@ -4213,34 +4222,54 @@ def test_reverse_grid_sl_tightening_trend_pyramid_lock_and_follower_priority():
     t_trk.evaluate_tick(102.26, 102.27, 102.265, trend_cfg, is_net_mode=False, round_trip_fee=0.0010)
     assert t_trk.long_trail_stop_price >= 101.80
 
-    # 3) Batch validator flags 3.80% SL on REVERSE_GRID (step=0.60%) and auto-tightens it, plus follower priority
+    # 3) Verify REVERSE_OSCILLATING executes BOTH LONG and SHORT grid arbitrage unrestricted by BULL/BEAR trend_bias,
+    #    and re-arms on shallow grid pullbacks (e.g. JUP dipping 0.05% below L2)
+    bull_bbw = {
+        "timeframe": "15m",
+        "bbw_pct": 2.1,
+        "bbw_percentile": 30.0,
+        "bb_upper": 102.0,
+        "bb_middle": 100.0,
+        "bb_lower": 98.0,
+        "ema_fast": 100.8,
+        "ema_slow": 99.5,
+        "ema_gap_pct": 1.30,
+        "trend_bias": "BULL",
+        "breakout_expansion": "NONE",
+    }
+    bear_bbw = {**bull_bbw, "ema_fast": 99.2, "ema_slow": 100.5, "ema_gap_pct": -1.29, "trend_bias": "BEAR"}
+
+    # Even under strong BULL trend_bias, dropping below S1 (99.40) in REVERSE_OSCILLATING MUST open SHORT S1 (跌破开空)!
+    en_s1_bull, _ = trk.evaluate_tick(99.38, 99.39, 99.385, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=bull_bbw)
+    assert len(en_s1_bull) == 1 and en_s1_bull[0]["slot_id"] == "S1" and en_s1_bull[0]["side"] == "SHORT"
+    trk.mark_entry_filled("S1", 99.38, 1.0, 1.0, 0.05, rev_cfg, round_trip_fee=0.0007)
+
+    # S1 hits TP at 98.65 -> exits with GRID_TP!
+    en_at_tp, ex_s1_tp = trk.evaluate_tick(98.64, 98.65, 98.645, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=bull_bbw)
+    for e_sub in en_at_tp:
+        trk.mark_entry_missed(e_sub["slot_id"])
+    assert [e["slot_id"] for e in ex_s1_tp] == ["S1"] and ex_s1_tp[0]["exit_reason"] == "GRID_TP"
+    trk.mark_exited("S1", 0.065, is_sl=False)
+    trk.levels["S1"]["cooldown_until_mono"] = 0.0
+    trk.levels["S1"]["last_closed_mono"] = 0.0
+
+    # Shallow bounce just 0.05% above S1 (99.40 * 1.0005 = 99.45) immediately re-arms S1 for repeated grid arbitrage!
+    trk.evaluate_tick(99.44, 99.46, 99.45, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=bull_bbw)
+    assert trk.levels["S1"]["armed"] is True
+    en_s1_repeat, _ = trk.evaluate_tick(99.38, 99.39, 99.385, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=bull_bbw)
+    assert len(en_s1_repeat) == 1 and en_s1_repeat[0]["slot_id"] == "S1"
+    trk.mark_entry_missed("S1")
+
+    # Even under strong BEAR trend_bias, rising above L2 (101.20) in REVERSE_OSCILLATING MUST open LONG L2 (涨破开多)!
+    en_l2_bear, _ = trk.evaluate_tick(101.21, 101.22, 101.215, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=bear_bbw)
+    assert len(en_l2_bear) == 1 and en_l2_bear[0]["slot_id"] == "L2" and en_l2_bear[0]["side"] == "LONG"
+
+    # 4) Follower priority: even if an unconfigured secondary exchange is active, verified/configured OKX wins
     with tempfile.TemporaryDirectory() as tmpdir:
         adb = AsyncDatabaseManager(db_path=os.path.join(tmpdir, "rev_audit.db"))
         adb.init_sync()
         adb.ensure_user_workspace_sync(91)
         eng = BidirectionalSniperEngine(adb, user_id=91)
-        eng.strategies["ZEC/USDT:USDT"] = SymbolStrategy(
-            symbol="ZEC/USDT:USDT",
-            strategy_type="REVERSE_GRID",
-            grid_levels=5,
-            grid_step_pct=0.006,
-            grid_take_profit_pct=0.0065,
-            grid_range_pct=0.035,
-            grid_stop_loss_pct=0.038,
-        )
-        rep = eng.validate_and_batch_update_symbols(
-            BatchSymbolUpdateRequest(action="validate", strategy_filter="REVERSE_GRID")
-        )
-        zec_item = next(it for it in rep["items"] if it["symbol"] == "ZEC/USDT:USDT")
-        assert any("单格止损过宽" in iss for iss in zec_item["issues"])
-
-        fix_rep = eng.validate_and_batch_update_symbols(
-            BatchSymbolUpdateRequest(action="apply", strategy_filter="REVERSE_GRID", auto_fix_anomalies=True)
-        )
-        assert fix_rep["updated_count"] >= 1
-        assert eng.strategies["ZEC/USDT:USDT"].grid_stop_loss_pct == 0.012
-
-        # Follower priority: even if an unconfigured secondary exchange is active, verified/configured OKX wins
         eng.exchanges = {
             "bybit": {"exchange_id": "bybit", "role": "follower", "is_active": True, "auth_status": "UNCONFIGURED"},
             "okx": {"exchange_id": "okx", "role": "follower", "is_active": True, "auth_status": "VERIFIED"},

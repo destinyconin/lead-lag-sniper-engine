@@ -1773,15 +1773,10 @@ class BidirectionalSniperEngine:
                     issues.append(
                         f"止损小于等于区间 (SL={new_cfg.grid_stop_loss_pct*100:.1f}% ≤ Range={new_cfg.grid_range_pct*100:.1f}%)"
                     )
-                elif new_cfg.strategy_type == "REVERSE_GRID":
-                    if new_cfg.grid_stop_loss_pct <= new_cfg.grid_step_pct + 1e-6:
-                        issues.append(
-                            f"单格止损小于等于步长 (SL={new_cfg.grid_stop_loss_pct*100:.2f}% ≤ Step={new_cfg.grid_step_pct*100:.2f}%)"
-                        )
-                    elif new_cfg.grid_stop_loss_pct > max(new_cfg.grid_step_pct * 3.2, new_cfg.grid_take_profit_pct * 3.0, 0.026):
-                        issues.append(
-                            f"单格止损过宽易造成多空对锁亏多赚少 (SL={new_cfg.grid_stop_loss_pct*100:.2f}% > 推荐≤{max(new_cfg.grid_step_pct*2.2, 0.015)*100:.2f}%)"
-                        )
+                elif new_cfg.strategy_type == "REVERSE_GRID" and new_cfg.grid_stop_loss_pct <= new_cfg.grid_step_pct + 1e-6:
+                    issues.append(
+                        f"单格止损小于等于步长 (SL={new_cfg.grid_stop_loss_pct*100:.2f}% ≤ Step={new_cfg.grid_step_pct*100:.2f}%)"
+                    )
                 sl_roe_pct_cur = new_cfg.grid_stop_loss_pct * max(1, int(new_cfg.leverage)) * 100.0
                 if sl_roe_pct_cur > 35.0:
                     issues.append(
@@ -1922,21 +1917,10 @@ class BidirectionalSniperEngine:
                                 new_cfg.grid_stop_loss_pct = round(min(0.90, new_cfg.grid_range_pct + 0.015), 4)
                                 fixes.append(f"修正止损→{new_cfg.grid_stop_loss_pct*100:.1f}%")
                                 changed = True
-                        elif new_cfg.strategy_type == "REVERSE_GRID":
-                            if new_cfg.grid_stop_loss_pct <= new_cfg.grid_step_pct + 1e-6:
-                                new_cfg.grid_stop_loss_pct = round(min(0.90, max(new_cfg.grid_step_pct * 2.0, new_cfg.grid_step_pct + 0.005)), 4)
-                                fixes.append(f"修正单格止损→{new_cfg.grid_stop_loss_pct*100:.2f}%")
-                                changed = True
-                            elif (
-                                req.grid_stop_loss_pct is None
-                                and new_cfg.grid_stop_loss_pct > max(new_cfg.grid_step_pct * 3.2, new_cfg.grid_take_profit_pct * 3.0, 0.026)
-                            ):
-                                new_cfg.grid_stop_loss_pct = round(
-                                    min(0.90, max(new_cfg.grid_step_pct * 2.0, new_cfg.grid_take_profit_pct * 1.85, new_cfg.grid_step_pct + 0.005)),
-                                    4,
-                                )
-                                fixes.append(f"收紧过宽单格止损→{new_cfg.grid_stop_loss_pct*100:.2f}%")
-                                changed = True
+                        elif new_cfg.strategy_type == "REVERSE_GRID" and new_cfg.grid_stop_loss_pct <= new_cfg.grid_step_pct + 1e-6:
+                            new_cfg.grid_stop_loss_pct = round(min(0.90, max(new_cfg.grid_range_pct + 0.003, new_cfg.grid_step_pct * 2.5, new_cfg.grid_step_pct + 0.005)), 4)
+                            fixes.append(f"修正单格止损→{new_cfg.grid_stop_loss_pct*100:.2f}%")
+                            changed = True
                         if new_cfg.strategy_type in ("TREND_GRID", "ADAPTIVE_GRID"):
                             dz_span = new_cfg.trend_dead_zone_mult * new_cfg.grid_step_pct
                             if dz_span > new_cfg.grid_range_pct:
@@ -2383,8 +2367,8 @@ class BidirectionalSniperEngine:
         regime_msg = tracker.consume_regime_log()
         if regime_msg:
             self.append_log("INFO", sym, regime_msg, mode=cur_mode)
-        # Keep live trailing stop & solo breakeven SL step-ups synchronized on active_grid_positions immediately after evaluate_tick
-        if tracker.active_grid_mode == "TREND_BREAKOUT":
+        # Keep live trailing stop & solo/grid SL step-ups synchronized on active_grid_positions immediately after evaluate_tick
+        if tracker.active_grid_mode in ("TREND_BREAKOUT", "REVERSE_OSCILLATING", "MEAN_REVERSION"):
             amend_slots: List[str] = []
             for lv_chk in tracker.levels.values():
                 if lv_chk.get("status") == "OPEN" and lv_chk.pop("sl_needs_amend", False):
