@@ -3118,14 +3118,48 @@ export default function App() {
 
                   {/* Monitored Contracts List — fills remaining full height on desktop down to Quick-Add footer */}
                   <div className="flex-1 min-h-0 flex flex-col pt-3.5 sm:pt-4">
-                    <div className="shrink-0 text-xs font-bold text-dim mb-2 px-1">
-                      当前监控中合约 ({strategies.length})
+                    <div className="shrink-0 flex items-center justify-between text-xs font-bold text-dim mb-2 px-1">
+                      <span>当前监控中合约 ({strategies.length})</span>
+                      <span className="text-[11px] font-mono">
+                        持仓中{' '}
+                        {
+                          strategies.filter((s) => {
+                            const hasPos = (snapshot?.active_positions || []).some(
+                              (p) => p && p.symbol === s.symbol && Number(p.qty ?? p.contracts ?? 1) > 0
+                            );
+                            const tg = snapshot?.telemetry?.[s.symbol]?.grid;
+                            const gCnt = (Number(tg?.open_long_count) || 0) + (Number(tg?.open_short_count) || 0);
+                            return hasPos || gCnt > 0 || snapshot?.telemetry?.[s.symbol]?.state === 'HOLDING';
+                          }).length
+                        }{' '}
+                        / 空仓{' '}
+                        {
+                          strategies.filter((s) => {
+                            const hasPos = (snapshot?.active_positions || []).some(
+                              (p) => p && p.symbol === s.symbol && Number(p.qty ?? p.contracts ?? 1) > 0
+                            );
+                            const tg = snapshot?.telemetry?.[s.symbol]?.grid;
+                            const gCnt = (Number(tg?.open_long_count) || 0) + (Number(tg?.open_short_count) || 0);
+                            return !(hasPos || gCnt > 0 || snapshot?.telemetry?.[s.symbol]?.state === 'HOLDING');
+                          }).length
+                        }
+                      </span>
                     </div>
                     <div className="flex-1 min-h-0 space-y-2 max-h-[380px] sm:max-h-[440px] lg:max-h-none overflow-y-auto pr-1">
                       {strategies.map((item) => {
                         const active = item.symbol === currentStrategy.symbol;
                         const st = item.strategy_type || 'LEAD_LAG';
                         const isGrid = isGridStrategyType(st);
+                        const symPositions = (snapshot?.active_positions || []).filter(
+                          (p) => p && p.symbol === item.symbol && Number(p.qty ?? p.contracts ?? 1) > 0
+                        );
+                        const telGrid = snapshot?.telemetry?.[item.symbol]?.grid;
+                        const gridOpenCnt =
+                          (Number(telGrid?.open_long_count) || 0) + (Number(telGrid?.open_short_count) || 0);
+                        const hasOpenPosition =
+                          symPositions.length > 0 ||
+                          gridOpenCnt > 0 ||
+                          snapshot?.telemetry?.[item.symbol]?.state === 'HOLDING';
                         return (
                           <div
                             key={item.symbol}
@@ -3150,11 +3184,31 @@ export default function App() {
                               </div>
                               <div className={`text-[11px] mt-0.5 truncate ${active ? 'text-white/75' : 'text-dim'}`}>
                                 {isGrid
-                                  ? `${GRID_MODE_LABEL_MAP[item.grid_side_mode || 'LONG_SHORT']} · ${item.grid_levels ?? 5}层 · ${item.order_usdt}U`
+                                  ? `${GRID_MODE_LABEL_MAP[item.grid_side_mode || 'LONG_SHORT']} · ${item.grid_levels ?? 3}层 · ${item.order_usdt}U`
                                   : `${DIRECTION_LABEL_MAP[item.direction]} · ${item.order_usdt}U · ${item.leverage}x`}
                               </div>
                             </div>
-                            <div className="flex items-center gap-2 shrink-0">
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <span
+                                className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
+                                  hasOpenPosition
+                                    ? active
+                                      ? 'bg-amber-500 text-white'
+                                      : 'bg-amber-500/15 text-amber-600'
+                                    : active
+                                    ? 'bg-white/15 text-white/80'
+                                    : 'bg-slate-500/15 text-dim'
+                                }`}
+                              >
+                                {hasOpenPosition && (
+                                  <span
+                                    className={`w-1.5 h-1.5 rounded-full ${
+                                      active ? 'bg-white' : 'bg-amber-500'
+                                    } animate-pulse`}
+                                  />
+                                )}
+                                {hasOpenPosition ? '持仓中' : '空仓'}
+                              </span>
                               <span
                                 className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
                                   item.is_running
