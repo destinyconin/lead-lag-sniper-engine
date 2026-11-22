@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.crypto_utils import vault
@@ -23,6 +24,29 @@ from backend.payment_monitor import (
     OnChainPaymentMonitor,
 )
 from backend.user_membership import UserMembershipManager, rate_limiter
+
+
+@pytest.fixture(autouse=True)
+def _isolate_global_app_db(tmp_path):
+    """Prevents any TestClient(app) lifespan from ever touching production backend/sniper_engine.db."""
+    import backend.main as main_mod
+    from backend.engine_manager import EngineManager
+
+    iso_db = str(tmp_path / "isolated_app.db")
+    orig_db_path = main_mod.db_manager.db_path
+    orig_um_path = main_mod.user_manager.db_path
+    orig_em = main_mod.engine_manager
+    main_mod.db_manager.db_path = iso_db
+    main_mod.user_manager.db_path = iso_db
+    main_mod.db_manager.init_sync()
+    main_mod.user_manager.init_sync()
+    main_mod.engine_manager = EngineManager(main_mod.db_manager, get_user_fn=main_mod.user_manager.get_user_by_id)
+    try:
+        yield
+    finally:
+        main_mod.db_manager.db_path = orig_db_path
+        main_mod.user_manager.db_path = orig_um_path
+        main_mod.engine_manager = orig_em
 
 
 def test_legacy_db_migration_preserves_ye520958_and_isolates_tenants():
@@ -3363,6 +3387,536 @@ def test_trend_solo_profit_lock_pyramid_sl_buffer_and_post_sl_cooldown():
     _, ex_lock = trk2.evaluate_tick(99.40, 99.42, 99.41, cfg2, is_net_mode=False, round_trip_fee=0.0010, bbw_info=high_vol_bb)
     assert {e["slot_id"] for e in ex_lock} == {"S1", "S2"}
     assert all(e["exit_reason"] == "TREND_TRAIL_TP" for e in ex_lock)
+
+
+def test_reverse_oscillating_grid_core_lifecycle():
+    """
+    Verifies the new REVERSE_GRID (多空震荡网格: 跌破开空 / 涨破开多) tracker end-to-end:
+    1) Symmetrical reverse layout: L1..Ln above center (break up -> LONG), S1..Sn below center (break down -> SHORT).
+    2) Fixed per-slot TP + per-slot SL relative to entry price.
+    3) Anti-re-stacking after TP via per-slot `armed` flag + hysteresis re-arm on pullback/bounce.
+    4) Gap-jump closest-level selection, in-flight ENTERING guard, and bypassed-slot disarming.
+    5) Net-mode mutual exclusion, EMA trend_bias filtering, post-SL cooldown, flat auto-recenter,
+       and export_state / restore_state persistence.
+    """
+    from backend.grid_engine import LongShortGridTracker
+    from backend.math_engine import mono_ms
+    from backend.models import is_grid_strategy
+
+    assert is_grid_strategy("REVERSE_GRID") is True
+
+    cfg = SymbolStrategy(
+        symbol="SOL/USDT:USDT",
+        strategy_type="REVERSE_GRID",
+        grid_side_mode="LONG_SHORT",
+        grid_levels=3,
+        grid_step_pct=0.008,
+        grid_take_profit_pct=0.0085,
+        grid_range_pct=0.028,
+        grid_stop_loss_pct=0.038,
+        order_usdt=20.0,
+        leverage=5,
+        price_precision=2,
+        qty_precision=2,
+        grid_recenter_enabled=True,
+    )
+    trk = LongShortGridTracker("SOL/USDT:USDT")
+    trk.sync_config(cfg, current_mid=100.00)
+
+    assert trk.active_grid_mode == "REVERSE_OSCILLATING"
+    assert trk.levels["L1"]["trigger_price"] == 100.80
+    assert trk.levels["L2"]["trigger_price"] == 101.60
+    assert trk.levels["L3"]["trigger_price"] == 102.40
+    assert trk.levels["S1"]["trigger_price"] == 99.20
+    assert trk.levels["S2"]["trigger_price"] == 98.40
+    assert trk.levels["S3"]["trigger_price"] == 97.60
+    assert all(lv["armed"] is True for lv in trk.levels.values())
+
+    # Snapshot orders from highest price (L3) down to lowest price (S3)
+    snap = trk.get_snapshot()
+    assert snap["active_grid_mode"] == "REVERSE_OSCILLATING"
+    assert [lv["slot_id"] for lv in snap["levels"]] == ["L3", "L2", "L1", "S1", "S2", "S3"]
+
+    # 1) Break UP above L1 (100.80) -> opens LONG L1!
+    en1, ex1 = trk.evaluate_tick(100.80, 100.82, 100.81, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert ex1 == []
+    assert [e["slot_id"] for e in en1] == ["L1"]
+    assert en1[0]["side"] == "LONG"
+
+    # While L1 is ENTERING, next tick does not double-fire same side
+    en_inflight, _ = trk.evaluate_tick(101.62, 101.64, 101.63, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert en_inflight == []
+
+    trk.mark_entry_filled("L1", 100.82, 0.20, 2.0, 0.1, cfg, round_trip_fee=0.0007)
+    assert trk.levels["L1"]["armed"] is False
+    assert trk.levels["L1"]["tp_price"] == round(100.82 * (1.0 + 0.0085 + 0.0007), 2)  # 101.75
+    assert trk.levels["L1"]["sl_price"] == round(100.82 * (1.0 - 0.038), 2)            # 96.99
+
+    # 2) Break UP above L2 (101.60) -> opens LONG L2!
+    en2, _ = trk.evaluate_tick(101.62, 101.65, 101.635, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert [e["slot_id"] for e in en2] == ["L2"]
+    trk.mark_entry_filled("L2", 101.65, 0.20, 2.0, 0.1, cfg, round_trip_fee=0.0007)
+
+    # 3) Price hits L1 TP (101.75) -> L1 exits with GRID_TP!
+    _, ex_l1 = trk.evaluate_tick(101.78, 101.80, 101.79, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert [e["slot_id"] for e in ex_l1] == ["L1"]
+    assert ex_l1[0]["exit_reason"] == "GRID_TP"
+    trk.mark_exited("L1", 0.17, is_sl=False)
+    assert trk.levels["L1"]["armed"] is False
+
+    # Clear L1 1.2s cooldown and stay above L1 at 101.85 -> L1 MUST NOT spuriously re-open!
+    trk.levels["L1"]["cooldown_until_mono"] = 0.0
+    trk.levels["L1"]["last_closed_mono"] = 0.0
+    en_no_restack, _ = trk.evaluate_tick(101.84, 101.86, 101.85, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert en_no_restack == []
+
+    # 4) Price pulls back below L1 (100.80 * (1 - 0.002) = 100.598) -> L1 re-arms!
+    en_pull, _ = trk.evaluate_tick(100.50, 100.55, 100.525, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert en_pull == []
+    assert trk.levels["L1"]["armed"] is True
+
+    # Price breaks UP across L1 (100.80) again while L2 is still OPEN at 101.65 (distance 0.79% >= 0.64%) -> L1 re-enters!
+    en_re, _ = trk.evaluate_tick(100.81, 100.83, 100.82, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert [e["slot_id"] for e in en_re] == ["L1"]
+    trk.mark_entry_missed("L1")
+    assert trk.levels["L1"]["status"] == "IDLE"
+    assert trk.levels["L1"]["armed"] is True  # Miss preserves armed state!
+
+    # 5) Net-mode mutual exclusion: L2 is OPEN (LONG), so dropping below S1 (99.20) is blocked in net_mode
+    en_net, _ = trk.evaluate_tick(99.15, 99.18, 99.165, cfg, is_net_mode=True, round_trip_fee=0.0007)
+    assert en_net == []
+
+    # In hedge mode (is_net_mode=False), dropping below S1 (99.20) opens SHORT S1!
+    en_s1, _ = trk.evaluate_tick(99.15, 99.18, 99.165, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert [e["slot_id"] for e in en_s1] == ["S1"]
+    assert en_s1[0]["side"] == "SHORT"
+    trk.mark_entry_filled("S1", 99.15, 0.20, 2.0, 0.1, cfg, round_trip_fee=0.0007)
+    assert trk.levels["S1"]["armed"] is False
+    assert trk.levels["S1"]["tp_price"] == round(99.15 * (1.0 - 0.0085 - 0.0007), 2)  # 98.24
+    assert trk.levels["S1"]["sl_price"] == round(99.15 * (1.0 + 0.038), 2)            # 102.92
+
+    # S1 hits TP at 98.20!
+    _, ex_s1 = trk.evaluate_tick(98.18, 98.20, 98.19, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert [e["slot_id"] for e in ex_s1] == ["S1"]
+    assert ex_s1[0]["exit_reason"] == "GRID_TP"
+    trk.mark_exited("S1", 0.17, is_sl=False)
+    trk.levels["S1"]["cooldown_until_mono"] = 0.0
+    trk.levels["S1"]["last_closed_mono"] = 0.0
+    assert trk.levels["S1"]["armed"] is False
+
+    # Export & restore state preserves active_grid_mode, open L2, and disarmed S1!
+    exported = trk.export_state()
+    assert exported["active_grid_mode"] == "REVERSE_OSCILLATING"
+    assert "S1" in exported["disarmed_slots"]
+    trk_restored = LongShortGridTracker("SOL/USDT:USDT")
+    trk_restored.restore_state(exported, cfg)
+    assert trk_restored.active_grid_mode == "REVERSE_OSCILLATING"
+    assert trk_restored.levels["L2"]["status"] == "OPEN"
+    assert trk_restored.levels["S1"]["armed"] is False
+    assert trk_restored.levels["L1"]["armed"] is True
+
+    # 6) Stop-loss on L2 (entry 101.65, sl = 97.79) triggers GRID_SL and engages 120s post-SL cooldown
+    now_pre = mono_ms()
+    _, ex_sl = trk_restored.evaluate_tick(97.70, 97.75, 97.725, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert [e["slot_id"] for e in ex_sl] == ["L2"]
+    assert ex_sl[0]["exit_reason"] == "GRID_SL"
+    trk_restored.mark_exited("L2", -0.76, is_sl=True)
+    assert trk_restored._post_sl_cooldown_until_mono >= now_pre + 110_000.0
+    # During cooldown, flat drift outside range does NOT prematurely recenter or enter!
+    en_cd, _ = trk_restored.evaluate_tick(96.00, 96.04, 96.02, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert en_cd == []
+    assert trk_restored.center_price == 100.00
+
+    # Once cooldown expires & flat outside range -> auto-recenters cleanly with all slots armed!
+    trk_restored._post_sl_cooldown_until_mono = 0.0
+    en_rc, ex_rc = trk_restored.evaluate_tick(96.00, 96.04, 96.02, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert en_rc == [] and ex_rc == []
+    assert trk_restored.center_price == 96.02
+    assert all(lv["armed"] is True for lv in trk_restored.levels.values())
+
+    # 7) Gap jump across multiple levels (100.0 -> 101.70) picks closest crossed L2 and disarms bypassed L1 on fill!
+    trk_gap = LongShortGridTracker("SOL/USDT:USDT")
+    trk_gap.sync_config(cfg, current_mid=100.00)
+    en_gap, _ = trk_gap.evaluate_tick(101.68, 101.70, 101.69, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert [e["slot_id"] for e in en_gap] == ["L2"]
+    trk_gap.mark_entry_filled("L2", 101.70, 0.20, 2.0, 0.1, cfg, round_trip_fee=0.0007)
+    assert trk_gap.levels["L1"]["armed"] is False  # Bypassed inner L1 disarmed!
+
+    # 8) EMA trend_bias filter: BEAR suppresses upward LONG breakouts but allows downward SHORT breakdowns
+    trk_bias = LongShortGridTracker("SOL/USDT:USDT")
+    trk_bias.sync_config(cfg, current_mid=100.00)
+    bear_bbw = {"timeframe": "15m", "bbw_pct": 2.5, "bbw_percentile": 45.0, "trend_bias": "BEAR"}
+    en_bear_up, _ = trk_bias.evaluate_tick(100.82, 100.85, 100.835, cfg, is_net_mode=False, bbw_info=bear_bbw)
+    assert en_bear_up == []
+    en_bear_dn, _ = trk_bias.evaluate_tick(99.15, 99.18, 99.165, cfg, is_net_mode=False, bbw_info=bear_bbw)
+    assert [e["slot_id"] for e in en_bear_dn] == ["S1"]
+
+
+def test_reverse_grid_engine_db_api_and_batch_e2e():
+    """
+    Full-stack integration test for REVERSE_GRID (多空震荡网格):
+    - SQLite persistence (`upsert_symbol_sync` / `load_symbols_sync`)
+    - Engine SHADOW round-trip execution (`_handle_follower_bbo` -> entry -> TP exit -> realized net PnL)
+    - `_get_grid_rt_fee` Maker Post-Only fee discount
+    - `validate_and_batch_update_symbols` with `strategy_filter="REVERSE_GRID"` & `"ALL_GRID"`
+    - FastAPI `/api/symbol/update`, `/api/symbols`, `/api/stats`, `/api/symbols/batch-update`
+    """
+    from backend.sniper_engine import BidirectionalSniperEngine
+    from backend.models import BatchSymbolUpdateRequest
+
+    async def _run_engine_e2e():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adb = AsyncDatabaseManager(db_path=os.path.join(tmpdir, "reverse_e2e.db"))
+            adb.init_sync()
+            adb.ensure_user_workspace_sync(77)
+
+            cfg = SymbolStrategy(
+                symbol="DOGE/USDT:USDT",
+                strategy_type="REVERSE_GRID",
+                grid_side_mode="LONG_SHORT",
+                grid_levels=3,
+                grid_step_pct=0.008,
+                grid_take_profit_pct=0.0085,
+                grid_range_pct=0.030,
+                grid_stop_loss_pct=0.025,  # Valid per-slot SL (< range=3.0%, > step=0.8%)!
+                order_usdt=25.0,
+                leverage=5,
+                price_precision=4,
+                qty_precision=1,
+                use_post_only_tp=True,
+                is_running=True,
+            )
+            adb.upsert_symbol_sync(cfg, user_id=77)
+            loaded = {s.symbol: s for s in adb.load_symbols_sync(user_id=77)}
+            assert loaded["DOGE/USDT:USDT"].strategy_type == "REVERSE_GRID"
+
+            eng = BidirectionalSniperEngine(adb, user_id=77)
+            eng.risk_config.trading_mode = "SHADOW"
+            eng.risk_config.shadow_base_latency_ms = 0.0
+            eng.risk_config.shadow_latency_jitter_ms = 0.0
+            eng.risk_config.shadow_adverse_selection_prob = 0.0
+            eng.trading_active_by_mode["SHADOW"] = True
+            eng._register_symbol_internal(cfg)
+
+            # Maker Post-Only fee applies cleanly to REVERSE_OSCILLATING
+            _, f_ex = eng.get_leader_And_follower_cfg()
+            rt_fee = eng._get_grid_rt_fee(cfg, "REVERSE_OSCILLATING", f_ex)
+            assert abs(rt_fee - (float(f_ex["taker_fee"]) + float(f_ex["maker_fee"]))) < 1e-9
+
+            # Seed center at 0.2000
+            eng._handle_follower_bbo("DOGE/USDT:USDT", 0.1999, 0.2001, 10000.0, 10000.0)
+            trk = eng.grid_trackers["DOGE/USDT:USDT"]
+            assert trk.active_grid_mode == "REVERSE_OSCILLATING"
+            assert trk.levels["L1"]["trigger_price"] == 0.2016
+            assert trk.levels["S1"]["trigger_price"] == 0.1984
+
+            # 1) Break UP past L1 (0.2016) -> opens LONG L1 -> breaks L2 (0.2032) -> L1 hits TP -> L2 hits TP!
+            eng._handle_follower_bbo("DOGE/USDT:USDT", 0.2016, 0.2017, 10000.0, 10000.0)
+            await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
+            assert "DOGE/USDT:USDT:L1" in eng.active_grid_positions
+            l1_pos = eng.active_grid_positions["DOGE/USDT:USDT:L1"]
+            assert l1_pos["side"] == "LONG"
+            assert l1_pos["strategy_type"] == "REVERSE_GRID"
+            assert l1_pos["grid_mode"] == "REVERSE_OSCILLATING"
+            assert l1_pos["tp_price"] > l1_pos["entry_price"]
+            assert l1_pos["sl_price"] < l1_pos["entry_price"]
+
+            # Price rises to 0.2033 -> opens LONG L2 (0.2032) while L1 stays open
+            eng._handle_follower_bbo("DOGE/USDT:USDT", 0.2032, 0.2033, 10000.0, 10000.0)
+            await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
+            assert "DOGE/USDT:USDT:L2" in eng.active_grid_positions
+            l2_pos = eng.active_grid_positions["DOGE/USDT:USDT:L2"]
+
+            # Price hits L1 TP -> L1 closes profitable; L1 is disarmed so it does NOT restack
+            tp_l1 = l1_pos["tp_price"]
+            eng._handle_follower_bbo("DOGE/USDT:USDT", tp_l1 + 0.0001, tp_l1 + 0.0002, 10000.0, 10000.0)
+            await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
+            assert "DOGE/USDT:USDT:L1" not in eng.active_grid_positions
+            assert trk.levels["L1"]["armed"] is False
+            assert eng.stats_by_mode["SHADOW"]["win_count"] == 1
+            assert eng.stats_by_mode["SHADOW"]["total_net_pnl"] > 0
+
+            # Complete L2 TP cleanly so long side is flat (using L3's trigger > tp_l2 or recentering cleanly)
+            tp_l2 = l2_pos["tp_price"]
+            # Disarm L3 so we cleanly harvest L2 and stay flat for the downward SHORT test
+            trk.levels["L3"]["armed"] = False
+            eng._handle_follower_bbo("DOGE/USDT:USDT", tp_l2 + 0.0001, tp_l2 + 0.0002, 10000.0, 10000.0)
+            await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
+            assert "DOGE/USDT:USDT:L2" not in eng.active_grid_positions
+            assert eng.stats_by_mode["SHADOW"]["win_count"] == 2
+            assert eng.stats_by_mode["SHADOW"]["total_net_pnl"] > 0
+
+            # 2) Break DOWN past S1 (0.1984) -> opens SHORT S1 -> breaks S2 (0.1968) -> S1 & S2 both close profitable!
+            eng._handle_follower_bbo("DOGE/USDT:USDT", 0.1983, 0.1984, 10000.0, 10000.0)
+            await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
+            assert "DOGE/USDT:USDT:S1" in eng.active_grid_positions
+            s1_pos = eng.active_grid_positions["DOGE/USDT:USDT:S1"]
+            assert s1_pos["side"] == "SHORT"
+            assert s1_pos["tp_price"] < s1_pos["entry_price"]
+            assert s1_pos["sl_price"] > s1_pos["entry_price"]
+
+            tp_s1 = s1_pos["tp_price"]
+            eng._handle_follower_bbo("DOGE/USDT:USDT", tp_s1 - 0.0002, tp_s1 - 0.0001, 10000.0, 10000.0)
+            await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
+            assert "DOGE/USDT:USDT:S1" not in eng.active_grid_positions
+            assert "DOGE/USDT:USDT:S2" in eng.active_grid_positions  # Price also crossed S2 (0.1968)!
+            s2_pos = eng.active_grid_positions["DOGE/USDT:USDT:S2"]
+
+            # Harvest S2 TP cleanly (with S3 below TP range) -> all slots flat and 4 profitable round-trips!
+            tp_s2 = s2_pos["tp_price"]
+            eng._handle_follower_bbo("DOGE/USDT:USDT", tp_s2 - 0.0002, tp_s2 - 0.0001, 10000.0, 10000.0)
+            await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
+            assert "DOGE/USDT:USDT:S2" not in eng.active_grid_positions
+            # Close S3 if triggered at tp_s2 <= 0.1952
+            if "DOGE/USDT:USDT:S3" in eng.active_grid_positions:
+                tp_s3 = eng.active_grid_positions["DOGE/USDT:USDT:S3"]["tp_price"]
+                eng._handle_follower_bbo("DOGE/USDT:USDT", tp_s3 - 0.0002, tp_s3 - 0.0001, 10000.0, 10000.0)
+                await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
+            assert not eng.active_grid_positions
+            assert eng.stats_by_mode["SHADOW"]["win_count"] >= 4
+            assert eng.stats_by_mode["SHADOW"]["loss_count"] == 0
+            assert eng.stats_by_mode["SHADOW"]["total_net_pnl"] > 0
+
+            # 3) Dashboard snapshot exposes REVERSE_GRID & REVERSE_OSCILLATING properly
+            dash = eng.build_dashboard_snapshot(radar_symbol="DOGE/USDT:USDT")
+            doge_tel = dash["telemetry"]["DOGE/USDT:USDT"]
+            assert doge_tel["strategy_type"] == "REVERSE_GRID"
+            assert doge_tel["grid"]["active_grid_mode"] == "REVERSE_OSCILLATING"
+
+            # 4) Batch validate with strategy_filter="REVERSE_GRID": SL=2.5% (< range 3.0%, > step 0.8%) has ZERO issues!
+            val_ok = eng.validate_and_batch_update_symbols(
+                BatchSymbolUpdateRequest(action="validate", strategy_filter="REVERSE_GRID")
+            )
+            assert val_ok["scanned_count"] == 1
+            assert val_ok["anomaly_count"] == 0
+
+            # Tight SL <= step IS flagged & auto-fixed by batch update!
+            eng.strategies["DOGE/USDT:USDT"].grid_stop_loss_pct = 0.006  # <= step 0.008!
+            val_bad = eng.validate_and_batch_update_symbols(
+                BatchSymbolUpdateRequest(action="validate", strategy_filter="REVERSE_GRID")
+            )
+            assert val_bad["anomaly_count"] == 1
+            assert any("单格止损" in iss for iss in val_bad["items"][0]["issues"])
+
+            apply_fix = eng.validate_and_batch_update_symbols(
+                BatchSymbolUpdateRequest(action="apply", strategy_filter="REVERSE_GRID", auto_fix_anomalies=True)
+            )
+            assert apply_fix["updated_count"] == 1
+            assert eng.strategies["DOGE/USDT:USDT"].grid_stop_loss_pct > eng.strategies["DOGE/USDT:USDT"].grid_step_pct
+
+            # 5) Manual recenter works cleanly with 多空震荡 mode label
+            ok_rc, msg_rc = eng.recenter_symbol_grid("DOGE/USDT:USDT")
+            assert ok_rc is True
+            assert "多空震荡" in msg_rc
+
+    asyncio.run(_run_engine_e2e())
+
+    # 6) Full FastAPI HTTP round-trip for REVERSE_GRID (/api/symbol/update, /api/symbols, /api/symbols/batch-update, /api/stats)
+    import backend.main as main_mod
+    from backend.engine_manager import EngineManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_db = os.path.join(tmpdir, "reverse_api.db")
+        orig_db_path = main_mod.db_manager.db_path
+        orig_um_path = main_mod.user_manager.db_path
+        orig_em = main_mod.engine_manager
+        try:
+            rate_limiter._buckets.clear()
+            main_mod.user_manager.db_path = test_db
+            main_mod.user_manager.init_sync()
+            main_mod.db_manager.db_path = test_db
+            main_mod.db_manager.init_sync()
+            main_mod.engine_manager = EngineManager(main_mod.db_manager, get_user_fn=main_mod.user_manager.get_user_by_id)
+
+            with (
+                patch.object(main_mod.engine_manager.gateway, "start", new=AsyncMock(return_value=None)),
+                patch.object(main_mod.engine_manager.gateway, "stop", new=AsyncMock(return_value=None)),
+                patch.object(main_mod.engine_manager.gateway, "fetch_exchange_instruments", new=AsyncMock(return_value=True)),
+                patch.object(main_mod.engine_manager.gateway, "fetch_real_bbo_snapshot", new=AsyncMock(return_value=True)),
+                patch.object(main_mod.payment_monitor, "start", return_value=None),
+                patch.object(main_mod.payment_monitor, "stop", new=AsyncMock(return_value=None)),
+            ):
+                with TestClient(main_mod.app) as client:
+                    reg = client.post(
+                        "/api/auth/register",
+                        json={"username": "rev_tester", "password": "password123"},
+                        headers={"X-Real-IP": "198.51.100.77"},
+                    )
+                    assert reg.status_code == 200
+                    tok = reg.json()["token"]
+                    uid = reg.json()["user"]["id"]
+                    conn = sqlite3.connect(test_db)
+                    conn.execute(
+                        "UPDATE users SET vip_tier='季度旗舰版会员', vip_expires_at=? WHERE id=?",
+                        (int(time.time()) + 86400 * 30, uid),
+                    )
+                    conn.commit()
+                    conn.close()
+
+                    hdr = {"Authorization": f"Bearer {tok}"}
+                    upd = client.post(
+                        "/api/symbol/update",
+                        headers=hdr,
+                        json={
+                            "symbol": "XRP/USDT:USDT",
+                            "strategy_type": "REVERSE_GRID",
+                            "grid_side_mode": "LONG_SHORT",
+                            "grid_levels": 4,
+                            "grid_step_pct": 0.006,
+                            "grid_take_profit_pct": 0.0065,
+                            "grid_range_pct": 0.03,
+                            "grid_stop_loss_pct": 0.02,
+                            "order_usdt": 30.0,
+                            "leverage": 5,
+                            "price_precision": 4,
+                            "qty_precision": 1,
+                            "is_running": True,
+                        },
+                    )
+                    assert upd.status_code == 200, upd.text
+                    xrp_cfg = next(s for s in upd.json()["strategies"] if s["symbol"] == "XRP/USDT:USDT")
+                    assert xrp_cfg["strategy_type"] == "REVERSE_GRID"
+
+                    # /api/symbols returns persisted REVERSE_GRID
+                    syms = client.get("/api/symbols", headers=hdr)
+                    assert syms.status_code == 200
+                    assert next(s for s in syms.json()["strategies"] if s["symbol"] == "XRP/USDT:USDT")["strategy_type"] == "REVERSE_GRID"
+
+                    # /api/symbols/batch-update filters REVERSE_GRID cleanly
+                    b_res = client.post(
+                        "/api/symbols/batch-update",
+                        headers=hdr,
+                        json={"action": "validate", "strategy_filter": "REVERSE_GRID"},
+                    )
+                    assert b_res.status_code == 200, b_res.text
+                    assert b_res.json()["scanned_count"] == 1
+                    assert b_res.json()["items"][0]["symbol"] == "XRP/USDT:USDT"
+                    assert b_res.json()["items"][0]["strategy_type"] == "REVERSE_GRID"
+
+                    # /api/stats telemetry shows REVERSE_GRID & REVERSE_OSCILLATING
+                    st_res = client.get("/api/stats?radar_symbol=XRP/USDT:USDT", headers=hdr)
+                    assert st_res.status_code == 200
+                    xrp_tel = st_res.json()["telemetry"]["XRP/USDT:USDT"]
+                    assert xrp_tel["strategy_type"] == "REVERSE_GRID"
+                    assert xrp_tel["grid"]["active_grid_mode"] == "REVERSE_OSCILLATING"
+        finally:
+            main_mod.db_manager.db_path = orig_db_path
+            main_mod.user_manager.db_path = orig_um_path
+            main_mod.engine_manager = orig_em
+
+
+def test_five_strategy_audit_payoff_asymmetry_fixes_and_idempotency():
+    """
+    Verifies the 5-strategy audit & '亏多赚少' live-data optimizations:
+    1) TREND_GRID solo L1/S1 does NOT prematurely close via profit_lock at +0.34% before reaching L2,
+       and progressively tightens SL at +0.45*step (half-risk) -> +0.80*step (breakeven).
+    2) TREND_GRID L2 pyramid addition does NOT immediately arm profit_lock below L2 at fill time;
+       profit_lock waits until peak clears L2 entry by >= 0.30*step.
+    3) ADAPTIVE_GRID suppresses climax chasing into TREND_BREAKOUT when bbw_percentile > 85%.
+    4) LONG_SHORT_GRID blocks same-tick new entry when GRID_SL fires.
+    5) _finalize_grid_slot_trade & record_trade_async deduplicate identical order_ids.
+    """
+    from backend.grid_engine import LongShortGridTracker
+    from backend.sniper_engine import BidirectionalSniperEngine
+
+    cfg = SymbolStrategy(
+        symbol="SNDK/USDT:USDT",
+        strategy_type="TREND_GRID",
+        grid_side_mode="LONG_SHORT",
+        grid_levels=3,
+        grid_step_pct=0.008,
+        grid_take_profit_pct=0.0085,
+        grid_range_pct=0.028,
+        grid_stop_loss_pct=0.038,
+        order_usdt=20.0,
+        leverage=5,
+        price_precision=2,
+        qty_precision=2,
+        trend_dead_zone_mult=1.25,
+        trend_trailing_mult=1.25,
+        trend_pyramid_decay=True,
+        trend_use_bb_breakout=False,
+    )
+    trk = LongShortGridTracker("SNDK/USDT:USDT")
+    trk.sync_config(cfg, current_mid=100.00)
+    assert trk.levels["L1"]["trigger_price"] == 101.00  # 100 * (1 + 1.25 * 0.8%)
+
+    # 1) Solo L1 enters at 101.00, moves up +0.55% to 101.56 (>= 0.45*0.8%=0.36% half-lock, < 0.80*0.8%=0.64% solo BE lock)
+    en1, _ = trk.evaluate_tick(101.00, 101.02, 101.01, cfg, is_net_mode=True, round_trip_fee=0.0010)
+    assert [e["slot_id"] for e in en1] == ["L1"]
+    trk.mark_entry_filled("L1", 101.00, 0.30, 3.0, 0.1, cfg, round_trip_fee=0.0010)
+    assert trk.levels["L1"]["sl_price"] == 100.00
+
+    _, ex_half = trk.evaluate_tick(101.55, 101.57, 101.56, cfg, is_net_mode=True, round_trip_fee=0.0010)
+    assert ex_half == []
+    # Half-risk step-up tightened L1 SL from 100.00 (-0.99%) to 101.00 * (1 - 0.004) = 100.60 (-0.40%)!
+    assert trk.levels["L1"]["sl_price"] == round(101.00 * (1.0 - 0.50 * 0.008), 2)
+    # Solo L1 trail stop stays at raw_trail (101.55 * (1 - 0.01) = 100.53), NOT choked at +0.34% (101.35)!
+    assert trk.long_trail_stop_price == round(101.55 * (1.0 - 0.01), 2)
+    _, ex_no_crumb = trk.evaluate_tick(101.30, 101.32, 101.31, cfg, is_net_mode=True, round_trip_fee=0.0010)
+    assert ex_no_crumb == []  # Does NOT prematurely close solo L1 for a tiny +0.30% crumb!
+
+    # 2) L2 fills at 101.85: at the instant L2 fills (peak == 101.85), profit_lock MUST NOT arm below L2!
+    trk.mark_entry_filled("L2", 101.85, 0.18, 1.8, 0.1, cfg, round_trip_fee=0.0010)
+    _, ex_l2_fill = trk.evaluate_tick(101.83, 101.85, 101.84, cfg, is_net_mode=True, round_trip_fee=0.0010)
+    assert ex_l2_fill == []
+    assert trk.long_trail_stop_price == round(101.85 * (1.0 - 0.01), 2)  # Raw trail 100.83, not choked at 101.52!
+    # A small 0.35% breathing tick to 101.50 right after L2 fill does NOT force-close L2 at a loss!
+    _, ex_breathe = trk.evaluate_tick(101.49, 101.51, 101.50, cfg, is_net_mode=True, round_trip_fee=0.0010)
+    assert ex_breathe == []
+
+    # 3) ADAPTIVE_GRID climax exhaustion guard (pct_rank=92% > 85% stays in MEAN_REVERSION instead of buying the top)
+    adp_cfg = cfg.model_copy(update={"strategy_type": "ADAPTIVE_GRID"})
+    adp_trk = LongShortGridTracker("SNDK/USDT:USDT")
+    climax_bbw = {
+        "timeframe": "15m",
+        "bbw_pct": 6.5,
+        "bbw_percentile": 92.0,
+        "bb_upper": 105.0,
+        "bb_middle": 100.0,
+        "bb_lower": 95.0,
+        "trend_bias": "BULL",
+        "breakout_expansion": "UP_BREAKOUT",
+    }
+    adp_trk.sync_config(adp_cfg, current_mid=100.0, bbw_info=climax_bbw)
+    assert adp_trk.active_grid_mode == "MEAN_REVERSION"
+
+    # 4) _finalize_grid_slot_trade idempotency guard against duplicate order_id
+    with tempfile.TemporaryDirectory() as tmpdir:
+        adb = AsyncDatabaseManager(db_path=os.path.join(tmpdir, "idem.db"))
+        adb.init_sync()
+        eng = BidirectionalSniperEngine(adb, user_id=4)
+        eng.risk_config.trading_mode = "LIVE"
+        eng._register_symbol_internal(cfg)
+        lv_dummy = dict(trk.levels["L1"])
+        eng._finalize_grid_slot_trade(
+            cfg=cfg,
+            tracker=trk,
+            lv=lv_dummy,
+            exit_avg=102.00,
+            is_maker=False,
+            exit_reason="TREND_BE_SL",
+            order_id="4121924935978430466",
+            latency_ms=12.0,
+            exec_mode="LIVE",
+        )
+        assert eng.stats_by_mode["LIVE"]["win_count"] == 1
+        # Second duplicate callback with the exact same OKX order_id is ignored!
+        eng._finalize_grid_slot_trade(
+            cfg=cfg,
+            tracker=trk,
+            lv=lv_dummy,
+            exit_avg=102.00,
+            is_maker=False,
+            exit_reason="TREND_BE_SL",
+            order_id="4121924935978430466",
+            latency_ms=12.0,
+            exec_mode="LIVE",
+        )
+        assert eng.stats_by_mode["LIVE"]["win_count"] == 1
+
+
+
 
 
 

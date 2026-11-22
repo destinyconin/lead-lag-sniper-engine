@@ -65,12 +65,13 @@ const STATE_LABEL_MAP = {
 const STRATEGY_LABEL_MAP = {
   LEAD_LAG: '脉冲狙击',
   LONG_SHORT_GRID: '传统网格',
+  REVERSE_GRID: '多空震荡',
   TREND_GRID: '顺势网格',
   ADAPTIVE_GRID: 'VCP双模式',
 };
 
 const isGridStrategyType = (st) =>
-  st === 'LONG_SHORT_GRID' || st === 'TREND_GRID' || st === 'ADAPTIVE_GRID';
+  st === 'LONG_SHORT_GRID' || st === 'REVERSE_GRID' || st === 'TREND_GRID' || st === 'ADAPTIVE_GRID';
 
 const calcPyramidWeights = (count, decayEnabled = true) => {
   const n = Math.max(1, Math.min(30, Math.round(Number(count) || 1)));
@@ -134,10 +135,17 @@ const buildGridPreviewAndDiagnostics = (cfg, okxMinNotional = 0, followerMid = 0
 
   const activeMrLegs = legs.filter((l) => !l.clippedInMr);
   const thinnestLeg = legs.reduce((minL, l) => (l.usdt < minL.usdt ? l : minL), legs[0]);
-  // Estimate worst-case full-side stop-loss loss in USDT (average entry to center +/- SL in MR mode, or full budget * SL)
+  // Estimate worst-case full-side stop-loss loss in USDT (average entry to center +/- SL in MR mode, per-slot SL in REVERSE_GRID, or full budget * SL)
   const worstSlLossUsdt =
     st === 'TREND_GRID'
       ? Number((orderUsdt * n * weights[0] * Math.min(sl, dzMult * step) + sideBudget * 0.001).toFixed(2))
+      : st === 'REVERSE_GRID'
+      ? Number(
+          (
+            activeMrLegs.reduce((acc, l) => acc + l.usdt * sl, 0) +
+            activeMrLegs.reduce((acc, l) => acc + l.usdt, 0) * 0.001
+          ).toFixed(2)
+        )
       : Number(
           (
             activeMrLegs.reduce((acc, l) => acc + l.usdt * Math.max(0, sl - l.mrDistPct), 0) +
@@ -173,10 +181,16 @@ const buildGridPreviewAndDiagnostics = (cfg, okxMinNotional = 0, followerMid = 0
       msg: `单格止盈 (${(tp * 100).toFixed(2)}%) 未覆盖双边手续费 (${(effRtFee * 100).toFixed(2)}%)`,
     });
   }
-  if (st !== 'TREND_GRID' && sl <= rng + 1e-6) {
+  if ((st === 'LONG_SHORT_GRID' || st === 'ADAPTIVE_GRID') && sl <= rng + 1e-6) {
     alerts.push({
       severity: 'error',
       msg: `破网硬止损 (${(sl * 100).toFixed(2)}%) ≤ 区间总跨度 (±${(rng * 100).toFixed(2)}%)，未出区间即强平`,
+    });
+  }
+  if (st === 'REVERSE_GRID' && sl <= step + 1e-6) {
+    alerts.push({
+      severity: 'error',
+      msg: `单格硬止损 (${(sl * 100).toFixed(2)}%) ≤ 每格间距 (${(step * 100).toFixed(2)}%)，轻微回撤即触发止损`,
     });
   }
   if (isTrendLike && dzMult * step > rng + 1e-6) {
@@ -228,6 +242,9 @@ const strategyBadgeClass = (st, active = false) => {
   }
   if (st === 'ADAPTIVE_GRID') {
     return active ? 'bg-amber-500 text-white' : 'bg-amber-500/15 text-amber-600 dark:text-amber-300';
+  }
+  if (st === 'REVERSE_GRID') {
+    return active ? 'bg-teal-500 text-white' : 'bg-teal-500/15 text-teal-600 dark:text-teal-300';
   }
   if (st === 'LONG_SHORT_GRID') {
     return active ? 'bg-sky-500 text-white' : 'bg-sky-500/15 text-sky-600 dark:text-sky-400';
@@ -914,11 +931,11 @@ export default function App() {
       price_precision: Math.min(12, Math.max(0, Math.round(Number.isFinite(rawPricePrec) ? rawPricePrec : 4))),
       qty_precision: Math.min(12, Math.max(0, Math.round(Number.isFinite(rawQtyPrec) ? rawQtyPrec : 2))),
       min_qty: Math.max(0.00000001, Number(cfg.min_qty) || 0.1),
-      grid_levels: Math.min(30, Math.max(1, Math.round(Number(cfg.grid_levels ?? 5) || 5))),
-      grid_step_pct: Math.min(0.5, Math.max(0.0001, Number(cfg.grid_step_pct ?? 0.006) || 0.006)),
-      grid_take_profit_pct: Math.min(0.5, Math.max(0.0001, Number(cfg.grid_take_profit_pct ?? 0.0065) || 0.0065)),
-      grid_range_pct: Math.min(0.8, Math.max(0.001, Number(cfg.grid_range_pct ?? 0.05) || 0.05)),
-      grid_stop_loss_pct: Math.min(0.9, Math.max(0.002, Number(cfg.grid_stop_loss_pct ?? 0.08) || 0.08)),
+      grid_levels: Math.min(30, Math.max(1, Math.round(Number(cfg.grid_levels ?? 3) || 3))),
+      grid_step_pct: Math.min(0.5, Math.max(0.0001, Number(cfg.grid_step_pct ?? 0.008) || 0.008)),
+      grid_take_profit_pct: Math.min(0.5, Math.max(0.0001, Number(cfg.grid_take_profit_pct ?? 0.0085) || 0.0085)),
+      grid_range_pct: Math.min(0.8, Math.max(0.001, Number(cfg.grid_range_pct ?? 0.028) || 0.028)),
+      grid_stop_loss_pct: Math.min(0.9, Math.max(0.002, Number(cfg.grid_stop_loss_pct ?? 0.038) || 0.038)),
       sl_trigger_px_type: cfg.sl_trigger_px_type === 'last' ? 'last' : 'mark',
     };
     try {
@@ -1026,14 +1043,14 @@ export default function App() {
         qty_precision: Math.min(12, Math.max(0, Number(vRes.recommended_precision?.qty_precision ?? 2))),
         price_precision: Math.min(12, Math.max(0, Number(vRes.recommended_precision?.price_precision ?? 4))),
         grid_side_mode: 'LONG_SHORT',
-        grid_levels: 5,
-        grid_step_pct: 0.006,
-        grid_take_profit_pct: 0.0045,
-        grid_range_pct: 0.05,
-        grid_stop_loss_pct: 0.08,
+        grid_levels: 3,
+        grid_step_pct: 0.008,
+        grid_take_profit_pct: 0.0085,
+        grid_range_pct: 0.028,
+        grid_stop_loss_pct: 0.038,
         grid_recenter_enabled: true,
-        trend_dead_zone_mult: 2.0,
-        trend_trailing_mult: 1.5,
+        trend_dead_zone_mult: 1.25,
+        trend_trailing_mult: 1.25,
         trend_pyramid_decay: true,
         trend_use_bb_breakout: true,
         bbw_timeframe: '15m',
@@ -1500,23 +1517,26 @@ export default function App() {
     const curRng = Number(base.grid_range_pct ?? 0.05) || 0.05;
     const curSl = Number(base.grid_stop_loss_pct ?? 0.08) || 0.08;
 
+    const isCenterAnchoredSl = base.strategy_type === 'LONG_SHORT_GRID' || base.strategy_type === 'ADAPTIVE_GRID';
     if (field === 'grid_levels' || field === 'grid_step_pct') {
       const nextRng = suggestLinkedGridRange(n, step);
       patch.grid_range_pct = nextRng;
       if (field === 'grid_step_pct' || curTp < step) {
         patch.grid_take_profit_pct = Number(Math.min(0.5, Math.max(step + 0.0005, 0.0012)).toFixed(6));
       }
-      if (curSl <= nextRng + 1e-6) {
+      if (isCenterAnchoredSl && curSl <= nextRng + 1e-6) {
         patch.grid_stop_loss_pct = Number(Math.min(0.9, Math.ceil((nextRng + 0.01) * 1000) / 1000).toFixed(4));
+      } else if (base.strategy_type === 'REVERSE_GRID' && curSl <= step + 1e-6) {
+        patch.grid_stop_loss_pct = Number(Math.min(0.9, Math.ceil(Math.max(step * 2, step + 0.005) * 1000) / 1000).toFixed(4));
       }
     } else if (field === 'grid_stop_loss_pct') {
       const nextSl = Math.max(0.002, Math.min(0.9, Number(rawVal) || 0.05));
-      if (curRng >= nextSl - 1e-6) {
+      if (isCenterAnchoredSl && curRng >= nextSl - 1e-6) {
         patch.grid_range_pct = Number(Math.max(0.005, Math.floor(nextSl * 0.8 * 1000) / 1000).toFixed(4));
       }
     } else if (field === 'grid_range_pct') {
       const nextRng = Math.max(0.001, Math.min(0.8, Number(rawVal) || 0.05));
-      if (curSl <= nextRng + 1e-6) {
+      if (isCenterAnchoredSl && curSl <= nextRng + 1e-6) {
         patch.grid_stop_loss_pct = Number(Math.min(0.9, Math.ceil((nextRng + 0.01) * 1000) / 1000).toFixed(4));
       }
     }
@@ -1525,14 +1545,25 @@ export default function App() {
 
   const handleAutoAlignCurrentGrid = () => {
     if (!currentStrategy || !isGridStrategyType(currentStrategy.strategy_type)) return;
+    const st = currentStrategy.strategy_type;
+    const isTrendLike = st === 'TREND_GRID' || st === 'ADAPTIVE_GRID';
+    const isCenterAnchoredSl = st === 'LONG_SHORT_GRID' || st === 'ADAPTIVE_GRID';
     const n = Math.max(1, Math.min(30, Math.round(Number(currentStrategy.grid_levels ?? 5) || 5)));
     const step = Math.max(0.0005, Number(currentStrategy.grid_step_pct ?? 0.006) || 0.006);
     const dz = Math.max(0.5, Number(currentStrategy.trend_dead_zone_mult ?? 2.0) || 2.0);
-    const minRng = Math.max(suggestLinkedGridRange(n, step), dz * step * 1.3);
+    const minRng = isTrendLike
+      ? Math.max(suggestLinkedGridRange(n, step), dz * step * 1.3)
+      : suggestLinkedGridRange(n, step);
     const nextRng = Math.min(0.8, Math.ceil(minRng * 1000) / 1000);
     const nextTp = Number(Math.max(Number(currentStrategy.grid_take_profit_pct ?? 0.0065) || 0.0065, step + 0.0005).toFixed(6));
     const curSl = Number(currentStrategy.grid_stop_loss_pct ?? 0.08) || 0.08;
-    const nextSl = curSl <= nextRng + 0.002 ? Number(Math.min(0.9, Math.ceil((nextRng + 0.01) * 1000) / 1000).toFixed(4)) : curSl;
+    const nextSl = isCenterAnchoredSl
+      ? curSl <= nextRng + 0.002
+        ? Number(Math.min(0.9, Math.ceil((nextRng + 0.01) * 1000) / 1000).toFixed(4))
+        : curSl
+      : st === 'REVERSE_GRID' && curSl <= step + 1e-6
+      ? Number(Math.min(0.9, Math.ceil(Math.max(step * 2, step + 0.005) * 1000) / 1000).toFixed(4))
+      : curSl;
     updateCurrentStrategyField({
       grid_range_pct: nextRng,
       grid_take_profit_pct: nextTp,
@@ -2460,8 +2491,18 @@ export default function App() {
                         const stratType = pos.strategy_type || (pos.managed_by_strategy ? 'LEAD_LAG' : 'UNMANAGED');
                         const isTrendPos =
                           pos.grid_mode === 'TREND_BREAKOUT' || stratType === 'TREND_GRID';
+                        const isReverseOscPos =
+                          pos.grid_mode === 'REVERSE_OSCILLATING' || stratType === 'REVERSE_GRID';
                         const stratLabel = isGridStrategyType(stratType)
-                          ? `${isTrendPos ? '顺势突破' : stratType === 'ADAPTIVE_GRID' ? 'VCP震荡' : '传统网格'}${
+                          ? `${
+                              isTrendPos
+                                ? '顺势突破'
+                                : isReverseOscPos
+                                ? '多空震荡'
+                                : stratType === 'ADAPTIVE_GRID'
+                                ? 'VCP震荡'
+                                : '传统网格'
+                            }${
                               pos.grid_slot_id ? ` · ${pos.grid_slot_id}` : ''
                             }`
                           : stratType === 'LEAD_LAG'
@@ -2782,6 +2823,7 @@ export default function App() {
                     <option value="ADAPTIVE_GRID">仅 VCP 双模式</option>
                     <option value="TREND_GRID">仅顺势突破网格</option>
                     <option value="LONG_SHORT_GRID">仅传统震荡网格</option>
+                    <option value="REVERSE_GRID">仅多空震荡网格 (反向)</option>
                   </select>
                 </div>
                 <div>
@@ -3168,6 +3210,8 @@ export default function App() {
                               ? '顺势突破网格 · 涨破死区/布林带上轨追多、跌破下轨追空，递减金字塔重底仓 + 利弗莫尔保本上移止损 + 移动追踪止盈'
                               : currentStrategy.strategy_type === 'ADAPTIVE_GRID'
                               ? 'VCP 双模式智能网格 · 常规震荡跑传统网格吃70%震荡利润；15m/1H BBW 极度压缩时在空仓重锚自动切顺势突破抓30%大单边'
+                              : currentStrategy.strategy_type === 'REVERSE_GRID'
+                              ? '多空震荡网格 · 在中心价格上下反向对称铺网（跌破网格开空、涨破网格开多），单格固定止盈 + 穿越重装防重复堆仓'
                               : currentStrategy.strategy_type === 'LONG_SHORT_GRID'
                               ? '传统多空动态网格 · 在中心价格上下对称铺网（跌破接多、涨破开空），逐格固定止盈捕获震荡利润'
                               : '跨所脉冲狙击策略 · 独立毫秒级脉冲检测窗口、保留价滑点保护与动态收敛系数'}
@@ -3216,15 +3260,15 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Per-Symbol Strategy Type Selector (4 Strategies incl. Reverse Trend & Adaptive Dual-Mode) */}
+                    {/* Per-Symbol Strategy Type Selector (5 Strategies incl. Reverse Oscillating Grid, Trend & Adaptive Dual-Mode) */}
                     <div className="surface-subtle p-3.5 sm:p-4 flex flex-col gap-3">
                       <div className="text-xs">
-                        <div className="font-bold text-main">该币种运行策略选择（支持传统网格 / 顺势突破 / VCP 双模式智能切换）</div>
+                        <div className="font-bold text-main">该币种运行策略选择（支持传统网格 / 多空震荡网格 / 顺势突破 / VCP 双模式）</div>
                         <div className="text-[11px] text-dim mt-0.5">
-                          可为不同币种独立指定策略，点击「保存策略参数」即时生效；选择「VCP 双模式」将在空仓重锚时按 15m/1H 布林带宽度自动切换
+                          可为不同币种独立指定策略，点击「保存策略参数」即时生效；选择「多空震荡网格」为跌破开空/涨破开多，选择「VCP 双模式」将在空仓重锚时按 15m/1H 布林带宽度自动切换
                         </div>
                       </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-2">
                         <button
                           type="button"
                           onClick={() => updateCurrentStrategyField({ strategy_type: 'LEAD_LAG' })}
@@ -3254,6 +3298,21 @@ export default function App() {
                             <span>传统震荡网格</span>
                           </div>
                           <div className="text-[10px] opacity-80 font-normal mt-0.5">跌破接多 / 涨破开空</div>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => updateCurrentStrategyField({ strategy_type: 'REVERSE_GRID' })}
+                          className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold transition text-left ${
+                            currentStrategy.strategy_type === 'REVERSE_GRID'
+                              ? 'bg-teal-600 text-white shadow-sm'
+                              : 'surface-card text-sub hover:text-main'
+                          }`}
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <Layers className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
+                            <span>多空震荡网格</span>
+                          </div>
+                          <div className="text-[10px] opacity-80 font-normal mt-0.5">跌破开空 / 涨破开多</div>
                         </button>
                         <button
                           type="button"
@@ -3381,7 +3440,11 @@ export default function App() {
 
                           {currentStrategy.strategy_type !== 'TREND_GRID' && (
                             <div>
-                              <label className="font-bold text-main block mb-2">传统模式单格止盈目标 (%)</label>
+                              <label className="font-bold text-main block mb-2">
+                                {currentStrategy.strategy_type === 'REVERSE_GRID'
+                                  ? '多空震荡单格止盈目标 (%)'
+                                  : '传统模式单格止盈目标 (%)'}
+                              </label>
                               <PercentNumberInput
                                 step="0.05"
                                 valueRatio={currentStrategy.grid_take_profit_pct}
@@ -3432,7 +3495,11 @@ export default function App() {
                           </div>
 
                           <div>
-                            <label className="font-bold text-main block mb-2">破网硬止损上限 (% · 标的价格)</label>
+                            <label className="font-bold text-main block mb-2">
+                              {currentStrategy.strategy_type === 'REVERSE_GRID'
+                                ? '单格硬止损上限 (% · 相对开仓价)'
+                                : '破网硬止损上限 (% · 标的价格)'}
+                            </label>
                             <PercentNumberInput
                               step="0.2"
                               valueRatio={currentStrategy.grid_stop_loss_pct}
@@ -3558,7 +3625,9 @@ export default function App() {
                                 }`}
                               >
                                 {lg.slot}: {lg.usdt.toFixed(1)}U
-                                {currentStrategy.strategy_type !== 'LONG_SHORT_GRID' && (currentStrategy.trend_pyramid_decay ?? true)
+                                {(currentStrategy.strategy_type === 'TREND_GRID' ||
+                                  currentStrategy.strategy_type === 'ADAPTIVE_GRID') &&
+                                (currentStrategy.trend_pyramid_decay ?? true)
                                   ? ` (${lg.weightPct}%)`
                                   : ` (±${(lg.mrDistPct * 100).toFixed(2)}%)`}
                                 {lg.clippedInMr ? ' [被裁切]' : lg.belowMin ? ' [不足最小额]' : ''}
@@ -3741,6 +3810,7 @@ export default function App() {
                         {snapshot.telemetry?.[currentStrategy.symbol]?.grid && (() => {
                           const gSnap = snapshot.telemetry[currentStrategy.symbol].grid;
                           const isTrendActive = gSnap.active_grid_mode === 'TREND_BREAKOUT';
+                          const isReverseOscActive = gSnap.active_grid_mode === 'REVERSE_OSCILLATING';
                           const gridPrec = Math.min(
                             12,
                             Math.max(0, Math.round(Number(currentStrategy.price_precision ?? 4) || 4))
@@ -3760,10 +3830,16 @@ export default function App() {
                                     className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
                                       isTrendActive
                                         ? 'bg-violet-500/15 text-violet-600 dark:text-violet-300'
+                                        : isReverseOscActive
+                                        ? 'bg-teal-500/15 text-teal-600 dark:text-teal-300'
                                         : 'bg-sky-500/15 text-sky-600 dark:text-sky-400'
                                     }`}
                                   >
-                                    {isTrendActive ? '当前激活：顺势突破模式' : '当前激活：传统震荡模式'}
+                                    {isTrendActive
+                                      ? '当前激活：顺势突破模式'
+                                      : isReverseOscActive
+                                      ? '当前激活：多空震荡模式 (跌破空/涨破多)'
+                                      : '当前激活：传统震荡模式'}
                                   </span>
                                   {gSnap.bbw_pct !== null && gSnap.bbw_pct !== undefined && (
                                     <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-amber-500/15 text-amber-700 dark:text-amber-300">
@@ -3857,6 +3933,20 @@ export default function App() {
                                         <div className="text-[10px] text-dim">
                                           仓位 {Number(lv.order_usdt || 0).toFixed(1)}U ({Number(lv.weight_pct || 0).toFixed(0)}%)
                                         </div>
+                                      </>
+                                    ) : isReverseOscActive ? (
+                                      <>
+                                        <div className="text-[10px] text-emerald-600 dark:text-emerald-400">
+                                          止盈 {Number(lv.tp_price).toFixed(gridPrec)}
+                                        </div>
+                                        <div className="text-[10px] text-rose-500">
+                                          止损 {Number(lv.sl_price || 0).toFixed(gridPrec)}
+                                        </div>
+                                        {lv.status === 'IDLE' && lv.armed === false && (
+                                          <div className="text-[9px] font-sans text-amber-600 dark:text-amber-300 mt-0.5">
+                                            {lv.side === 'LONG' ? '待回踩重装' : '待反弹重装'}
+                                          </div>
+                                        )}
                                       </>
                                     ) : (
                                       <div className="text-[10px] text-dim">

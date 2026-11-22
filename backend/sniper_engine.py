@@ -154,6 +154,7 @@ class BidirectionalSniperEngine:
         }
         self._last_live_cred_warn_mono: float = 0.0
         self._grid_block_log_ts: Dict[str, float] = {}
+        self._finalized_grid_order_ids: deque[str] = deque(maxlen=2000)
 
         self.executor = ExecutionAdapter(
             get_math_state=lambda sym: self.math_states.get(sym),
@@ -721,7 +722,7 @@ class BidirectionalSniperEngine:
     def _get_grid_rt_fee(cfg: SymbolStrategy, active_mode: str, follower_ex: Dict[str, Any]) -> float:
         taker_fee = float(follower_ex.get("taker_fee", 0.0005))
         maker_fee = float(follower_ex.get("maker_fee", 0.0002))
-        if active_mode == "MEAN_REVERSION" and cfg.use_post_only_tp:
+        if active_mode in ("MEAN_REVERSION", "REVERSE_OSCILLATING") and cfg.use_post_only_tp:
             return taker_fee + maker_fee
         return 2.0 * taker_fee
 
@@ -1635,6 +1636,7 @@ class BidirectionalSniperEngine:
         self._sync_gateway_subscription()
         strat_label_map = {
             "LONG_SHORT_GRID": "传统震荡网格",
+            "REVERSE_GRID": "多空震荡网格",
             "TREND_GRID": "顺势突破网格",
             "ADAPTIVE_GRID": "VCP双模式智能网格",
             "LEAD_LAG": "跨所脉冲狙击",
@@ -1644,7 +1646,7 @@ class BidirectionalSniperEngine:
             f"切换为【{strat_label}】并更新参数" if (prev_cfg and prev_cfg.strategy_type != cfg.strategy_type) else "更新合约策略参数"
         )
         if is_grid_strategy(cfg.strategy_type):
-            if cfg.strategy_type == "LONG_SHORT_GRID":
+            if cfg.strategy_type in ("LONG_SHORT_GRID", "REVERSE_GRID"):
                 detail = f"模式={cfg.grid_side_mode}, 档位={cfg.grid_levels}层/侧, 间距={cfg.grid_step_pct*100:.2f}%, 止盈={cfg.grid_take_profit_pct*100:.2f}%, 区间=±{cfg.grid_range_pct*100:.1f}%"
             else:
                 detail = (
@@ -1719,7 +1721,7 @@ class BidirectionalSniperEngine:
                 continue
             if req.strategy_filter == "ALL_GRID" and not is_grid_strategy(cfg.strategy_type):
                 continue
-            if req.strategy_filter in ("ADAPTIVE_GRID", "TREND_GRID", "LONG_SHORT_GRID") and cfg.strategy_type != req.strategy_filter:
+            if req.strategy_filter in ("ADAPTIVE_GRID", "TREND_GRID", "LONG_SHORT_GRID", "REVERSE_GRID") and cfg.strategy_type != req.strategy_filter:
                 continue
 
             issues: List[str] = []
@@ -1758,9 +1760,13 @@ class BidirectionalSniperEngine:
                     issues.append(
                         f"层数×步长超出区间会裁层 ({new_cfg.grid_levels}层×{new_cfg.grid_step_pct*100:.2f}%={total_span*100:.2f}% > 区间±{new_cfg.grid_range_pct*100:.1f}%)"
                     )
-                if new_cfg.strategy_type != "TREND_GRID" and new_cfg.grid_stop_loss_pct <= new_cfg.grid_range_pct:
+                if new_cfg.strategy_type in ("LONG_SHORT_GRID", "ADAPTIVE_GRID") and new_cfg.grid_stop_loss_pct <= new_cfg.grid_range_pct:
                     issues.append(
                         f"止损小于等于区间 (SL={new_cfg.grid_stop_loss_pct*100:.1f}% ≤ Range={new_cfg.grid_range_pct*100:.1f}%)"
+                    )
+                elif new_cfg.strategy_type == "REVERSE_GRID" and new_cfg.grid_stop_loss_pct <= new_cfg.grid_step_pct + 1e-6:
+                    issues.append(
+                        f"单格止损小于等于步长 (SL={new_cfg.grid_stop_loss_pct*100:.2f}% ≤ Step={new_cfg.grid_step_pct*100:.2f}%)"
                     )
                 sl_roe_pct_cur = new_cfg.grid_stop_loss_pct * max(1, int(new_cfg.leverage)) * 100.0
                 if sl_roe_pct_cur > 35.0:
@@ -1890,7 +1896,7 @@ class BidirectionalSniperEngine:
                                 fixes.append(f"联动扩宽区间→±{new_cfg.grid_range_pct*100:.2f}%")
                                 changed = True
                         # Honor explicit user-requested stop-loss: shrink range instead of overwriting their SL!
-                        if new_cfg.strategy_type != "TREND_GRID" and new_cfg.grid_stop_loss_pct <= new_cfg.grid_range_pct:
+                        if new_cfg.strategy_type in ("LONG_SHORT_GRID", "ADAPTIVE_GRID") and new_cfg.grid_stop_loss_pct <= new_cfg.grid_range_pct:
                             if req.grid_stop_loss_pct is not None:
                                 new_rng = round(max(0.005, new_cfg.grid_stop_loss_pct * 0.85), 4)
                                 if abs(new_cfg.grid_range_pct - new_rng) > 1e-6:
@@ -1901,6 +1907,10 @@ class BidirectionalSniperEngine:
                                 new_cfg.grid_stop_loss_pct = round(min(0.90, new_cfg.grid_range_pct + 0.015), 4)
                                 fixes.append(f"修正止损→{new_cfg.grid_stop_loss_pct*100:.1f}%")
                                 changed = True
+                        elif new_cfg.strategy_type == "REVERSE_GRID" and new_cfg.grid_stop_loss_pct <= new_cfg.grid_step_pct + 1e-6:
+                            new_cfg.grid_stop_loss_pct = round(min(0.90, max(new_cfg.grid_step_pct * 2.0, new_cfg.grid_step_pct + 0.005)), 4)
+                            fixes.append(f"修正单格止损→{new_cfg.grid_stop_loss_pct*100:.2f}%")
+                            changed = True
                         if new_cfg.strategy_type in ("TREND_GRID", "ADAPTIVE_GRID"):
                             dz_span = new_cfg.trend_dead_zone_mult * new_cfg.grid_step_pct
                             if dz_span > new_cfg.grid_range_pct:
@@ -2578,6 +2588,7 @@ class BidirectionalSniperEngine:
         slot_order_usdt = float(slot_info.get("order_usdt") or cfg.order_usdt)
         slot_weight_pct = float(slot_info.get("weight_pct") or 0.0)
         is_trend_mode = tracker.active_grid_mode == "TREND_BREAKOUT"
+        is_reverse_osc = tracker.active_grid_mode == "REVERSE_OSCILLATING"
         exec_cfg = cfg.model_copy(update={"order_usdt": slot_order_usdt}) if abs(slot_order_usdt - cfg.order_usdt) > 1e-6 else cfg
         est_qty = slot_order_usdt / max(1e-12, res_px)
         entry_filled_done = False
@@ -2650,12 +2661,21 @@ class BidirectionalSniperEngine:
                 )
 
                 if not is_structural_block:
-                    mode_tag = "顺势突破开仓" if is_trend_mode else "多空网格开仓"
+                    mode_tag = "顺势突破开仓" if is_trend_mode else ("多空震荡开仓" if is_reverse_osc else "多空网格开仓")
+                    side_action = (
+                        ("涨破开多" if side == "LONG" else "跌破开空")
+                        if is_reverse_osc
+                        else (
+                            ("突破做多" if side == "LONG" else "跌破做空")
+                            if is_trend_mode
+                            else ("做多网格" if side == "LONG" else "做空网格")
+                        )
+                    )
                     w_note = f" ({slot_weight_pct:g}%权重)" if (is_trend_mode and slot_weight_pct > 0) else ""
                     self.append_log(
                         "SIGNAL",
                         sym,
-                        f"[{mode_tag}] {sym} [{slot_id}] 触发 {'突破做多' if (is_trend_mode and side == 'LONG') else ('跌破做空' if is_trend_mode else ('做多网格' if side == 'LONG' else '做空网格'))} @ {trig_px:.{cfg.price_precision}f} | 下单额 {slot_order_usdt:.1f}U{w_note}",
+                        f"[{mode_tag}] {sym} [{slot_id}] 触发 {side_action} @ {trig_px:.{cfg.price_precision}f} | 下单额 {slot_order_usdt:.1f}U{w_note}",
                         mode=exec_mode,
                     )
                     if not self.is_guest_preview:
@@ -2893,6 +2913,13 @@ class BidirectionalSniperEngine:
                         f"[顺势突破成交] {sym} [{slot_id}] {side} 均价: {entry_res.avg_price:.{cfg.price_precision}f} | 数量: {entry_res.filled_qty} | 假突破/保本止损: {lv.get('sl_price', 0):.{cfg.price_precision}f} | 追踪止盈: 回撤 {cfg.trend_trailing_mult * cfg.grid_step_pct * 100:.2f}%{prot_suffix}",
                         mode=exec_mode,
                     )
+                elif is_reverse_osc:
+                    self.append_log(
+                        "FILL",
+                        sym,
+                        f"[多空震荡成交] {sym} [{slot_id}] {side} 均价: {entry_res.avg_price:.{cfg.price_precision}f} | 数量: {entry_res.filled_qty} | 止盈目标: {lv.get('tp_price', 0):.{cfg.price_precision}f} | 止损: {lv.get('sl_price', 0):.{cfg.price_precision}f}{prot_suffix}",
+                        mode=exec_mode,
+                    )
                 else:
                     self.append_log(
                         "FILL",
@@ -3013,6 +3040,14 @@ class BidirectionalSniperEngine:
         sym = cfg.symbol
         slot_id = lv["slot_id"]
         side = lv["side"]
+        full_order_id = f"grid-{slot_id}-{order_id}"
+        if order_id and full_order_id in self._finalized_grid_order_ids:
+            tracker.mark_exited(slot_id, 0.0, is_sl=("SL" in str(exit_reason)))
+            self.active_grid_positions.pop( f"{sym}:{slot_id}", None)
+            self._uncertain_grid_notional.pop(f"{sym}:{slot_id}", None)
+            return
+        if order_id:
+            self._finalized_grid_order_ids.append(full_order_id)
         qty = float(lv.get("filled_qty") or 0.0)
         entry_avg = float(lv.get("entry_price") or 0.0)
         slot_tp = float(lv.get("tp_price") or lv.get("target_price") or entry_avg)
@@ -3085,10 +3120,11 @@ class BidirectionalSniperEngine:
         if not has_more_side:
             self.exchange_live_positions.pop(f"{sym}:{side}", None)
         mode_str = "Maker被动挂单" if is_maker else "Taker吃单"
+        exit_tag = "多空震荡平仓" if tracker.active_grid_mode == "REVERSE_OSCILLATING" else "多空网格平仓"
         self.append_log(
             "EXIT_WIN" if net_pnl >= 0 else "EXIT_LOSS",
             sym,
-            f"[多空网格平仓] {sym} [{slot_id}] {side} 归因: {exit_reason} ({mode_str}) | 开={entry_avg:.{cfg.price_precision}f} 平={exit_avg:.{cfg.price_precision}f} | 费用: {total_fee:.4f}U | 净收益: {net_pnl:+.4f} USDT",
+            f"[{exit_tag}] {sym} [{slot_id}] {side} 归因: {exit_reason} ({mode_str}) | 开={entry_avg:.{cfg.price_precision}f} 平={exit_avg:.{cfg.price_precision}f} | 费用: {total_fee:.4f}U | 净收益: {net_pnl:+.4f} USDT",
             mode=exec_mode,
         )
 
@@ -3637,7 +3673,7 @@ class BidirectionalSniperEngine:
                                 break
 
                             leader_retrace = (sig.leader_mid - l_curr.mid) / (abs(sig.leader_jump_pct) * sig.leader_mid + 1e-9)
-                            if hold_elapsed_ms > 45.0 and leader_retrace >= cfg.reversal_stop_ratio:
+                            if hold_elapsed_ms > 45.0 and not trailing_armed and leader_retrace >= cfg.reversal_stop_ratio:
                                 exit_reason = "REVERSAL_SL"
                                 break
 
@@ -3670,7 +3706,7 @@ class BidirectionalSniperEngine:
                                 break
 
                             leader_retrace = (l_curr.mid - sig.leader_mid) / (abs(sig.leader_jump_pct) * sig.leader_mid + 1e-9)
-                            if hold_elapsed_ms > 45.0 and leader_retrace >= cfg.reversal_stop_ratio:
+                            if hold_elapsed_ms > 45.0 and not trailing_armed and leader_retrace >= cfg.reversal_stop_ratio:
                                 exit_reason = "REVERSAL_SL"
                                 break
 
@@ -3944,7 +3980,11 @@ class BidirectionalSniperEngine:
         regime_msg = tracker.consume_regime_log()
         if regime_msg:
             self.append_log("INFO", symbol, regime_msg)
-        mode_cn = "顺势突破" if tracker.active_grid_mode == "TREND_BREAKOUT" else "传统震荡"
+        mode_cn = (
+            "顺势突破"
+            if tracker.active_grid_mode == "TREND_BREAKOUT"
+            else ("多空震荡" if tracker.active_grid_mode == "REVERSE_OSCILLATING" else "传统震荡")
+        )
         self.append_log("INFO", symbol, f"[网格重锚] {symbol} ({mode_cn}) 网格中枢已更新至 {f_mid:.{cfg.price_precision}f}")
         self._save_open_strategy_state()
         return True, f"{symbol} 网格({mode_cn})已以 {f_mid:.{cfg.price_precision}f} 重锚"

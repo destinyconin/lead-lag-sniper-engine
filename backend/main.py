@@ -46,6 +46,7 @@ from backend.models import (
     RedeemVipCodeRequest,
     RegisterRequest,
     SymbolStrategy,
+    is_grid_strategy,
 )
 from backend.payment_monitor import OnChainPaymentMonitor
 from backend.sniper_engine import BidirectionalSniperEngine
@@ -431,7 +432,7 @@ async def verify_symbol(symbol: str = Query(...), authorization: str = Header(de
 
     # Infer sensible strategy & order_usdt defaults from the user's current portfolio
     existing = list(eng.strategies.values())
-    grid_configs = [s for s in existing if s.strategy_type in ("LONG_SHORT_GRID", "TREND_GRID", "ADAPTIVE_GRID")]
+    grid_configs = [s for s in existing if is_grid_strategy(s.strategy_type)]
     if grid_configs and len(grid_configs) >= len(existing) / 2:
         rec_strategy = grid_configs[0].strategy_type
         base_order_usdt = float(grid_configs[0].order_usdt or 5.0)

@@ -80,14 +80,14 @@ CREATE TABLE IF NOT EXISTS symbol_configs (
     qty_precision INTEGER DEFAULT 2,
     price_precision INTEGER DEFAULT 4,
     grid_side_mode VARCHAR(16) DEFAULT 'LONG_SHORT',
-    grid_levels INTEGER DEFAULT 5,
-    grid_step_pct DECIMAL(8, 6) DEFAULT 0.0060,
-    grid_take_profit_pct DECIMAL(8, 6) DEFAULT 0.0045,
-    grid_range_pct DECIMAL(8, 6) DEFAULT 0.0500,
-    grid_stop_loss_pct DECIMAL(8, 6) DEFAULT 0.0800,
+    grid_levels INTEGER DEFAULT 3,
+    grid_step_pct DECIMAL(8, 6) DEFAULT 0.0080,
+    grid_take_profit_pct DECIMAL(8, 6) DEFAULT 0.0085,
+    grid_range_pct DECIMAL(8, 6) DEFAULT 0.0280,
+    grid_stop_loss_pct DECIMAL(8, 6) DEFAULT 0.0380,
     grid_recenter_enabled BOOLEAN DEFAULT 1,
-    trend_dead_zone_mult DECIMAL(6, 2) DEFAULT 2.00,
-    trend_trailing_mult DECIMAL(6, 2) DEFAULT 1.50,
+    trend_dead_zone_mult DECIMAL(6, 2) DEFAULT 1.25,
+    trend_trailing_mult DECIMAL(6, 2) DEFAULT 1.25,
     trend_pyramid_decay BOOLEAN DEFAULT 1,
     trend_use_bb_breakout BOOLEAN DEFAULT 1,
     bbw_timeframe VARCHAR(8) DEFAULT '15m',
@@ -361,19 +361,19 @@ class AsyncDatabaseManager:
         conn.commit()
 
     def _ensure_symbol_columns_sync(self, conn: sqlite3.Connection):
-        """Additive column migration for multi-strategy (`LEAD_LAG` / `LONG_SHORT_GRID` / `TREND_GRID` / `ADAPTIVE_GRID`) fields."""
+        """Additive column migration for multi-strategy (`LEAD_LAG` / `LONG_SHORT_GRID` / `REVERSE_GRID` / `TREND_GRID` / `ADAPTIVE_GRID`) fields."""
         existing = {row[1] for row in conn.execute("PRAGMA table_info(symbol_configs)").fetchall()}
         additions = [
             ("strategy_type", "ALTER TABLE symbol_configs ADD COLUMN strategy_type VARCHAR(24) DEFAULT 'LEAD_LAG'"),
             ("grid_side_mode", "ALTER TABLE symbol_configs ADD COLUMN grid_side_mode VARCHAR(16) DEFAULT 'LONG_SHORT'"),
-            ("grid_levels", "ALTER TABLE symbol_configs ADD COLUMN grid_levels INTEGER DEFAULT 5"),
-            ("grid_step_pct", "ALTER TABLE symbol_configs ADD COLUMN grid_step_pct DECIMAL(8, 6) DEFAULT 0.0060"),
-            ("grid_take_profit_pct", "ALTER TABLE symbol_configs ADD COLUMN grid_take_profit_pct DECIMAL(8, 6) DEFAULT 0.0045"),
-            ("grid_range_pct", "ALTER TABLE symbol_configs ADD COLUMN grid_range_pct DECIMAL(8, 6) DEFAULT 0.0500"),
-            ("grid_stop_loss_pct", "ALTER TABLE symbol_configs ADD COLUMN grid_stop_loss_pct DECIMAL(8, 6) DEFAULT 0.0800"),
+            ("grid_levels", "ALTER TABLE symbol_configs ADD COLUMN grid_levels INTEGER DEFAULT 3"),
+            ("grid_step_pct", "ALTER TABLE symbol_configs ADD COLUMN grid_step_pct DECIMAL(8, 6) DEFAULT 0.0080"),
+            ("grid_take_profit_pct", "ALTER TABLE symbol_configs ADD COLUMN grid_take_profit_pct DECIMAL(8, 6) DEFAULT 0.0085"),
+            ("grid_range_pct", "ALTER TABLE symbol_configs ADD COLUMN grid_range_pct DECIMAL(8, 6) DEFAULT 0.0280"),
+            ("grid_stop_loss_pct", "ALTER TABLE symbol_configs ADD COLUMN grid_stop_loss_pct DECIMAL(8, 6) DEFAULT 0.0380"),
             ("grid_recenter_enabled", "ALTER TABLE symbol_configs ADD COLUMN grid_recenter_enabled BOOLEAN DEFAULT 1"),
-            ("trend_dead_zone_mult", "ALTER TABLE symbol_configs ADD COLUMN trend_dead_zone_mult DECIMAL(6, 2) DEFAULT 2.00"),
-            ("trend_trailing_mult", "ALTER TABLE symbol_configs ADD COLUMN trend_trailing_mult DECIMAL(6, 2) DEFAULT 1.50"),
+            ("trend_dead_zone_mult", "ALTER TABLE symbol_configs ADD COLUMN trend_dead_zone_mult DECIMAL(6, 2) DEFAULT 1.25"),
+            ("trend_trailing_mult", "ALTER TABLE symbol_configs ADD COLUMN trend_trailing_mult DECIMAL(6, 2) DEFAULT 1.25"),
             ("trend_pyramid_decay", "ALTER TABLE symbol_configs ADD COLUMN trend_pyramid_decay BOOLEAN DEFAULT 1"),
             ("trend_use_bb_breakout", "ALTER TABLE symbol_configs ADD COLUMN trend_use_bb_breakout BOOLEAN DEFAULT 1"),
             ("bbw_timeframe", "ALTER TABLE symbol_configs ADD COLUMN bbw_timeframe VARCHAR(8) DEFAULT '15m'"),
@@ -711,13 +711,13 @@ class AsyncDatabaseManager:
                 if d.get("sl_trigger_px_type") not in ("mark", "last"):
                     d["sl_trigger_px_type"] = "mark"
                 for k, dv in (
-                    ("grid_levels", 5),
-                    ("grid_step_pct", 0.0060),
-                    ("grid_take_profit_pct", 0.0045),
-                    ("grid_range_pct", 0.05),
-                    ("grid_stop_loss_pct", 0.08),
-                    ("trend_dead_zone_mult", 2.0),
-                    ("trend_trailing_mult", 1.5),
+                    ("grid_levels", 3),
+                    ("grid_step_pct", 0.0080),
+                    ("grid_take_profit_pct", 0.0085),
+                    ("grid_range_pct", 0.028),
+                    ("grid_stop_loss_pct", 0.038),
+                    ("trend_dead_zone_mult", 1.25),
+                    ("trend_trailing_mult", 1.25),
                     ("bbw_squeeze_percentile", 20.0),
                 ):
                     if d.get(k) is None:
@@ -881,13 +881,17 @@ class AsyncDatabaseManager:
             conn.close()
 
     def record_trade_async(self, trade: Dict[str, Any], user_id: int = 0):
+        ord_id = str(trade.get("order_id") or "")
         sql = """INSERT INTO trade_logs (
             user_id, symbol, leader_ex, follower_ex, side, trading_mode, order_id, exit_order_type,
             leader_jump_pct, follower_lag_pct, expected_net_pct, actual_slippage_pct,
             beta_est, leader_snapshot_price, follower_snapshot_price, reservation_price,
             entry_price, exit_price, filled_qty, gross_pnl_usdt, fee_usdt, net_pnl_usdt,
             signal_ts_ms, submit_ts_ms, ack_ts_ms, signal_to_fill_ms, hold_duration_ms, exit_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+        ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM trade_logs WHERE user_id = ? AND order_id = ? AND order_id != ''
+        )"""
         params = (
             user_id,
             trade["symbol"],
@@ -895,7 +899,7 @@ class AsyncDatabaseManager:
             trade.get("follower_ex", "okx"),
             trade["side"],
             trade.get("trading_mode", "SHADOW"),
-            trade.get("order_id", ""),
+            ord_id,
             trade.get("exit_order_type", "MAKER_POST_ONLY"),
             trade.get("leader_jump_pct", 0.0),
             trade.get("follower_lag_pct", 0.0),
@@ -917,6 +921,8 @@ class AsyncDatabaseManager:
             trade.get("signal_to_fill_ms", 0.0),
             trade.get("hold_duration_ms", 0),
             trade.get("exit_reason", "TAKE_PROFIT"),
+            user_id,
+            ord_id,
         )
         self.enqueue_write(sql, params)
 

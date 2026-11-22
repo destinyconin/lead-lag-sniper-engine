@@ -1,17 +1,21 @@
 """
-Dual-Mode Bidirectional Grid Strategy Tracker (`LONG_SHORT_GRID`, `TREND_GRID`, `ADAPTIVE_GRID`).
+Multi-Mode Bidirectional Grid Strategy Tracker (`LONG_SHORT_GRID`, `REVERSE_GRID`, `TREND_GRID`, `ADAPTIVE_GRID`).
 Supports per-symbol:
-1. Traditional Mean-Reversion Grid (`MEAN_REVERSION`):
+1. Traditional Mean-Reversion Grid (`MEAN_REVERSION` / `LONG_SHORT_GRID`):
    - Buy dips (`L1..Ln` below center) / Sell rallies (`S1..Sn` above center)
    - Fixed per-slot take-profit covering round-trip fees + breakout hard stop-loss
-2. Reverse / Trend Breakout Grid (`TREND_BREAKOUT`):
+2. Reverse Oscillating Grid (`REVERSE_OSCILLATING` / `REVERSE_GRID` — 多空震荡网格):
+   - Sell breakdowns (`S1..Sn` below center) / Buy breakouts (`L1..Ln` above center)
+   - Equal per-slot sizing + fixed per-slot take-profit (supports Maker Post-Only TP) + per-slot hard stop-loss
+   - Per-slot crossing re-arm hysteresis & symmetric anti-stacking spacing so post-TP slots never immediately re-stack
+3. Reverse / Trend Breakout Grid (`TREND_BREAKOUT` / `TREND_GRID`):
    - Buy breakouts (`L1..Ln` above center + Dead Zone / Bollinger Upper Band)
    - Sell breakdowns (`S1..Sn` below center - Dead Zone / Bollinger Lower Band)
    - Front-loaded decaying pyramid sizing (e.g., 50% / 30% / 20% across 3 levels)
    - False-breakout hard stop-loss + Livermore step-up breakeven stop-loss on pyramid fills
    - No fixed TP ceiling: global per-side Trailing Stop (e.g., 1.5 * step pullback from peak/trough)
      that batch-closes all profitable slots on that side at once
-3. Volatility-Adaptive Dual-Mode Grid (`ADAPTIVE_GRID`):
+4. Volatility-Adaptive Dual-Mode Grid (`ADAPTIVE_GRID`):
    - Defaults to `MEAN_REVERSION` during normal range-bound markets (70% of time)
    - When completely flat (initial build / Auto-Recenter / flat regime check) and 15m/1H
      Bollinger Band Width (BBW) compresses into extreme VCP squeeze percentile, automatically
@@ -54,7 +58,7 @@ class LongShortGridTracker:
         self.total_net_pnl: float = 0.0
         self._last_sig_params: Optional[tuple] = None
 
-        # Dual-mode state: "MEAN_REVERSION" | "TREND_BREAKOUT"
+        # Multi-mode state: "MEAN_REVERSION" | "REVERSE_OSCILLATING" | "TREND_BREAKOUT"
         self.active_grid_mode: str = "MEAN_REVERSION"
         self.long_peak_price: float = 0.0
         self.short_trough_price: float = 0.0
@@ -151,6 +155,8 @@ class LongShortGridTracker:
             return "TREND_BREAKOUT", "手动指定顺势突破网格"
         if cfg.strategy_type == "LONG_SHORT_GRID":
             return "MEAN_REVERSION", "手动指定传统震荡网格"
+        if cfg.strategy_type == "REVERSE_GRID":
+            return "REVERSE_OSCILLATING", "手动指定多空震荡网格（跌破开空 / 涨破开多）"
 
         # ADAPTIVE_GRID: Volatility-driven dual-mode switching with hysteresis
         info = self._get_valid_bbw(cfg, bbw_info=bbw_info)
@@ -171,7 +177,7 @@ class LongShortGridTracker:
                     "TREND_BREAKOUT",
                     f"检测到 {tf} BBW={bbw_pct:.2f}% 压缩至历史 {pct_rank:.1f}% 极低位 (≤{thresh:.0f}%)，触发 VCP 变盘预警 → 顺势突破网格",
                 )
-            if breakout_exp in ("UP_BREAKOUT", "DOWN_BREAKOUT"):
+            if breakout_exp in ("UP_BREAKOUT", "DOWN_BREAKOUT") and pct_rank <= 85.0:
                 dir_cn = "放量向上突破" if breakout_exp == "UP_BREAKOUT" else "放量向下破位"
                 return (
                     "TREND_BREAKOUT",
@@ -245,12 +251,16 @@ class LongShortGridTracker:
             bb_lower = float(info.get("bb_lower") or 0.0) if (cfg.trend_use_bb_breakout and info) else 0.0
             bb_pct_rank = float(info.get("bbw_percentile", 0.0)) if info else 0.0
             # Cap ONLY L1/S1 distance from center:
-            # - During squeeze/normal bands (bbw_percentile <= 55%), allow BB alignment up to max(1.6*dz, 2.2%).
-            # - During blown-out high-volatility expansion (bbw_percentile > 55%), cap tightly at 1.15*dz so L1/S1
-            #   never chases an exhausted -3%~-5% band edge with a 2.5% stop-loss distance!
+            # - During extreme VCP squeeze (bbw_percentile <= 25%), allow BB alignment up to max(1.6*dz, 2.2%).
+            # - During normal volatility bands (25% < bbw_percentile <= 55%), cap at 1.25*dz to prevent
+            #   over-wide L1/S1 entries with -2.0%~-3.0% false-breakout stop distance back to center.
+            # - During blown-out high-volatility expansion (bbw_percentile > 55%), cap tightly at 1.15*dz.
             if bb_pct_rank > 55.0:
                 bb_cap = dz_ratio * 1.15
                 max_first_span = max(dz_ratio * 1.15, step * 1.25)
+            elif bb_pct_rank > 25.0:
+                bb_cap = dz_ratio * 1.25
+                max_first_span = max(dz_ratio * 1.25, step * 1.35)
             else:
                 bb_cap = max(dz_ratio * 1.6, 0.022)
                 max_first_span = max(dz_ratio * 1.5, min(rng, bb_cap), step * 2.0)
@@ -332,6 +342,69 @@ class LongShortGridTracker:
                         "order_usdt": slot_usdt,
                         "weight_pct": round(w * 100.0, 1),
                         "status": "IDLE",
+                        "entry_price": 0.0,
+                        "filled_qty": 0.0,
+                        "contracts": 0.0,
+                        "ct_val": 1.0,
+                        "mgn_mode": "cross",
+                        "opened_mono_ms": 0.0,
+                        "last_closed_mono": last_c,
+                        "cooldown_until_mono": cd_u,
+                        "maker_tp_touched_mono": 0.0,
+                        "cond_sl_touched_mono": 0.0,
+                    }
+        elif self.active_grid_mode == "REVERSE_OSCILLATING":
+            # Reverse Oscillating Grid (多空震荡网格): L1..Ln ABOVE center (涨破开多), S1..Sn BELOW center (跌破开空)
+            if cfg.grid_side_mode in ("LONG_SHORT", "LONG_ONLY"):
+                long_indices = [i for i in range(1, count + 1) if i == 1 or i * step <= rng + 1e-9]
+                w_pct = round(100.0 / max(1, len(long_indices)), 1)
+                for i in long_indices:
+                    slot_id = f"L{i}"
+                    trig = round(self.center_price * (1.0 + i * step), prec)
+                    cd_u, last_c = old_cooldowns.get(slot_id, (0.0, 0.0))
+                    new_levels[slot_id] = {
+                        "slot_id": slot_id,
+                        "side": "LONG",
+                        "level_idx": i,
+                        "grid_mode": "REVERSE_OSCILLATING",
+                        "trigger_price": trig,
+                        "tp_price": round(trig * (1.0 + tp_pct), prec),
+                        "sl_price": round(trig * max(0.05, 1.0 - sl_pct), prec),
+                        "order_usdt": round(float(cfg.order_usdt), 2),
+                        "weight_pct": w_pct,
+                        "status": "IDLE",
+                        "armed": True,
+                        "entry_price": 0.0,
+                        "filled_qty": 0.0,
+                        "contracts": 0.0,
+                        "ct_val": 1.0,
+                        "mgn_mode": "cross",
+                        "opened_mono_ms": 0.0,
+                        "last_closed_mono": last_c,
+                        "cooldown_until_mono": cd_u,
+                        "maker_tp_touched_mono": 0.0,
+                        "cond_sl_touched_mono": 0.0,
+                    }
+
+            if cfg.grid_side_mode in ("LONG_SHORT", "SHORT_ONLY"):
+                short_indices = [i for i in range(1, count + 1) if i == 1 or i * step <= rng + 1e-9]
+                w_pct = round(100.0 / max(1, len(short_indices)), 1)
+                for i in short_indices:
+                    slot_id = f"S{i}"
+                    trig = round(self.center_price * max(0.05, 1.0 - i * step), prec)
+                    cd_u, last_c = old_cooldowns.get(slot_id, (0.0, 0.0))
+                    new_levels[slot_id] = {
+                        "slot_id": slot_id,
+                        "side": "SHORT",
+                        "level_idx": i,
+                        "grid_mode": "REVERSE_OSCILLATING",
+                        "trigger_price": trig,
+                        "tp_price": round(trig * max(0.05, 1.0 - tp_pct), prec),
+                        "sl_price": round(trig * (1.0 + sl_pct), prec),
+                        "order_usdt": round(float(cfg.order_usdt), 2),
+                        "weight_pct": w_pct,
+                        "status": "IDLE",
+                        "armed": True,
                         "entry_price": 0.0,
                         "filled_qty": 0.0,
                         "contracts": 0.0,
@@ -577,10 +650,16 @@ class LongShortGridTracker:
         if self.active_grid_mode == "TREND_BREAKOUT":
             step_now = max(0.0001, float(cfg.grid_step_pct))
             trail_ratio = max(0.0005, float(cfg.trend_trailing_mult) * step_now)
+            half_lock_move = max(0.45 * step_now, round_trip_fee + 0.0020)
             solo_lock_move = max(0.80 * step_now, round_trip_fee + 0.0035)
             profit_floor_trigger = max(0.55 * step_now, 0.0040)
+            pyramid_clear_move = max(0.30 * step_now, round_trip_fee + 0.0010)
             be_slip_buf = 0.0006
             sl_room_buf = max(0.0025, step_now * 0.30)
+            max_l1_sl_dist = min(
+                float(cfg.grid_stop_loss_pct),
+                max(float(cfg.trend_dead_zone_mult) * step_now * 1.30, step_now * 2.55, 0.012),
+            )
 
             open_longs = [lv for lv in self.levels.values() if lv["side"] == "LONG" and lv["status"] == "OPEN"]
             if open_longs:
@@ -593,22 +672,39 @@ class LongShortGridTracker:
                     / max(1e-12, tot_notional_l)
                 ) if tot_notional_l > 0 else max_entry_l
                 vwap_be_l = round(vwap_l * (1.0 + round_trip_fee + be_slip_buf), prec) if vwap_l > 0 else 0.0
-                if vwap_be_l > 0 and self.long_peak_price >= vwap_be_l * (1.0 + profit_floor_trigger):
+                # Multi-leg VWAP profit-lock floor ONLY engages once >=2 pyramid legs are open AND peak has
+                # cleared the newest leg's entry (`max_entry_l`) by >= 0.30*step (preventing L2/L3 from being
+                # choked at a loss immediately after fill, and preventing solo L1 from closing at +0.34% crumbs!).
+                if (
+                    len(open_longs) >= 2
+                    and vwap_be_l > 0
+                    and self.long_peak_price >= vwap_be_l * (1.0 + profit_floor_trigger)
+                    and self.long_peak_price >= max_entry_l * (1.0 + pyramid_clear_move)
+                ):
                     profit_lock_l = round(vwap_be_l + 0.25 * (self.long_peak_price - vwap_be_l), prec)
+                    if self.long_peak_price >= max_entry_l * (1.0 + solo_lock_move):
+                        profit_lock_l = max(profit_lock_l, round(max_entry_l * (1.0 + round_trip_fee * 0.5), prec))
                     long_trail_px = max(raw_trail_l, profit_lock_l)
                 else:
                     long_trail_px = raw_trail_l
                 self.long_trail_stop_price = long_trail_px
 
-                # Solo L1 Profit-Protection Breakeven Step-Up once peak move >= 0.80 * step (when L2 has not been reached)
+                # Solo L1 Progressive Risk Reduction & Profit-Protection Step-Up:
+                # 1) Cap any over-wide legacy L1 SL distance to `max_l1_sl_dist`.
+                # 2) Once peak >= +0.45 * step, tighten L1 SL to -0.50 * step (cuts false-breakout loss in half).
+                # 3) Once peak >= +0.80 * step, tighten L1 SL to full breakeven `be_px`.
                 if len(open_longs) == 1:
                     lv = open_longs[0]
                     e_entry = float(lv.get("entry_price") or 0.0)
-                    if e_entry > 0 and self.long_peak_price >= e_entry * (1.0 + solo_lock_move):
-                        be_px = round(e_entry * (1.0 + round_trip_fee + be_slip_buf), prec)
+                    if e_entry > 0:
                         cur_sl = float(lv.get("sl_price") or 0.0)
-                        if cur_sl < be_px - 1e-12 and bid >= be_px * (1.0 + sl_room_buf):
-                            lv["sl_price"] = be_px
+                        target_sl_l = round(e_entry * max(0.05, 1.0 - max_l1_sl_dist), prec)
+                        if self.long_peak_price >= e_entry * (1.0 + solo_lock_move):
+                            target_sl_l = max(target_sl_l, round(e_entry * (1.0 + round_trip_fee + be_slip_buf), prec))
+                        elif self.long_peak_price >= e_entry * (1.0 + half_lock_move):
+                            target_sl_l = max(target_sl_l, round(e_entry * max(0.05, 1.0 - 0.50 * step_now), prec))
+                        if cur_sl < target_sl_l - 1e-12 and bid >= target_sl_l * (1.0 + sl_room_buf):
+                            lv["sl_price"] = target_sl_l
                             lv["sl_needs_amend"] = True
 
                 # 1a. All-or-Nothing Batch Trailing Stop FIRST (harvests entire pyramid when combined net PnL > 0!)
@@ -629,7 +725,8 @@ class LongShortGridTracker:
                             for lv in remaining_longs
                             if float(lv.get("entry_price") or 0.0) > 0
                         )
-                        if side_notional > 0 and side_net_pnl > max(0.0, side_notional * 0.0005):
+                        min_basket_net = side_notional * max(0.0012, 0.15 * step_now)
+                        if side_notional > 0 and side_net_pnl > max(0.0, min_basket_net):
                             for lv in remaining_longs:
                                 lv["status"] = "EXITING"
                                 exits.append({**lv, "exit_reason": "TREND_TRAIL_TP", "target_price": bid})
@@ -642,6 +739,7 @@ class LongShortGridTracker:
                     if sl_px > 0 and bid <= sl_px:
                         if _should_fire_software_sl(lv, bid, sl_px, True):
                             lv["status"] = "EXITING"
+                            lv["exiting_is_sl"] = True
                             reason = "TREND_BE_SL" if sl_px >= float(lv.get("entry_price") or 0.0) else "TREND_SL"
                             exits.append({**lv, "exit_reason": reason, "target_price": bid})
                     elif float(lv.get("cond_sl_touched_mono") or 0.0) > 0.0 and sl_px > 0 and bid > sl_px * 1.0005:
@@ -664,22 +762,40 @@ class LongShortGridTracker:
                     / max(1e-12, tot_notional_s)
                 ) if tot_notional_s > 0 else min_entry_s
                 vwap_be_s = round(vwap_s * max(0.05, 1.0 - round_trip_fee - be_slip_buf), prec) if vwap_s > 0 else 0.0
-                if vwap_be_s > 0 and self.short_trough_price > 0 and self.short_trough_price <= vwap_be_s * max(0.05, 1.0 - profit_floor_trigger):
+                if (
+                    len(open_shorts) >= 2
+                    and vwap_be_s > 0
+                    and self.short_trough_price > 0
+                    and self.short_trough_price <= vwap_be_s * max(0.05, 1.0 - profit_floor_trigger)
+                    and self.short_trough_price <= min_entry_s * max(0.05, 1.0 - pyramid_clear_move)
+                ):
                     profit_lock_s = round(vwap_be_s - 0.25 * (vwap_be_s - self.short_trough_price), prec)
+                    if self.short_trough_price <= min_entry_s * max(0.05, 1.0 - solo_lock_move):
+                        profit_lock_s = min(
+                            profit_lock_s,
+                            round(min_entry_s * max(0.05, 1.0 - round_trip_fee * 0.5), prec),
+                        )
                     short_trail_px = min(raw_trail_s, profit_lock_s)
                 else:
                     short_trail_px = raw_trail_s
                 self.short_trail_stop_price = short_trail_px
 
-                # Solo S1 Profit-Protection Breakeven Step-Down once trough move >= 0.80 * step (when S2 has not been reached)
+                # Solo S1 Progressive Risk Reduction & Profit-Protection Step-Down
                 if len(open_shorts) == 1:
                     lv = open_shorts[0]
                     e_entry = float(lv.get("entry_price") or 0.0)
-                    if e_entry > 0 and self.short_trough_price > 0 and self.short_trough_price <= e_entry * max(0.05, 1.0 - solo_lock_move):
-                        be_px = round(e_entry * max(0.05, 1.0 - round_trip_fee - be_slip_buf), prec)
+                    if e_entry > 0 and self.short_trough_price > 0:
                         cur_sl = float(lv.get("sl_price") or 0.0)
-                        if (cur_sl <= 0 or cur_sl > be_px + 1e-12) and ask <= be_px * max(0.05, 1.0 - sl_room_buf):
-                            lv["sl_price"] = be_px
+                        target_sl_s = round(e_entry * (1.0 + max_l1_sl_dist), prec)
+                        if self.short_trough_price <= e_entry * max(0.05, 1.0 - solo_lock_move):
+                            target_sl_s = min(
+                                target_sl_s,
+                                round(e_entry * max(0.05, 1.0 - round_trip_fee - be_slip_buf), prec),
+                            )
+                        elif self.short_trough_price <= e_entry * max(0.05, 1.0 - half_lock_move):
+                            target_sl_s = min(target_sl_s, round(e_entry * (1.0 + 0.50 * step_now), prec))
+                        if (cur_sl <= 0 or cur_sl > target_sl_s + 1e-12) and ask <= target_sl_s * max(0.05, 1.0 - sl_room_buf):
+                            lv["sl_price"] = target_sl_s
                             lv["sl_needs_amend"] = True
 
                 # 1a. All-or-Nothing Batch Trailing Stop FIRST (harvests entire pyramid when combined net PnL > 0!)
@@ -700,7 +816,8 @@ class LongShortGridTracker:
                             for lv in remaining_shorts
                             if float(lv.get("entry_price") or 0.0) > 0
                         )
-                        if side_notional > 0 and side_net_pnl > max(0.0, side_notional * 0.0005):
+                        min_basket_net = side_notional * max(0.0012, 0.15 * step_now)
+                        if side_notional > 0 and side_net_pnl > max(0.0, min_basket_net):
                             for lv in remaining_shorts:
                                 lv["status"] = "EXITING"
                                 exits.append({**lv, "exit_reason": "TREND_TRAIL_TP", "target_price": ask})
@@ -713,6 +830,7 @@ class LongShortGridTracker:
                     if sl_px > 0 and ask >= sl_px:
                         if _should_fire_software_sl(lv, ask, sl_px, False):
                             lv["status"] = "EXITING"
+                            lv["exiting_is_sl"] = True
                             reason = "TREND_BE_SL" if sl_px <= float(lv.get("entry_price") or 0.0) else "TREND_SL"
                             exits.append({**lv, "exit_reason": reason, "target_price": ask})
                     elif float(lv.get("cond_sl_touched_mono") or 0.0) > 0.0 and sl_px > 0 and ask < sl_px * 0.9995:
@@ -746,6 +864,7 @@ class LongShortGridTracker:
                     elif sl_px > 0 and bid <= sl_px:
                         if _should_fire_software_sl(lv, bid, sl_px, True):
                             lv["status"] = "EXITING"
+                            lv["exiting_is_sl"] = True
                             exits.append({**lv, "exit_reason": "GRID_SL", "target_price": bid})
                     else:
                         if maker_live and float(lv.get("maker_tp_touched_mono") or 0.0) > 0.0 and bid < tp_px * 0.9995:
@@ -768,6 +887,7 @@ class LongShortGridTracker:
                     elif sl_px > 0 and ask >= sl_px:
                         if _should_fire_software_sl(lv, ask, sl_px, False):
                             lv["status"] = "EXITING"
+                            lv["exiting_is_sl"] = True
                             exits.append({**lv, "exit_reason": "GRID_SL", "target_price": ask})
                     else:
                         if maker_live and float(lv.get("maker_tp_touched_mono") or 0.0) > 0.0 and ask > tp_px * 1.0005:
@@ -789,6 +909,8 @@ class LongShortGridTracker:
                 ]
                 max_first_dist = max(first_dists) if first_dists else (float(cfg.trend_dead_zone_mult) * float(cfg.grid_step_pct))
                 eff_range = max(eff_range, max_first_dist * 1.15)
+            elif self.active_grid_mode == "REVERSE_OSCILLATING" and self.center_price > 0:
+                eff_range = max(eff_range, float(cfg.grid_step_pct) * 1.15)
             drifted_out = (
                 cfg.grid_recenter_enabled
                 and now_m >= self._post_sl_cooldown_until_mono
@@ -821,6 +943,8 @@ class LongShortGridTracker:
         trend_bias = self._resolve_effective_trend_bias(valid_bbw)
 
         if self.active_grid_mode == "TREND_BREAKOUT":
+            if exits or any(lv.get("status") == "EXITING" and lv.get("exiting_is_sl") for lv in self.levels.values()):
+                return [], exits
             # Strictly monotonic breakout pyramid: only enter `max_active_idx + 1` (never re-open L1 under an open L2!)
             allow_trend_long = (cfg.grid_side_mode in ("LONG_SHORT", "LONG_ONLY")) and (trend_bias != "BEAR")
             allow_trend_short = (cfg.grid_side_mode in ("LONG_SHORT", "SHORT_ONLY")) and (trend_bias != "BULL")
@@ -897,9 +1021,107 @@ class LongShortGridTracker:
                         res_px = round(bid * max(0.05, 1.0 - cfg.slippage_pct), prec)
                         entries.append({**lv, "reservation_price": res_px, "trigger_exec_price": bid})
                         break
+        elif self.active_grid_mode == "REVERSE_OSCILLATING":
+            # Never open brand-new entries on the same tick (or while an SL close is in flight) as a hard stop-loss!
+            if any("SL" in str(e.get("exit_reason") or "") for e in exits) or any(
+                lv.get("status") == "EXITING" and lv.get("exiting_is_sl") for lv in self.levels.values()
+            ):
+                return [], exits
+            # Reverse Oscillating Grid (多空震荡网格: 跌破开空 / 涨破开多):
+            # - L1..Ln above center trigger LONG when ask breaks >= trigger_price
+            # - S1..Sn below center trigger SHORT when bid breaks <= trigger_price
+            # - Slots disarm on fill/exit and re-arm once price crosses back past trigger_price
+            #   by a small hysteresis buffer, preventing instant re-stacking after TP!
+            rearm_buf = min(step * 0.25, 0.0020)
+            for lv in self.levels.values():
+                if lv["status"] != "IDLE":
+                    continue
+                if not lv.get("armed", True):
+                    t_px = float(lv.get("trigger_price") or 0.0)
+                    if t_px > 0:
+                        if lv["side"] == "LONG" and ask <= t_px * max(0.05, 1.0 - rearm_buf):
+                            lv["armed"] = True
+                        elif lv["side"] == "SHORT" and bid >= t_px * (1.0 + rearm_buf):
+                            lv["armed"] = True
+
+            eff_rng = max(float(cfg.grid_range_pct), step)
+            range_upper = self.center_price * (1.0 + eff_rng + step * 0.5)
+            range_lower = self.center_price * max(0.05, 1.0 - eff_rng - step * 0.5)
+            has_entering_long = any(lv["side"] == "LONG" and lv["status"] == "ENTERING" for lv in self.levels.values())
+            has_entering_short = any(lv["side"] == "SHORT" and lv["status"] == "ENTERING" for lv in self.levels.values())
+            open_long_entries = [
+                float(lv.get("entry_price") or 0.0)
+                for lv in self.levels.values()
+                if lv["side"] == "LONG" and lv["status"] == "OPEN" and float(lv.get("entry_price") or 0.0) > 0
+            ]
+            open_short_entries = [
+                float(lv.get("entry_price") or 0.0)
+                for lv in self.levels.values()
+                if lv["side"] == "SHORT" and lv["status"] == "OPEN" and float(lv.get("entry_price") or 0.0) > 0
+            ]
+
+            if (
+                not has_entering_long
+                and cfg.grid_side_mode in ("LONG_SHORT", "LONG_ONLY")
+                and trend_bias != "BEAR"
+                and not (is_net_mode and has_short_active)
+                and self.center_price < mid <= range_upper
+            ):
+                long_cands = []
+                for lv in self.levels.values():
+                    if lv["side"] != "LONG" or lv["status"] != "IDLE" or not lv.get("armed", True):
+                        continue
+                    cooldown_until = max(
+                        float(lv.get("cooldown_until_mono") or 0.0),
+                        (float(lv.get("last_closed_mono") or 0.0) + 1200.0)
+                        if float(lv.get("last_closed_mono") or 0.0) > 0
+                        else 0.0,
+                    )
+                    if now_m < cooldown_until:
+                        continue
+                    if ask >= float(lv["trigger_price"]):
+                        long_cands.append(lv)
+                if long_cands and all(abs(ask - ep) / ep >= step * 0.80 for ep in open_long_entries):
+                    chosen = max(long_cands, key=lambda x: (float(x["trigger_price"]), int(x["level_idx"])))
+                    chosen["status"] = "ENTERING"
+                    has_long_active = True
+                    res_px = round(ask * (1.0 + cfg.slippage_pct), prec)
+                    entries.append({**chosen, "reservation_price": res_px, "trigger_exec_price": ask})
+
+            if (
+                not has_entering_short
+                and cfg.grid_side_mode in ("LONG_SHORT", "SHORT_ONLY")
+                and trend_bias != "BULL"
+                and not (is_net_mode and has_long_active)
+                and range_lower <= mid < self.center_price
+            ):
+                short_cands = []
+                for lv in self.levels.values():
+                    if lv["side"] != "SHORT" or lv["status"] != "IDLE" or not lv.get("armed", True):
+                        continue
+                    cooldown_until = max(
+                        float(lv.get("cooldown_until_mono") or 0.0),
+                        (float(lv.get("last_closed_mono") or 0.0) + 1200.0)
+                        if float(lv.get("last_closed_mono") or 0.0) > 0
+                        else 0.0,
+                    )
+                    if now_m < cooldown_until:
+                        continue
+                    if bid <= float(lv["trigger_price"]):
+                        short_cands.append(lv)
+                if short_cands and all(abs(bid - ep) / ep >= step * 0.80 for ep in open_short_entries):
+                    chosen = min(short_cands, key=lambda x: (float(x["trigger_price"]), -int(x["level_idx"])))
+                    chosen["status"] = "ENTERING"
+                    has_short_active = True
+                    res_px = round(bid * max(0.05, 1.0 - cfg.slippage_pct), prec)
+                    entries.append({**chosen, "reservation_price": res_px, "trigger_exec_price": bid})
         else:
             # Traditional Mean-Reversion entries: max 1 entry per side per tick, enforce spacing vs open siblings, respect post-SL cooldown
-            if now_m < self._post_sl_cooldown_until_mono:
+            if (
+                now_m < self._post_sl_cooldown_until_mono
+                or any("SL" in str(e.get("exit_reason") or "") for e in exits)
+                or any(lv.get("status") == "EXITING" and lv.get("exiting_is_sl") for lv in self.levels.values())
+            ):
                 return [], exits
             sl_guard_long = self.center_price * max(0.05, 1.0 - float(cfg.grid_stop_loss_pct) * 0.90)
             sl_guard_short = self.center_price * (1.0 + float(cfg.grid_stop_loss_pct) * 0.90)
@@ -1043,6 +1265,28 @@ class LongShortGridTracker:
                             min_earlier_sl = min(min_earlier_sl, float(earlier["sl_price"]))
                     base_sl = min(round(prev_anchor, prec), min_earlier_sl) if min_earlier_sl < float("inf") else round(prev_anchor, prec)
                     lv["sl_price"] = max(base_sl, safe_floor_s)
+        elif self.active_grid_mode == "REVERSE_OSCILLATING":
+            lv["armed"] = False
+            rearm_buf = min(step * 0.25, 0.0020)
+            sl_pct = float(cfg.grid_stop_loss_pct)
+            if lv["side"] == "LONG":
+                lv["tp_price"] = round(entry_price * (1.0 + float(cfg.grid_take_profit_pct) + round_trip_fee), prec)
+                lv["sl_price"] = round(entry_price * max(0.05, 1.0 - sl_pct), prec)
+                # Disarm any bypassed inner LONG levels below current entry so they cannot stack-fire after TP
+                for other in self.levels.values():
+                    if other["slot_id"] != slot_id and other["side"] == "LONG" and other["status"] == "IDLE":
+                        if float(other.get("trigger_price") or 0.0) <= entry_price * max(0.05, 1.0 - rearm_buf):
+                            other["armed"] = False
+            else:
+                lv["tp_price"] = round(
+                    entry_price * max(0.05, 1.0 - float(cfg.grid_take_profit_pct) - round_trip_fee), prec
+                )
+                lv["sl_price"] = round(entry_price * (1.0 + sl_pct), prec)
+                # Disarm any bypassed inner SHORT levels above current entry so they cannot stack-fire after TP
+                for other in self.levels.values():
+                    if other["slot_id"] != slot_id and other["side"] == "SHORT" and other["status"] == "IDLE":
+                        if float(other.get("trigger_price") or 0.0) >= entry_price * (1.0 + rearm_buf):
+                            other["armed"] = False
         else:
             sl_pct = float(cfg.grid_stop_loss_pct)
             if lv["side"] == "LONG":
@@ -1157,14 +1401,27 @@ class LongShortGridTracker:
                 )
                 lv["sl_price"] = round(entry_price * (1.0 + sl_pct), prec)
         else:
-            if side == "LONG":
-                lv["tp_price"] = round(entry_price * (1.0 + float(cfg.grid_take_profit_pct) + round_trip_fee), prec)
-                lv["sl_price"] = round(entry_price * max(0.05, 1.0 - sl_pct), prec)
+            if self.active_grid_mode == "REVERSE_OSCILLATING":
+                lv["armed"] = False
+                if side == "LONG":
+                    lv["tp_price"] = round(entry_price * (1.0 + float(cfg.grid_take_profit_pct) + round_trip_fee), prec)
+                    lv["sl_price"] = round(entry_price * max(0.05, 1.0 - sl_pct), prec)
+                else:
+                    lv["tp_price"] = round(
+                        entry_price * max(0.05, 1.0 - float(cfg.grid_take_profit_pct) - round_trip_fee), prec
+                    )
+                    lv["sl_price"] = round(entry_price * (1.0 + sl_pct), prec)
             else:
-                lv["tp_price"] = round(
-                    entry_price * max(0.05, 1.0 - float(cfg.grid_take_profit_pct) - round_trip_fee), prec
-                )
-                lv["sl_price"] = round(entry_price * (1.0 + sl_pct), prec)
+                if side == "LONG":
+                    lv["tp_price"] = round(entry_price * (1.0 + float(cfg.grid_take_profit_pct) + round_trip_fee), prec)
+                    base_sl = self.center_price * max(0.05, 1.0 - sl_pct) if self.center_price > 0 else entry_price * max(0.05, 1.0 - sl_pct)
+                    lv["sl_price"] = round(min(base_sl, entry_price * max(0.05, 1.0 - max(float(cfg.grid_step_pct), 0.005))), prec)
+                else:
+                    lv["tp_price"] = round(
+                        entry_price * max(0.05, 1.0 - float(cfg.grid_take_profit_pct) - round_trip_fee), prec
+                    )
+                    base_sl = self.center_price * (1.0 + sl_pct) if self.center_price > 0 else entry_price * (1.0 + sl_pct)
+                    lv["sl_price"] = round(max(base_sl, entry_price * (1.0 + max(float(cfg.grid_step_pct), 0.005))), prec)
         return target_slot
 
     def export_state(self) -> dict:
@@ -1190,6 +1447,7 @@ class LongShortGridTracker:
             for lv in self.levels.values()
             if lv.get("status") in ("OPEN", "EXITING") and float(lv.get("entry_price") or 0.0) > 0
         ]
+        disarmed_slots = [sid for sid, lv in self.levels.items() if lv.get("armed") is False]
         return {
             "center_price": float(self.center_price or 0.0),
             "active_grid_mode": self.active_grid_mode,
@@ -1199,6 +1457,7 @@ class LongShortGridTracker:
             "total_net_pnl": float(self.total_net_pnl or 0.0),
             "last_bbw_info": dict(self.last_bbw_info) if isinstance(self.last_bbw_info, dict) else None,
             "open_slots": open_slots,
+            "disarmed_slots": disarmed_slots,
         }
 
     def restore_state(self, data: dict, cfg: SymbolStrategy):
@@ -1211,7 +1470,9 @@ class LongShortGridTracker:
             self.active_grid_mode = "TREND_BREAKOUT"
         elif cfg.strategy_type == "LONG_SHORT_GRID":
             self.active_grid_mode = "MEAN_REVERSION"
-        elif saved_mode in ("MEAN_REVERSION", "TREND_BREAKOUT"):
+        elif cfg.strategy_type == "REVERSE_GRID":
+            self.active_grid_mode = "REVERSE_OSCILLATING"
+        elif saved_mode in ("MEAN_REVERSION", "REVERSE_OSCILLATING", "TREND_BREAKOUT"):
             self.active_grid_mode = saved_mode
 
         c_px = float(data.get("center_price") or 0.0)
@@ -1220,6 +1481,9 @@ class LongShortGridTracker:
             self._build_levels(cfg, bbw_info=self.last_bbw_info)
             self._last_user_sig_params = self._compute_user_sig_params(cfg, self.active_grid_mode)
             self._last_sig_params = self._compute_sig_params(cfg, self.active_grid_mode, bbw_info=self.last_bbw_info)
+        for sid in data.get("disarmed_slots") or []:
+            if sid in self.levels:
+                self.levels[sid]["armed"] = False
         self.completed_cycles = int(data.get("completed_cycles") or self.completed_cycles)
         self.total_net_pnl = float(data.get("total_net_pnl") or self.total_net_pnl)
         self.long_peak_price = float(data.get("long_peak_price") or 0.0)
@@ -1242,6 +1506,7 @@ class LongShortGridTracker:
                     "order_usdt": float(slot.get("order_usdt") or cfg.order_usdt),
                     "weight_pct": float(slot.get("weight_pct") or 0.0),
                     "status": "IDLE",
+                    "armed": False,
                     "entry_price": 0.0,
                     "filled_qty": 0.0,
                     "contracts": 0.0,
@@ -1256,6 +1521,8 @@ class LongShortGridTracker:
                 }
             lv = self.levels[sid]
             lv["status"] = "OPEN"
+            if self.active_grid_mode == "REVERSE_OSCILLATING" or "armed" in lv:
+                lv["armed"] = False
             lv["recovered"] = True
             e_px = float(slot.get("entry_price") or 0.0)
             lv["entry_price"] = e_px
@@ -1264,8 +1531,8 @@ class LongShortGridTracker:
             lv["ct_val"] = float(slot.get("ct_val") or 1.0)
             lv["mgn_mode"] = str(slot.get("mgn_mode") or "cross")
             tp_restored = float(slot.get("tp_price") or 0.0)
-            # If strategy switched from TREND_BREAKOUT (tp=0) -> MEAN_REVERSION, synthesize valid TP so slot isn't stuck!
-            if self.active_grid_mode == "MEAN_REVERSION" and tp_restored <= 0 and e_px > 0:
+            # If strategy switched from TREND_BREAKOUT (tp=0) -> MEAN_REVERSION/REVERSE_OSCILLATING, synthesize valid TP so slot isn't stuck!
+            if self.active_grid_mode in ("MEAN_REVERSION", "REVERSE_OSCILLATING") and tp_restored <= 0 and e_px > 0:
                 tp_restored = round(
                     e_px * (1.0 + float(cfg.grid_take_profit_pct) + 0.001)
                     if lv["side"] == "LONG"
@@ -1304,6 +1571,8 @@ class LongShortGridTracker:
             else:
                 now_m = mono_ms()
                 lv["status"] = "IDLE"
+                if self.active_grid_mode == "REVERSE_OSCILLATING" or "armed" in lv:
+                    lv["armed"] = False
                 lv["entry_price"] = 0.0
                 lv["filled_qty"] = 0.0
                 lv["contracts"] = 0.0
@@ -1317,6 +1586,7 @@ class LongShortGridTracker:
                 lv["cond_sl_algo_id"] = ""
                 lv["cond_sl_live"] = False
                 lv["cond_sl_touched_mono"] = 0.0
+                lv.pop("exiting_is_sl", None)
                 lv.pop("recovered", None)
         if not self._has_active_slots("LONG"):
             self.long_peak_price = 0.0
@@ -1333,6 +1603,8 @@ class LongShortGridTracker:
                 self.levels.pop(slot_id, None)
             else:
                 lv["status"] = "IDLE"
+                if self.active_grid_mode == "REVERSE_OSCILLATING" or "armed" in lv:
+                    lv["armed"] = False
                 lv["entry_price"] = 0.0
                 lv["filled_qty"] = 0.0
                 lv["contracts"] = 0.0
@@ -1348,9 +1620,10 @@ class LongShortGridTracker:
                 lv["cond_sl_live"] = False
                 lv["cond_sl_touched_mono"] = 0.0
                 lv.pop("sl_needs_amend", None)
+                lv.pop("exiting_is_sl", None)
                 lv.pop("recovered", None)
-        if is_sl and self.active_grid_mode == "MEAN_REVERSION":
-            # Prevent instant crash-low recenter & second falling-knife SL (120s cooloff)
+        if is_sl and self.active_grid_mode in ("MEAN_REVERSION", "REVERSE_OSCILLATING"):
+            # Prevent instant crash-low/spike-high recenter & immediate whipsaw SL (120s cooloff)
             self._post_sl_cooldown_until_mono = max(self._post_sl_cooldown_until_mono, now_m + 120_000.0)
         elif is_sl and self.active_grid_mode == "TREND_BREAKOUT" and not self._has_active_slots():
             # Prevent instant re-entry / whipsaw recenter on an exhausted false breakout (90s cooloff)
@@ -1371,13 +1644,14 @@ class LongShortGridTracker:
         lv = self.levels.get(slot_id)
         if lv and lv["status"] == "EXITING":
             lv["status"] = "OPEN"
+            lv.pop("exiting_is_sl", None)
             lv["exit_retry_until_mono"] = mono_ms() + max(1000.0, float(backoff_ms))
 
     def get_snapshot(self) -> dict:
         open_long = sum(1 for lv in self.levels.values() if lv["side"] == "LONG" and lv["status"] in ("OPEN", "EXITING"))
         open_short = sum(1 for lv in self.levels.values() if lv["side"] == "SHORT" and lv["status"] in ("OPEN", "EXITING"))
         # Display order from highest price at top to lowest price at bottom
-        if self.active_grid_mode == "TREND_BREAKOUT":
+        if self.active_grid_mode in ("TREND_BREAKOUT", "REVERSE_OSCILLATING"):
             ordered = sorted(
                 self.levels.values(),
                 key=lambda x: (0 if x["side"] == "LONG" else 1, -x["level_idx"] if x["side"] == "LONG" else x["level_idx"]),
@@ -1423,6 +1697,7 @@ class LongShortGridTracker:
                     "weight_pct": lv.get("weight_pct", 0.0),
                     "maker_tp_live": bool(lv.get("maker_tp_live", False)),
                     "cond_sl_live": bool(lv.get("cond_sl_live", False)),
+                    "armed": bool(lv.get("armed", True)),
                     "status": lv["status"],
                     "entry_price": lv["entry_price"],
                 }

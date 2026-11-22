@@ -37,7 +37,7 @@ class ExchangeConfigModel(BaseModel):
     is_active: bool = True
 
 
-GRID_STRATEGY_TYPES = ("LONG_SHORT_GRID", "TREND_GRID", "ADAPTIVE_GRID")
+GRID_STRATEGY_TYPES = ("LONG_SHORT_GRID", "REVERSE_GRID", "TREND_GRID", "ADAPTIVE_GRID")
 
 
 def is_grid_strategy(strategy_type: Optional[str]) -> bool:
@@ -46,9 +46,9 @@ def is_grid_strategy(strategy_type: Optional[str]) -> bool:
 
 class SymbolStrategy(BaseModel):
     symbol: str = Field(default="XRP/USDT:USDT", description="Unified perpetual swap symbol")
-    strategy_type: Literal["LEAD_LAG", "LONG_SHORT_GRID", "TREND_GRID", "ADAPTIVE_GRID"] = Field(
+    strategy_type: Literal["LEAD_LAG", "LONG_SHORT_GRID", "REVERSE_GRID", "TREND_GRID", "ADAPTIVE_GRID"] = Field(
         default="LEAD_LAG",
-        description="Per-symbol running strategy: LEAD_LAG, LONG_SHORT_GRID, TREND_GRID, or ADAPTIVE_GRID",
+        description="Per-symbol running strategy: LEAD_LAG, LONG_SHORT_GRID, REVERSE_GRID, TREND_GRID, or ADAPTIVE_GRID",
     )
     direction: Literal["BOTH", "LONG_ONLY", "SHORT_ONLY"] = "BOTH"
     order_usdt: float = Field(default=300.0, gt=0, le=1_000_000.0, allow_inf_nan=False, description="Notional order size in USDT")
@@ -129,7 +129,7 @@ class GlobalRiskConfig(BaseModel):
 
 class BatchSymbolUpdateRequest(BaseModel):
     action: Literal["validate", "apply"] = "validate"
-    strategy_filter: Literal["ALL_GRID", "ADAPTIVE_GRID", "TREND_GRID", "LONG_SHORT_GRID", "ALL"] = "ALL_GRID"
+    strategy_filter: Literal["ALL_GRID", "ADAPTIVE_GRID", "TREND_GRID", "LONG_SHORT_GRID", "REVERSE_GRID", "ALL"] = "ALL_GRID"
     only_running: bool = False
     order_usdt: Optional[float] = Field(default=None, ge=5.0, le=500_000.0, allow_inf_nan=False)
     grid_levels: Optional[int] = Field(default=None, ge=1, le=30)
