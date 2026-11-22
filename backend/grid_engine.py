@@ -682,7 +682,7 @@ class LongShortGridTracker:
                     and self.long_peak_price >= max_entry_l * (1.0 + pyramid_clear_move)
                 ):
                     profit_lock_l = round(vwap_be_l + 0.25 * (self.long_peak_price - vwap_be_l), prec)
-                    if self.long_peak_price >= max_entry_l * (1.0 + solo_lock_move):
+                    if self.long_peak_price >= max_entry_l * (1.0 + half_lock_move):
                         profit_lock_l = max(profit_lock_l, round(max_entry_l * (1.0 + round_trip_fee * 0.5), prec))
                     long_trail_px = max(raw_trail_l, profit_lock_l)
                 else:
@@ -770,7 +770,7 @@ class LongShortGridTracker:
                     and self.short_trough_price <= min_entry_s * max(0.05, 1.0 - pyramid_clear_move)
                 ):
                     profit_lock_s = round(vwap_be_s - 0.25 * (vwap_be_s - self.short_trough_price), prec)
-                    if self.short_trough_price <= min_entry_s * max(0.05, 1.0 - solo_lock_move):
+                    if self.short_trough_price <= min_entry_s * max(0.05, 1.0 - half_lock_move):
                         profit_lock_s = min(
                             profit_lock_s,
                             round(min_entry_s * max(0.05, 1.0 - round_trip_fee * 0.5), prec),
@@ -839,9 +839,25 @@ class LongShortGridTracker:
                 self.short_trough_price = 0.0
                 self.short_trail_stop_price = 0.0
         else:
+            rev_sl_pct = max(0.002, float(cfg.grid_stop_loss_pct))
+            rev_room_buf = max(0.0025, float(cfg.grid_step_pct) * 0.30)
             for slot_id, lv in self.levels.items():
                 if lv["status"] != "OPEN":
                     continue
+                if self.active_grid_mode == "REVERSE_OSCILLATING":
+                    e_px = float(lv.get("entry_price") or 0.0)
+                    cur_sl_px = float(lv.get("sl_price") or 0.0)
+                    if e_px > 0:
+                        if lv["side"] == "LONG":
+                            target_rev_sl = round(e_px * max(0.05, 1.0 - rev_sl_pct), prec)
+                            if cur_sl_px < target_rev_sl - 1e-12 and bid >= target_rev_sl * (1.0 + rev_room_buf):
+                                lv["sl_price"] = target_rev_sl
+                                lv["sl_needs_amend"] = True
+                        else:
+                            target_rev_sl = round(e_px * (1.0 + rev_sl_pct), prec)
+                            if (cur_sl_px <= 0 or cur_sl_px > target_rev_sl + 1e-12) and ask <= target_rev_sl * max(0.05, 1.0 - rev_room_buf):
+                                lv["sl_price"] = target_rev_sl
+                                lv["sl_needs_amend"] = True
                 if now_m < float(lv.get("exit_retry_until_mono") or 0.0):
                     continue
                 tp_px = float(lv.get("tp_price") or 0.0)

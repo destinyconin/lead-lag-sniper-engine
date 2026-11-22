@@ -4148,6 +4148,108 @@ def test_traditional_brokers_sp500_catalog_and_per_symbol_exchange_selection():
     asyncio.run(_test_api_protocols())
 
 
+def test_reverse_grid_sl_tightening_trend_pyramid_lock_and_follower_priority():
+    """
+    Verifies:
+    1) REVERSE_GRID over-wide SL (e.g. 3.80% left over from LONG_SHORT_GRID with 0.60% step) is flagged
+       by validate_and_batch_update_symbols and auto-tightened to ~1.20% (2 * step), and open REVERSE_OSCILLATING
+       slots dynamically tighten legacy over-wide sl_price on tick evaluation.
+    2) TREND_BREAKOUT multi-leg pyramid (L1 + L2) floors trailing stop above L2's breakeven once peak moves
+       >= +0.45 * step above L2.
+    3) get_leader_And_follower_cfg() prioritizes verified/configured OKX follower over unconfigured active followers.
+    """
+    from backend.grid_engine import LongShortGridTracker
+    from backend.models import BatchSymbolUpdateRequest, SymbolStrategy
+    from backend.sniper_engine import BidirectionalSniperEngine
+
+    # 1) Open REVERSE_OSCILLATING slot dynamically tightens legacy 3.80% SL to 1.20%
+    rev_cfg = SymbolStrategy(
+        symbol="ZEC/USDT:USDT",
+        strategy_type="REVERSE_GRID",
+        grid_levels=5,
+        grid_step_pct=0.006,
+        grid_take_profit_pct=0.0065,
+        grid_range_pct=0.035,
+        grid_stop_loss_pct=0.038,
+        price_precision=2,
+        qty_precision=2,
+    )
+    trk = LongShortGridTracker("ZEC/USDT:USDT")
+    entries, _ = trk.evaluate_tick(100.0, 100.0, 100.0, rev_cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert entries == []
+    entries, _ = trk.evaluate_tick(100.62, 100.63, 100.625, rev_cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert len(entries) == 1 and entries[0]["slot_id"] == "L1"
+    trk.mark_entry_filled("L1", 100.60, 1.0, 1.0, 0.05, rev_cfg, round_trip_fee=0.0007)
+    assert trk.levels["L1"]["sl_price"] == round(100.60 * (1.0 - 0.038), 2)
+
+    # User lowers grid_stop_loss_pct from 3.80% to 1.20%: next tick tightens open L1 sl_price & flags sl_needs_amend!
+    rev_cfg.grid_stop_loss_pct = 0.012
+    trk.evaluate_tick(100.55, 100.56, 100.555, rev_cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert trk.levels["L1"]["sl_price"] == round(100.60 * (1.0 - 0.012), 2)
+    assert trk.levels["L1"]["sl_needs_amend"] is True
+
+    # 2) TREND_BREAKOUT multi-leg pyramid floors profit_lock_l at L2 breakeven once peak >= L2 * (1 + 0.45 * step)
+    trend_cfg = SymbolStrategy(
+        symbol="HYPE/USDT:USDT",
+        strategy_type="TREND_GRID",
+        grid_levels=3,
+        grid_step_pct=0.008,
+        grid_range_pct=0.035,
+        grid_stop_loss_pct=0.045,
+        trend_dead_zone_mult=1.25,
+        trend_trailing_mult=1.15,
+        trend_use_bb_breakout=False,
+        price_precision=4,
+        qty_precision=2,
+    )
+    t_trk = LongShortGridTracker("HYPE/USDT:USDT")
+    t_trk.evaluate_tick(100.0, 100.0, 100.0, trend_cfg, is_net_mode=False, round_trip_fee=0.0010)
+    # Trigger L1 at 101.00 and L2 at 101.80
+    t_trk.evaluate_tick(101.02, 101.03, 101.025, trend_cfg, is_net_mode=False, round_trip_fee=0.0010)
+    t_trk.mark_entry_filled("L1", 101.00, 1.0, 1.0, 0.05, trend_cfg, round_trip_fee=0.0010)
+    t_trk.evaluate_tick(101.82, 101.83, 101.825, trend_cfg, is_net_mode=False, round_trip_fee=0.0010)
+    t_trk.mark_entry_filled("L2", 101.80, 0.6, 0.6, 0.03, trend_cfg, round_trip_fee=0.0010)
+    # Move peak to +0.55 * step above L2 (101.80 * 1.0044 = 102.2479)
+    t_trk.evaluate_tick(102.26, 102.27, 102.265, trend_cfg, is_net_mode=False, round_trip_fee=0.0010)
+    assert t_trk.long_trail_stop_price >= 101.80
+
+    # 3) Batch validator flags 3.80% SL on REVERSE_GRID (step=0.60%) and auto-tightens it, plus follower priority
+    with tempfile.TemporaryDirectory() as tmpdir:
+        adb = AsyncDatabaseManager(db_path=os.path.join(tmpdir, "rev_audit.db"))
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(91)
+        eng = BidirectionalSniperEngine(adb, user_id=91)
+        eng.strategies["ZEC/USDT:USDT"] = SymbolStrategy(
+            symbol="ZEC/USDT:USDT",
+            strategy_type="REVERSE_GRID",
+            grid_levels=5,
+            grid_step_pct=0.006,
+            grid_take_profit_pct=0.0065,
+            grid_range_pct=0.035,
+            grid_stop_loss_pct=0.038,
+        )
+        rep = eng.validate_and_batch_update_symbols(
+            BatchSymbolUpdateRequest(action="validate", strategy_filter="REVERSE_GRID")
+        )
+        zec_item = next(it for it in rep["items"] if it["symbol"] == "ZEC/USDT:USDT")
+        assert any("单格止损过宽" in iss for iss in zec_item["issues"])
+
+        fix_rep = eng.validate_and_batch_update_symbols(
+            BatchSymbolUpdateRequest(action="apply", strategy_filter="REVERSE_GRID", auto_fix_anomalies=True)
+        )
+        assert fix_rep["updated_count"] >= 1
+        assert eng.strategies["ZEC/USDT:USDT"].grid_stop_loss_pct == 0.012
+
+        # Follower priority: even if an unconfigured secondary exchange is active, verified/configured OKX wins
+        eng.exchanges = {
+            "bybit": {"exchange_id": "bybit", "role": "follower", "is_active": True, "auth_status": "UNCONFIGURED"},
+            "okx": {"exchange_id": "okx", "role": "follower", "is_active": True, "auth_status": "VERIFIED"},
+        }
+        _, follower = eng.get_leader_And_follower_cfg()
+        assert follower["exchange_id"] == "okx"
+
+
+
 
 
 

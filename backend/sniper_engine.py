@@ -1773,10 +1773,15 @@ class BidirectionalSniperEngine:
                     issues.append(
                         f"止损小于等于区间 (SL={new_cfg.grid_stop_loss_pct*100:.1f}% ≤ Range={new_cfg.grid_range_pct*100:.1f}%)"
                     )
-                elif new_cfg.strategy_type == "REVERSE_GRID" and new_cfg.grid_stop_loss_pct <= new_cfg.grid_step_pct + 1e-6:
-                    issues.append(
-                        f"单格止损小于等于步长 (SL={new_cfg.grid_stop_loss_pct*100:.2f}% ≤ Step={new_cfg.grid_step_pct*100:.2f}%)"
-                    )
+                elif new_cfg.strategy_type == "REVERSE_GRID":
+                    if new_cfg.grid_stop_loss_pct <= new_cfg.grid_step_pct + 1e-6:
+                        issues.append(
+                            f"单格止损小于等于步长 (SL={new_cfg.grid_stop_loss_pct*100:.2f}% ≤ Step={new_cfg.grid_step_pct*100:.2f}%)"
+                        )
+                    elif new_cfg.grid_stop_loss_pct > max(new_cfg.grid_step_pct * 3.2, new_cfg.grid_take_profit_pct * 3.0, 0.026):
+                        issues.append(
+                            f"单格止损过宽易造成多空对锁亏多赚少 (SL={new_cfg.grid_stop_loss_pct*100:.2f}% > 推荐≤{max(new_cfg.grid_step_pct*2.2, 0.015)*100:.2f}%)"
+                        )
                 sl_roe_pct_cur = new_cfg.grid_stop_loss_pct * max(1, int(new_cfg.leverage)) * 100.0
                 if sl_roe_pct_cur > 35.0:
                     issues.append(
@@ -1917,10 +1922,21 @@ class BidirectionalSniperEngine:
                                 new_cfg.grid_stop_loss_pct = round(min(0.90, new_cfg.grid_range_pct + 0.015), 4)
                                 fixes.append(f"修正止损→{new_cfg.grid_stop_loss_pct*100:.1f}%")
                                 changed = True
-                        elif new_cfg.strategy_type == "REVERSE_GRID" and new_cfg.grid_stop_loss_pct <= new_cfg.grid_step_pct + 1e-6:
-                            new_cfg.grid_stop_loss_pct = round(min(0.90, max(new_cfg.grid_step_pct * 2.0, new_cfg.grid_step_pct + 0.005)), 4)
-                            fixes.append(f"修正单格止损→{new_cfg.grid_stop_loss_pct*100:.2f}%")
-                            changed = True
+                        elif new_cfg.strategy_type == "REVERSE_GRID":
+                            if new_cfg.grid_stop_loss_pct <= new_cfg.grid_step_pct + 1e-6:
+                                new_cfg.grid_stop_loss_pct = round(min(0.90, max(new_cfg.grid_step_pct * 2.0, new_cfg.grid_step_pct + 0.005)), 4)
+                                fixes.append(f"修正单格止损→{new_cfg.grid_stop_loss_pct*100:.2f}%")
+                                changed = True
+                            elif (
+                                req.grid_stop_loss_pct is None
+                                and new_cfg.grid_stop_loss_pct > max(new_cfg.grid_step_pct * 3.2, new_cfg.grid_take_profit_pct * 3.0, 0.026)
+                            ):
+                                new_cfg.grid_stop_loss_pct = round(
+                                    min(0.90, max(new_cfg.grid_step_pct * 2.0, new_cfg.grid_take_profit_pct * 1.85, new_cfg.grid_step_pct + 0.005)),
+                                    4,
+                                )
+                                fixes.append(f"收紧过宽单格止损→{new_cfg.grid_stop_loss_pct*100:.2f}%")
+                                changed = True
                         if new_cfg.strategy_type in ("TREND_GRID", "ADAPTIVE_GRID"):
                             dz_span = new_cfg.trend_dead_zone_mult * new_cfg.grid_step_pct
                             if dz_span > new_cfg.grid_range_pct:
@@ -2012,10 +2028,20 @@ class BidirectionalSniperEngine:
             (ex for ex in self.exchanges.values() if ex["role"] == "leader" and ex["is_active"]),
             self.exchanges.get("binanceusdm", {"exchange_id": "binanceusdm", "display_name": "Binance USDM", "taker_fee": 0.0004, "maker_fee": 0.00018}),
         )
-        follower = next(
-            (ex for ex in self.exchanges.values() if ex["role"] == "follower" and ex["is_active"]),
-            self.exchanges.get("okx", {"exchange_id": "okx", "display_name": "OKX Swap", "taker_fee": 0.0005, "maker_fee": 0.00020}),
-        )
+        active_followers = [ex for ex in self.exchanges.values() if ex["role"] == "follower" and ex["is_active"]]
+        okx_ex = self.exchanges.get("okx")
+        if okx_ex and okx_ex.get("role") == "follower" and okx_ex.get("is_active") and (
+            okx_ex.get("auth_status") == "VERIFIED" or okx_ex.get("has_credentials") or bool(okx_ex.get("api_key"))
+        ):
+            follower = okx_ex
+        else:
+            follower = (
+                next((ex for ex in active_followers if ex.get("auth_status") == "VERIFIED"), None)
+                or next((ex for ex in active_followers if ex.get("has_credentials") or bool(ex.get("api_key"))), None)
+                or (okx_ex if okx_ex and okx_ex.get("is_active") else None)
+                or next(iter(active_followers), None)
+                or self.exchanges.get("okx", {"exchange_id": "okx", "display_name": "OKX Swap", "taker_fee": 0.0005, "maker_fee": 0.00020})
+            )
         return leader, follower
 
     async def verify_and_update_exchange(self, exchange_id: str, auto_upgrade_okx_mode: bool = False) -> Dict[str, Any]:
