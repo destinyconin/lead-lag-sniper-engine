@@ -544,9 +544,11 @@ class LongShortGridTracker:
                 # NEVER snap center_price to current_mid on routine BB refreshes — otherwise L1/S1 runs away from price!
                 if current_mid > 0 and (self.center_price <= 0 or mode_changed):
                     self.center_price = current_mid
+                    self._needs_post_trend_recenter = False
+                elif not bb_only_update:
+                    self._needs_post_trend_recenter = False
                 if self.center_price > 0:
                     self._build_levels(cfg, bbw_info=valid_bbw, preserve_cooldowns=bb_only_update)
-                self._needs_post_trend_recenter = False
                 self._last_user_sig_params = user_sig
                 self._last_sig_params = sig_params
                 if not bb_only_update:
@@ -706,6 +708,18 @@ class LongShortGridTracker:
                         if cur_sl < target_sl_l - 1e-12 and bid >= target_sl_l * (1.0 + sl_room_buf):
                             lv["sl_price"] = target_sl_l
                             lv["sl_needs_amend"] = True
+                elif (
+                    len(open_longs) >= 2
+                    and vwap_be_l > 0
+                    and self.long_peak_price >= max_entry_l * (1.0 + pyramid_clear_move)
+                    and bid >= vwap_be_l * (1.0 + sl_room_buf)
+                ):
+                    # Step up all pyramid legs' SL to combined basket VWAP breakeven so L1+L2 never nets a loss on SL!
+                    for lv in open_longs:
+                        cur_sl = float(lv.get("sl_price") or 0.0)
+                        if cur_sl < vwap_be_l - 1e-12:
+                            lv["sl_price"] = vwap_be_l
+                            lv["sl_needs_amend"] = True
 
                 # 1a. All-or-Nothing Batch Trailing Stop FIRST (harvests entire pyramid when combined net PnL > 0!)
                 if self.long_peak_price > 0 and bid <= long_trail_px:
@@ -725,7 +739,7 @@ class LongShortGridTracker:
                             for lv in remaining_longs
                             if float(lv.get("entry_price") or 0.0) > 0
                         )
-                        min_basket_net = side_notional * max(0.0012, 0.15 * step_now)
+                        min_basket_net = 0.0 if len(remaining_longs) >= 2 else (side_notional * max(0.0012, 0.15 * step_now))
                         if side_notional > 0 and side_net_pnl > max(0.0, min_basket_net):
                             for lv in remaining_longs:
                                 lv["status"] = "EXITING"
@@ -797,6 +811,18 @@ class LongShortGridTracker:
                         if (cur_sl <= 0 or cur_sl > target_sl_s + 1e-12) and ask <= target_sl_s * max(0.05, 1.0 - sl_room_buf):
                             lv["sl_price"] = target_sl_s
                             lv["sl_needs_amend"] = True
+                elif (
+                    len(open_shorts) >= 2
+                    and vwap_be_s > 0
+                    and self.short_trough_price > 0
+                    and self.short_trough_price <= min_entry_s * max(0.05, 1.0 - pyramid_clear_move)
+                    and ask <= vwap_be_s * max(0.05, 1.0 - sl_room_buf)
+                ):
+                    for lv in open_shorts:
+                        cur_sl = float(lv.get("sl_price") or 0.0)
+                        if cur_sl <= 0 or cur_sl > vwap_be_s + 1e-12:
+                            lv["sl_price"] = vwap_be_s
+                            lv["sl_needs_amend"] = True
 
                 # 1a. All-or-Nothing Batch Trailing Stop FIRST (harvests entire pyramid when combined net PnL > 0!)
                 if self.short_trough_price > 0 and ask >= short_trail_px:
@@ -816,7 +842,7 @@ class LongShortGridTracker:
                             for lv in remaining_shorts
                             if float(lv.get("entry_price") or 0.0) > 0
                         )
-                        min_basket_net = side_notional * max(0.0012, 0.15 * step_now)
+                        min_basket_net = 0.0 if len(remaining_shorts) >= 2 else (side_notional * max(0.0012, 0.15 * step_now))
                         if side_notional > 0 and side_net_pnl > max(0.0, min_basket_net):
                             for lv in remaining_shorts:
                                 lv["status"] = "EXITING"

@@ -4221,6 +4221,20 @@ def test_reverse_grid_sl_tightening_trend_pyramid_lock_and_follower_priority():
     # Move peak to +0.55 * step above L2 (101.80 * 1.0044 = 102.2479)
     t_trk.evaluate_tick(102.26, 102.27, 102.265, trend_cfg, is_net_mode=False, round_trip_fee=0.0010)
     assert t_trk.long_trail_stop_price >= 101.80
+    # Both L1 and L2 SL step up to combined basket VWAP breakeven (> L1 solo breakeven 101.16)
+    assert t_trk.levels["L1"]["sl_price"] >= 101.40
+    assert t_trk.levels["L2"]["sl_price"] >= 101.40
+
+    # And routine BB-only refreshes during post-SL cooldown MUST NOT wipe _needs_post_trend_recenter!
+    t_trk.mark_exited("L1", 0.05, is_sl=True)
+    t_trk.mark_exited("L2", -0.02, is_sl=True)
+    assert t_trk._needs_post_trend_recenter is True
+    t_trk.sync_config(
+        trend_cfg,
+        current_mid=101.50,
+        bbw_info={"timeframe": "15m", "bbw_pct": 2.2, "bbw_percentile": 25.0, "bb_upper": 103.0, "bb_lower": 99.0},
+    )
+    assert t_trk._needs_post_trend_recenter is True
 
     # 3) Verify REVERSE_OSCILLATING executes BOTH LONG and SHORT grid arbitrage unrestricted by BULL/BEAR trend_bias,
     #    and re-arms on shallow grid pullbacks (e.g. JUP dipping 0.05% below L2)
