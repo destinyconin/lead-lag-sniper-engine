@@ -226,7 +226,11 @@ export default function MarketSentimentChart({
                 tradMarketOpen ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
               }`}
             />
-            {tradMarketOpen ? '双市场实时同步' : '传统市场休市 · 虚线沿用收盘'}
+            {tradMarketOpen
+              ? '双市场实时同步'
+              : activeSeries.some((p) => p.trad_proxy)
+              ? '美股休市 · 虚线为 SPY/QQQ 24H 代理'
+              : '传统市场休市 · 虚线沿用收盘'}
           </span>
         </div>
 
@@ -302,7 +306,7 @@ export default function MarketSentimentChart({
             </span>
             <span className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold ${tradMeta.cls}`}>
               {tradMeta.label}
-              {activeRaw && !activeRaw.trad_live ? '·休' : ''}
+              {activeRaw && !activeRaw.trad_live ? (activeRaw.trad_proxy ? '·盘外' : '·休') : ''}
             </span>
           </div>
           <div className="flex items-baseline gap-2 mt-1 font-mono">

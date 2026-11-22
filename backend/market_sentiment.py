@@ -167,6 +167,57 @@ def _parse_okx_ls_ratio(payload: Any) -> Dict[int, float]:
     return out
 
 
+def _parse_cnbc_candles(payload: Any, require_activity: bool = True) -> Dict[int, dict]:
+    """
+    Parses CNBC Harmony 5D JSON (`barData.priceBars`) 5-minute bars into UTC top-of-hour 1H OHLCV buckets.
+    Filters out CNBC weekend stale-heartbeat flat bars (`o==h==l==c` with zero volume on Sat/Sun).
+    """
+    out: Dict[int, dict] = {}
+    if not isinstance(payload, dict):
+        return out
+    bars = (payload.get("barData") or {}).get("priceBars") or []
+    for b in bars:
+        if not isinstance(b, dict):
+            continue
+        try:
+            ms = int(b.get("tradeTimeinMills") or 0)
+            if ms <= 0:
+                continue
+            ts_raw = ms // 1000
+            o = float(b.get("open") or 0.0)
+            h = float(b.get("high") or 0.0)
+            l = float(b.get("low") or 0.0)
+            c = float(b.get("close") or 0.0)
+            v = float(b.get("volume") or 0.0)
+            if c <= 0 or h <= 0 or l <= 0:
+                continue
+            dt = datetime.datetime.fromtimestamp(ts_raw, datetime.timezone.utc)
+            is_flat = abs(h - l) < 1e-9 and abs(o - c) < 1e-9
+            # Skip synthetic flat weekend heartbeat prints (Saturday all day, Sunday before 22:00 UTC, Friday after 22:15 UTC)
+            if is_flat and v <= 0:
+                wd = dt.weekday()
+                if wd == 5 or (wd == 6 and dt.hour < 22) or (wd == 4 and (dt.hour > 22 or (dt.hour == 22 and dt.minute >= 15))):
+                    continue
+            if require_activity and is_flat and v <= 0:
+                continue
+            ts_hour = (ts_raw // 3600) * 3600
+            existing = out.get(ts_hour)
+            if existing is None:
+                out[ts_hour] = {"o": o, "h": h, "l": l, "c": c, "v": v, "_last_ts": ts_raw}
+            else:
+                existing["h"] = max(existing["h"], h)
+                existing["l"] = min(existing["l"], l)
+                existing["v"] += v
+                if ts_raw >= existing["_last_ts"]:
+                    existing["c"] = c
+                    existing["_last_ts"] = ts_raw
+        except Exception:
+            continue
+    for node in out.values():
+        node.pop("_last_ts", None)
+    return out
+
+
 def _parse_yahoo_candles(payload: Any) -> Dict[int, dict]:
     out: Dict[int, dict] = {}
     if not isinstance(payload, dict):
@@ -217,6 +268,9 @@ def compute_hourly_sentiment_comparison(
     cnn_fng_latest: Optional[float],
     now_ts_sec: Optional[int] = None,
     data_sources: Optional[List[str]] = None,
+    spy_proxy_candles: Optional[Dict[int, dict]] = None,
+    qqq_proxy_candles: Optional[Dict[int, dict]] = None,
+    xau_proxy_candles: Optional[Dict[int, dict]] = None,
 ) -> Dict[str, Any]:
     """
     Pure deterministic calculator that turns raw hourly crypto & tradfi series into
@@ -416,6 +470,88 @@ def compute_hourly_sentiment_comparison(
             "anchor": round(float(anchor), 1) if anchor is not None else None,
         }
 
+    # 2b. Compute 24/7 TradFi proxy hourly sentiment (OKX SPY/QQQ/XAU perps) for weekend / closed-market continuity
+    spy_c = spy_proxy_candles or {}
+    qqq_c = qqq_proxy_candles or {}
+    xau_c = xau_proxy_candles or {}
+    trad_proxy_by_hour: Dict[int, dict] = {}
+    proxy_union_hours = sorted(set(spy_c.keys()) | set(qqq_c.keys()))
+    if proxy_union_hours:
+        spy_h = sorted(spy_c.keys())
+        qqq_h = sorted(qqq_c.keys())
+        xau_h = sorted(xau_c.keys())
+        spy_i = {h: i for i, h in enumerate(spy_h)}
+        qqq_i = {h: i for i, h in enumerate(qqq_h)}
+        xau_i = {h: i for i, h in enumerate(xau_h)}
+        spy_ema = _compute_ema_map(spy_c, 20)
+        qqq_ema = _compute_ema_map(qqq_c, 20)
+        ref_vix = last_vix_val
+        for h in proxy_union_hours:
+            if h in trad_by_hour:
+                continue
+            r1_s, r6_s, r24_s, dev_s, w_s = 0.0, 0.0, 0.0, 0.0, 0.0
+            spy_px = None
+            spy_r1 = None
+            spy_r6 = None
+            qqq_r1 = None
+            if h in spy_i:
+                si = spy_i[h]
+                sc = float(spy_c[h]["c"])
+                spy_px = sc
+                sr1 = _return_over_steps(spy_h, si, spy_c, 1)
+                sr6 = _return_over_steps(spy_h, si, spy_c, 6)
+                sr24 = _return_over_steps(spy_h, si, spy_c, 24)
+                sdev = (sc - spy_ema.get(h, sc)) / max(1e-9, spy_ema.get(h, sc))
+                spy_r1, spy_r6 = sr1, sr6
+                r1_s += sr1 * 0.55
+                r6_s += sr6 * 0.55
+                r24_s += sr24 * 0.55
+                dev_s += sdev * 0.55
+                w_s += 0.55
+            if h in qqq_i:
+                qi = qqq_i[h]
+                qc = float(qqq_c[h]["c"])
+                qr1 = _return_over_steps(qqq_h, qi, qqq_c, 1)
+                qr6 = _return_over_steps(qqq_h, qi, qqq_c, 6)
+                qr24 = _return_over_steps(qqq_h, qi, qqq_c, 24)
+                qdev = (qc - qqq_ema.get(h, qc)) / max(1e-9, qqq_ema.get(h, qc))
+                qqq_r1 = qr1
+                r1_s += qr1 * 0.45
+                r6_s += qr6 * 0.45
+                r24_s += qr24 * 0.45
+                dev_s += qdev * 0.45
+                w_s += 0.45
+            if w_s <= 0:
+                continue
+            r1, r6, r24, dev = r1_s / w_s, r6_s / w_s, r24_s / w_s, dev_s / w_s
+            z_mom = 0.32 * (r1 / 0.0035) + 0.30 * (r6 / 0.0090) + 0.23 * (r24 / 0.0180) + 0.15 * (dev / 0.010)
+            mom_score = _tanh_score(z_mom, amplitude=45.0)
+            vix_score = (
+                _clamp(50.0 + 45.0 * math.tanh((19.5 - ref_vix) / 9.5), 2.0, 98.0)
+                if (ref_vix is not None and ref_vix > 0)
+                else mom_score
+            )
+            if h in xau_i and spy_r6 is not None:
+                xi = xau_i[h]
+                xr6 = _return_over_steps(xau_h, xi, xau_c, 6)
+                haven_score = _tanh_score((spy_r6 - xr6) / 0.012, amplitude=42.0)
+            else:
+                haven_score = mom_score
+            anchor = _lookup_daily_anchor(cnn_fng_daily, h, cnn_fng_latest)
+            if anchor is not None:
+                score = 0.40 * mom_score + 0.25 * vix_score + 0.10 * haven_score + 0.25 * float(anchor)
+            else:
+                score = 0.54 * mom_score + 0.34 * vix_score + 0.12 * haven_score
+            trad_proxy_by_hour[h] = {
+                "score": round(_clamp(score, 2.0, 98.0), 1),
+                "es_px": round(spy_px * 10.0, 2) if spy_px is not None else None,
+                "es_ret_1h_pct": round(spy_r1 * 100.0, 2) if spy_r1 is not None else None,
+                "nq_ret_1h_pct": round(qqq_r1 * 100.0, 2) if qqq_r1 is not None else None,
+                "vix": round(ref_vix, 2) if ref_vix is not None else None,
+                "anchor": round(float(anchor), 1) if anchor is not None else None,
+                "is_proxy": True,
+            }
+
     # 3. Build aligned 72H chronological timeline & latest 24H overlapping active trading timeline
     all_crypto_hours = sorted(crypto_by_hour.keys())
     all_trad_hours = sorted(trad_by_hour.keys())
@@ -432,6 +568,7 @@ def compute_hourly_sentiment_comparison(
             "trad_score": round(t_sc, 1),
             "spread": spread,
             "trad_live": is_trad_live,
+            "trad_proxy": bool(t_node.get("is_proxy")) if t_node else False,
             "btc_px": c_node.get("btc_px"),
             "btc_ret_1h_pct": c_node.get("btc_ret_1h_pct"),
             "taker_buy_pct": c_node.get("taker_buy_pct"),
@@ -442,7 +579,7 @@ def compute_hourly_sentiment_comparison(
             "vix": t_node.get("vix") if t_node else None,
         }
 
-    # Timeline 1: Last 72 hours (chronological, carrying forward TradFi last active bar during CME/weekend closures)
+    # Timeline 1: Last 72 hours (official CME/CBOE when open; 24/7 SPY/QQQ/XAU proxy or last close when closed)
     timeline_hours = all_crypto_hours[-72:] if all_crypto_hours else all_trad_hours[-72:]
     series_72h: List[dict] = []
     last_known_trad: Optional[dict] = None
@@ -461,6 +598,9 @@ def compute_hourly_sentiment_comparison(
         if h in trad_by_hour:
             last_known_trad = trad_by_hour[h]
             series_72h.append(_build_point(h, c_node, last_known_trad, True))
+        elif h in trad_proxy_by_hour:
+            p_node = trad_proxy_by_hour[h]
+            series_72h.append(_build_point(h, c_node, p_node, False))
         else:
             series_72h.append(_build_point(h, c_node, last_known_trad, False))
 
@@ -664,11 +804,14 @@ class MarketSentimentService:
                         _fetch_json(client, "https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=BTC&period=1H"),
                         _fetch_json(client, "https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP"),
                         _fetch_json(client, "https://api.alternative.me/fng/?limit=7"),
-                        _fetch_json(client, "https://query1.finance.yahoo.com/v8/finance/chart/ES=F?interval=1h&range=5d"),
-                        _fetch_json(client, "https://query1.finance.yahoo.com/v8/finance/chart/NQ=F?interval=1h&range=5d"),
-                        _fetch_json(client, "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1h&range=5d"),
-                        _fetch_json(client, "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1h&range=5d"),
+                        _fetch_json(client, "https://ts-api.cnbc.com/harmony/app/charts/5D.json?symbol=@SP.1"),
+                        _fetch_json(client, "https://ts-api.cnbc.com/harmony/app/charts/5D.json?symbol=@ND.1"),
+                        _fetch_json(client, "https://ts-api.cnbc.com/harmony/app/charts/5D.json?symbol=.VIX"),
+                        _fetch_json(client, "https://ts-api.cnbc.com/harmony/app/charts/5D.json?symbol=@GC.1"),
                         _fetch_json(client, "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"),
+                        _fetch_json(client, "https://www.okx.com/api/v5/market/candles?instId=SPY-USDT-SWAP&bar=1H&limit=100"),
+                        _fetch_json(client, "https://www.okx.com/api/v5/market/candles?instId=QQQ-USDT-SWAP&bar=1H&limit=100"),
+                        _fetch_json(client, "https://www.okx.com/api/v5/market/candles?instId=XAU-USDT-SWAP&bar=1H&limit=100"),
                     )
             except Exception:
                 return self._cache
@@ -681,11 +824,14 @@ class MarketSentimentService:
                 okx_ls_raw,
                 okx_fund_raw,
                 alt_fng_raw,
-                yf_es_raw,
-                yf_nq_raw,
-                yf_vix_raw,
-                yf_gc_raw,
+                cnbc_es_raw,
+                cnbc_nq_raw,
+                cnbc_vix_raw,
+                cnbc_gc_raw,
                 cnn_fng_raw,
+                okx_spy_raw,
+                okx_qqq_raw,
+                okx_xau_raw,
             ) = results
 
             btc_candles = _parse_okx_candles(okx_btc_raw)
@@ -716,10 +862,13 @@ class MarketSentimentService:
                     except Exception:
                         continue
 
-            es_candles = _parse_yahoo_candles(yf_es_raw)
-            nq_candles = _parse_yahoo_candles(yf_nq_raw)
-            vix_candles = _parse_yahoo_candles(yf_vix_raw)
-            gc_candles = _parse_yahoo_candles(yf_gc_raw)
+            es_candles = _parse_cnbc_candles(cnbc_es_raw, require_activity=True)
+            nq_candles = _parse_cnbc_candles(cnbc_nq_raw, require_activity=True)
+            vix_candles = _parse_cnbc_candles(cnbc_vix_raw, require_activity=False)
+            gc_candles = _parse_cnbc_candles(cnbc_gc_raw, require_activity=True)
+            spy_proxy_candles = _parse_okx_candles(okx_spy_raw)
+            qqq_proxy_candles = _parse_okx_candles(okx_qqq_raw)
+            xau_proxy_candles = _parse_okx_candles(okx_xau_raw)
 
             cnn_fng_daily: Dict[str, float] = {}
             cnn_fng_latest: Optional[float] = None
@@ -745,9 +894,11 @@ class MarketSentimentService:
             if crypto_fng_latest is not None:
                 sources_ok.append("Alternative.me 加密恐贪")
             if es_candles or nq_candles:
-                sources_ok.append("CME 标普/纳指期货 1H")
+                sources_ok.append("CNBC CME 标普/纳指期货 1H")
             if vix_candles:
-                sources_ok.append("CBOE VIX 1H")
+                sources_ok.append("CNBC CBOE VIX 1H")
+            if spy_proxy_candles or qqq_proxy_candles:
+                sources_ok.append("OKX SPY/QQQ/XAU 24H盘外代理")
             if cnn_fng_latest is not None:
                 sources_ok.append("CNN 传统恐贪指数")
 
@@ -767,6 +918,9 @@ class MarketSentimentService:
                 cnn_fng_daily=cnn_fng_daily,
                 cnn_fng_latest=cnn_fng_latest,
                 data_sources=sources_ok,
+                spy_proxy_candles=spy_proxy_candles,
+                qqq_proxy_candles=qqq_proxy_candles,
+                xau_proxy_candles=xau_proxy_candles,
             )
             if computed.get("ok"):
                 self._cache = computed
