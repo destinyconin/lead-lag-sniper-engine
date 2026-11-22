@@ -53,6 +53,7 @@ from backend.models import (
     is_traditional_broker,
 )
 from backend.payment_monitor import OnChainPaymentMonitor
+from backend.market_sentiment import market_sentiment_service
 from backend.sniper_engine import BidirectionalSniperEngine
 from backend.user_membership import rate_limiter, user_manager
 
@@ -69,8 +70,10 @@ SYMBOL_FORMAT_RE = re.compile(r"^[A-Z0-9]{1,20}/USDT:USDT$")
 async def lifespan(app: FastAPI):
     user_manager.init_sync()
     payment_monitor.start()
+    market_sentiment_service.start()
     await engine_manager.start()
     yield
+    await market_sentiment_service.stop()
     await payment_monitor.stop()
     await engine_manager.stop()
 
@@ -1120,6 +1123,11 @@ async def admin_delete_vip_code(code_id: int, authorization: str = Header(defaul
     _require_admin(authorization)
     res = user_manager.admin_delete_vip_code(code_id)
     return {**res, "dashboard": _admin_summary()}
+
+
+@app.get("/api/market/sentiment")
+async def get_market_sentiment(refresh: bool = Query(default=False)):
+    return await market_sentiment_service.get_sentiment(force_refresh=bool(refresh))
 
 
 # ==================== 6. Stats & Real-Time WebSocket Stream (Tenant-Isolated) ====================

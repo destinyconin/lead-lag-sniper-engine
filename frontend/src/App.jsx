@@ -33,7 +33,7 @@ import {
   Wifi,
   Zap,
 } from 'lucide-react';
-import RadarChart from './components/RadarChart';
+import MarketSentimentChart from './components/MarketSentimentChart';
 import EquityChart from './components/EquityChart';
 import { AuthModal, MembershipCenterView, AdminSystemView } from './components/UserMembershipViews';
 
@@ -496,6 +496,8 @@ export default function App() {
   const [analyticsSymbolFilter, setAnalyticsSymbolFilter] = useState('ALL');
   const [analyticsStrategyFilter, setAnalyticsStrategyFilter] = useState('ALL');
   const [showRunningOnly, setShowRunningOnly] = useState(true);
+  const [marketSentiment, setMarketSentiment] = useState(null);
+  const [sentimentLoading, setSentimentLoading] = useState(false);
 
   // User Auth & Membership State
   const [authToken, setAuthToken] = useState(() => localStorage.getItem('sniper_auth_token') || '');
@@ -710,6 +712,28 @@ export default function App() {
   useEffect(() => {
     fetchInitialData();
   }, [fetchInitialData]);
+
+  const fetchMarketSentiment = useCallback(async (forceRefresh = false) => {
+    setSentimentLoading(true);
+    try {
+      const url = forceRefresh ? '/api/market/sentiment?refresh=true' : '/api/market/sentiment';
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        setMarketSentiment(data);
+      }
+    } catch (err) {
+      console.error('Market sentiment fetch error:', err);
+    } finally {
+      setSentimentLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchMarketSentiment(false);
+    const timer = setInterval(() => fetchMarketSentiment(false), 60000);
+    return () => clearInterval(timer);
+  }, [fetchMarketSentiment]);
 
   useEffect(() => {
     const ws = wsRef.current;
@@ -1723,7 +1747,6 @@ export default function App() {
   };
 
   const currentTelemetry = snapshot.telemetry?.[selectedSymbol] || {};
-  const currentRadarSeries = snapshot.radar_series?.[selectedSymbol] || [];
   const stats = snapshot.stats || {};
   const realityGap = snapshot.reality_gap || {};
   const liveStatus = snapshot.live_status || {};
@@ -2858,14 +2881,13 @@ export default function App() {
               )}
             </div>
 
-            {/* Chart + Real-Time Terminal Log */}
+            {/* Hourly Crypto vs Traditional Sentiment Chart + Real-Time Terminal Log */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-5">
               <div className="lg:col-span-7">
-                <RadarChart
-                  symbol={selectedSymbol}
-                  series={currentRadarSeries}
-                  telemetry={currentTelemetry}
-                  strategy={currentStrategy}
+                <MarketSentimentChart
+                  sentiment={marketSentiment}
+                  loading={sentimentLoading}
+                  onRefresh={fetchMarketSentiment}
                   theme={theme}
                 />
               </div>

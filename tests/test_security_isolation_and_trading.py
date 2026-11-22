@@ -4292,6 +4292,74 @@ def test_reverse_grid_sl_tightening_trend_pyramid_lock_and_follower_priority():
         assert follower["exchange_id"] == "okx"
 
 
+def test_hourly_crypto_vs_traditional_market_sentiment_comparison():
+    from backend.market_sentiment import compute_hourly_sentiment_comparison, sentiment_regime_label
+
+    base_h = 1_795_200_000  # aligned UTC hour
+    base_h = (base_h // 3600) * 3600
+
+    # Build 48 hours of crypto (rising bullish) vs 30 hours of tradfi (falling bearish + rising VIX, then closed 18h)
+    btc_c, eth_c, sol_c = {}, {}, {}
+    taker_ratio, ls_map = {}, {}
+    es_c, nq_c, vix_c, gc_c = {}, {}, {}, {}
+
+    for i in range(48):
+        h = base_h + i * 3600
+        bp = 60000.0 * (1.0 + 0.0022 * i)
+        btc_c[h] = {"o": bp * 0.998, "h": bp * 1.003, "l": bp * 0.997, "c": bp, "v": 1000.0}
+        ep = 2000.0 * (1.0 + 0.0025 * i)
+        eth_c[h] = {"o": ep * 0.998, "h": ep * 1.003, "l": ep * 0.997, "c": ep, "v": 5000.0}
+        sp = 100.0 * (1.0 + 0.0030 * i)
+        sol_c[h] = {"o": sp * 0.998, "h": sp * 1.004, "l": sp * 0.997, "c": sp, "v": 8000.0}
+        taker_ratio[h] = 0.58  # net aggressive buying
+        ls_map[h] = 1.15 + 0.01 * i
+
+        if i < 30:
+            esp = 6000.0 * (1.0 - 0.0012 * i)
+            es_c[h] = {"o": esp * 1.001, "h": esp * 1.002, "l": esp * 0.998, "c": esp, "v": 10000.0}
+            nqp = 21000.0 * (1.0 - 0.0015 * i)
+            nq_c[h] = {"o": nqp * 1.001, "h": nqp * 1.002, "l": nqp * 0.998, "c": nqp, "v": 9000.0}
+            vixp = 20.0 + 0.55 * i
+            vix_c[h] = {"o": vixp - 0.2, "h": vixp + 0.3, "l": vixp - 0.3, "c": vixp, "v": 0.0}
+            gcp = 3400.0 * (1.0 + 0.0008 * i)
+            gc_c[h] = {"o": gcp * 0.999, "h": gcp * 1.001, "l": gcp * 0.998, "c": gcp, "v": 500.0}
+
+    res = compute_hourly_sentiment_comparison(
+        btc_candles=btc_c,
+        eth_candles=eth_c,
+        sol_candles=sol_c,
+        taker_buy_ratio=taker_ratio,
+        ls_ratio_map=ls_map,
+        funding_rate=0.0002,
+        crypto_fng_daily={},
+        crypto_fng_latest=72.0,
+        es_candles=es_c,
+        nq_candles=nq_c,
+        vix_candles=vix_c,
+        gc_candles=gc_c,
+        cnn_fng_daily={},
+        cnn_fng_latest=15.0,
+        now_ts_sec=base_h + 47 * 3600 + 600,
+        data_sources=["OKX BTC/ETH/SOL 1H", "CME 标普/纳指期货 1H", "CBOE VIX 1H"],
+    )
+
+    assert res["ok"] is True
+    assert res["is_live_data"] is True
+    assert res["trad_market_open"] is False  # Last TradFi bar was 18 hours before now
+    assert len(res["series_72h"]) == 48
+    assert len(res["series_overlap_24h"]) == 24
+    # First 30 bars have trad_live=True, final 18 bars have trad_live=False (carried forward cleanly)
+    assert all(p["trad_live"] is True for p in res["series_72h"][:30])
+    assert all(p["trad_live"] is False for p in res["series_72h"][30:])
+    assert res["summary"]["crypto_score"] > 65.0
+    assert res["summary"]["trad_score"] < 35.0
+    assert res["summary"]["spread"] > 30.0
+    assert res["summary"]["correlation_24h"] is not None
+    assert sentiment_regime_label(res["summary"]["crypto_score"]) in ("贪婪", "极度贪婪")
+    assert sentiment_regime_label(res["summary"]["trad_score"]) in ("恐慌", "极度恐慌")
+
+
+
 
 
 
