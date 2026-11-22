@@ -226,6 +226,54 @@ def okx_inst_id_to_unified(inst_id: str) -> str:
     return inst_id
 
 
+def to_bybit_symbol(unified_sym: str) -> str:
+    """Converts 'XRP/USDT:USDT' -> 'XRPUSDT', 'PEPE/USDT:USDT' -> '1000PEPEUSDT' per Bybit V5 Linear spec."""
+    base = unified_sym.split("/")[0].upper()
+    if base in ("PEPE", "SHIB", "BONK", "FLOKI", "LUNC", "XEC", "RATS", "SATS", "CAT", "TURBO"):
+        return f"1000{base}USDT"
+    return f"{base}USDT"
+
+
+def to_bitget_symbol(unified_sym: str) -> str:
+    """Converts 'XRP/USDT:USDT' -> 'XRPUSDT' per Bitget V2 USDT-FUTURES spec."""
+    base = unified_sym.split("/")[0].upper()
+    return f"{base}USDT"
+
+
+def to_gate_contract(unified_sym: str) -> str:
+    """Converts 'XRP/USDT:USDT' -> 'XRP_USDT' per Gate.io V4 Futures spec."""
+    base = unified_sym.split("/")[0].upper()
+    return f"{base}_USDT"
+
+
+def to_kraken_futures_symbol(unified_sym: str) -> str:
+    """Converts 'BTC/USDT:USDT' -> 'PF_XBTUSD', 'XRP/USDT:USDT' -> 'PF_XRPUSD' per Kraken Futures v3 spec."""
+    base = unified_sym.split("/")[0].upper()
+    if base == "BTC":
+        base = "XBT"
+    elif base == "DOGE":
+        base = "XDG"
+    return f"PF_{base}USD"
+
+
+def to_futu_moomoo_code(unified_sym: str) -> str:
+    """Converts 'SPY/USDT:USDT' -> 'US.SPY', 'BRKB/USDT:USDT' -> 'US.BRK.B' per Futu/Moomoo OpenD Security code spec."""
+    base = unified_sym.split("/")[0].upper()
+    if base == "BRKB":
+        base = "BRK.B"
+    elif base == "SPX":
+        return "US.SPX"
+    return f"US.{base}"
+
+
+def to_us_equity_symbol(unified_sym: str) -> str:
+    """Converts 'SPY/USDT:USDT' -> 'SPY', 'BRKB/USDT:USDT' -> 'BRK.B' per IBKR / Charles Schwab Trader API spec."""
+    base = unified_sym.split("/")[0].upper()
+    if base == "BRKB":
+        return "BRK.B"
+    return base
+
+
 # Shared module-level instrument caches (refreshed by MarketDataGateway & preflight)
 _OKX_INSTRUMENT_CACHE: Dict[str, dict] = {}
 _BINANCE_INSTRUMENT_CACHE: Dict[str, dict] = {}

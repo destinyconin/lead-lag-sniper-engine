@@ -742,42 +742,49 @@ class ExecutionAdapter:
                 "account_equity_usdt": 0.0,
             }
 
-        # 2. Real Binance USDM Verification (+ dualSidePosition check)
+        # 2. Real Binance USDM Verification (+ dualSidePosition check & Testnet fallback per Binance FAPI v2 docs)
         if ex_id == "binanceusdm":
             try:
-                ts_ms = int(time.time() * 1000)
-                query_str = f"timestamp={ts_ms}&recvWindow=5000"
-                sig = hmac.new(api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
-                url = f"https://fapi.binance.com/fapi/v2/balance?{query_str}&signature={sig}"
                 async with httpx.AsyncClient(proxy=proxy, timeout=6.0) as client:
-                    resp = await client.get(url, headers={"X-MBX-APIKEY": api_key})
-                    body = resp.json()
-                    if resp.status_code == 200 and isinstance(body, list):
-                        usdt_bal = 0.0
-                        for asset in body:
-                            if asset.get("asset") == "USDT":
-                                usdt_bal = float(asset.get("balance") or 0.0)
-                        pos_mode_label = "单向持仓"
-                        try:
-                            q2 = f"timestamp={int(time.time()*1000)}&recvWindow=5000"
-                            s2 = hmac.new(api_secret.encode("utf-8"), q2.encode("utf-8"), hashlib.sha256).hexdigest()
-                            r2 = await client.get(
-                                f"https://fapi.binance.com/fapi/v1/positionSide/dual?{q2}&signature={s2}",
-                                headers={"X-MBX-APIKEY": api_key},
-                            )
-                            if r2.status_code == 200 and isinstance(r2.json(), dict):
-                                pos_mode_label = "双向持仓" if r2.json().get("dualSidePosition") else "单向持仓"
-                        except Exception:
-                            pass
-                        return {
-                            "ok": True,
-                            "auth_status": "VERIFIED",
-                            "auth_message": f"已配置且验证通过 (币安实盘合约 · {pos_mode_label} · 余额: {usdt_bal:.2f} USDT)",
-                            "account_equity_usdt": round(usdt_bal, 2),
-                        }
-                    else:
+                    for bn_base, env_label in (
+                        ("https://fapi.binance.com", "币安实盘合约"),
+                        ("https://testnet.binancefuture.com", "币安模拟合约 Testnet"),
+                    ):
+                        ts_ms = int(time.time() * 1000)
+                        query_str = f"timestamp={ts_ms}&recvWindow=5000"
+                        sig = hmac.new(api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
+                        url = f"{bn_base}/fapi/v2/balance?{query_str}&signature={sig}"
+                        resp = await client.get(url, headers={"X-MBX-APIKEY": api_key})
+                        body = resp.json()
+                        if resp.status_code == 200 and isinstance(body, list):
+                            usdt_bal = 0.0
+                            for asset in body:
+                                if asset.get("asset") == "USDT":
+                                    cw = float(asset.get("crossWalletBalance") or asset.get("balance") or 0.0)
+                                    upnl = float(asset.get("crossUnPnl") or 0.0)
+                                    usdt_bal = (cw + upnl) if cw > 0 else float(asset.get("balance") or 0.0)
+                            pos_mode_label = "单向持仓"
+                            try:
+                                q2 = f"timestamp={int(time.time()*1000)}&recvWindow=5000"
+                                s2 = hmac.new(api_secret.encode("utf-8"), q2.encode("utf-8"), hashlib.sha256).hexdigest()
+                                r2 = await client.get(
+                                    f"{bn_base}/fapi/v1/positionSide/dual?{q2}&signature={s2}",
+                                    headers={"X-MBX-APIKEY": api_key},
+                                )
+                                if r2.status_code == 200 and isinstance(r2.json(), dict):
+                                    pos_mode_label = "双向持仓" if r2.json().get("dualSidePosition") else "单向持仓"
+                            except Exception:
+                                pass
+                            return {
+                                "ok": True,
+                                "auth_status": "VERIFIED",
+                                "auth_message": f"已配置且验证通过 ({env_label} · {pos_mode_label} · 权益: {usdt_bal:.2f} USDT)",
+                                "account_equity_usdt": round(usdt_bal, 2),
+                            }
                         err_code = body.get("code", resp.status_code) if isinstance(body, dict) else resp.status_code
                         err_msg = body.get("msg", "密钥无效") if isinstance(body, dict) else "密钥校验未通过"
+                        if bn_base == "https://fapi.binance.com" and err_code in (-2015, -2014):
+                            continue
                         return {
                             "ok": False,
                             "auth_status": "ERROR",
@@ -792,38 +799,58 @@ class ExecutionAdapter:
                     "account_equity_usdt": 0.0,
                 }
 
-        # 3. Real Bybit V5 Verification (/v5/account/wallet-balance)
+        # 3. Real Bybit V5 Verification (/v5/account/wallet-balance with UNIFIED/CONTRACT & Demo fallback per Bybit V5 docs)
         if ex_id == "bybit":
             try:
                 async with httpx.AsyncClient(proxy=proxy, timeout=6.0) as client:
-                    ts = str(int(time.time() * 1000))
-                    recv_w = "5000"
-                    q = "accountType=UNIFIED"
-                    pre = f"{ts}{api_key}{recv_w}{q}"
-                    sign = hmac.new(api_secret.encode("utf-8"), pre.encode("utf-8"), hashlib.sha256).hexdigest()
-                    hdrs = {
-                        "X-BAPI-API-KEY": api_key,
-                        "X-BAPI-TIMESTAMP": ts,
-                        "X-BAPI-RECV-WINDOW": recv_w,
-                        "X-BAPI-SIGN": sign,
-                    }
-                    r = await client.get(f"https://api.bybit.com/v5/account/wallet-balance?{q}", headers=hdrs)
-                    b = r.json()
-                    if b.get("retCode") == 0:
-                        eq = 0.0
-                        lst = b.get("result", {}).get("list", [])
-                        if lst:
-                            eq = float(lst[0].get("totalEquity") or 0.0)
-                        return {
-                            "ok": True,
-                            "auth_status": "VERIFIED",
-                            "auth_message": f"已配置且验证通过 (Bybit V5 统一账户 · 权益: {eq:.2f} USDT)",
-                            "account_equity_usdt": round(eq, 2),
-                        }
+                    last_code = -1
+                    last_msg = "认证未通过"
+                    for bybit_base, env_label in (
+                        ("https://api.bybit.com", "Bybit V5 实盘"),
+                        ("https://api-demo.bybit.com", "Bybit V5 模拟盘"),
+                        ("https://api-testnet.bybit.com", "Bybit V5 Testnet"),
+                    ):
+                        for acct_type in ("UNIFIED", "CONTRACT"):
+                            ts = str(int(time.time() * 1000))
+                            recv_w = "5000"
+                            q = f"accountType={acct_type}"
+                            pre = f"{ts}{api_key}{recv_w}{q}"
+                            sign = hmac.new(api_secret.encode("utf-8"), pre.encode("utf-8"), hashlib.sha256).hexdigest()
+                            hdrs = {
+                                "X-BAPI-API-KEY": api_key,
+                                "X-BAPI-TIMESTAMP": ts,
+                                "X-BAPI-RECV-WINDOW": recv_w,
+                                "X-BAPI-SIGN": sign,
+                                "X-BAPI-SIGN-TYPE": "2",
+                            }
+                            r = await client.get(f"{bybit_base}/v5/account/wallet-balance?{q}", headers=hdrs)
+                            b = r.json()
+                            ret_code = b.get("retCode")
+                            if ret_code == 0:
+                                eq = 0.0
+                                lst = b.get("result", {}).get("list", [])
+                                if lst:
+                                    eq = float(lst[0].get("totalEquity") or 0.0)
+                                    if eq <= 0:
+                                        for c_row in lst[0].get("coin", []):
+                                            if c_row.get("coin") == "USDT":
+                                                eq = float(c_row.get("equity") or c_row.get("walletBalance") or 0.0)
+                                return {
+                                    "ok": True,
+                                    "auth_status": "VERIFIED",
+                                    "auth_message": f"已配置且验证通过 ({env_label} · {acct_type} · 权益: {eq:.2f} USDT)",
+                                    "account_equity_usdt": round(eq, 2),
+                                }
+                            last_code = ret_code
+                            last_msg = b.get("retMsg", "认证未通过")
+                            if ret_code not in (10001, 100028):
+                                break
+                        if last_code not in (10003, 10004, 33004):
+                            break
                     return {
                         "ok": False,
                         "auth_status": "ERROR",
-                        "auth_message": f"Bybit API 验证失败 ({b.get('retCode')}): {b.get('retMsg', '认证未通过')}",
+                        "auth_message": f"Bybit API 验证失败 ({last_code}): {last_msg}",
                         "account_equity_usdt": 0.0,
                     }
             except Exception as e:
@@ -834,34 +861,49 @@ class ExecutionAdapter:
                     "account_equity_usdt": 0.0,
                 }
 
-        # 4. Real Bitget V2 Futures Verification (/api/v2/mix/account/accounts)
+        # 4. Real Bitget V2 Futures Verification (/api/v2/mix/account/accounts per Bitget V2 docs)
         if ex_id == "bitget":
             try:
                 req_path = "/api/v2/mix/account/accounts?productType=USDT-FUTURES"
-                ts = str(int(time.time() * 1000))
-                pre = f"{ts}GET{req_path}"
-                sign = base64.b64encode(hmac.new(api_secret.encode("utf-8"), pre.encode("utf-8"), hashlib.sha256).digest()).decode("utf-8")
-                hdrs = {
-                    "ACCESS-KEY": api_key,
-                    "ACCESS-SIGN": sign,
-                    "ACCESS-TIMESTAMP": ts,
-                    "ACCESS-PASSPHRASE": passphrase,
-                    "Content-Type": "application/json",
-                }
                 async with httpx.AsyncClient(proxy=proxy, timeout=6.0) as client:
-                    r = await client.get(f"https://api.bitget.com{req_path}", headers=hdrs)
-                    b = r.json()
-                    if str(b.get("code", "")) == "00000":
-                        usdt_eq = 0.0
-                        for row in b.get("data", []):
-                            if row.get("marginCoin") == "USDT":
-                                usdt_eq = float(row.get("usdtEquity") or row.get("available") or 0.0)
-                        return {
-                            "ok": True,
-                            "auth_status": "VERIFIED",
-                            "auth_message": f"已配置且验证通过 (Bitget V2 合约 · 权益: {usdt_eq:.2f} USDT)",
-                            "account_equity_usdt": round(usdt_eq, 2),
+                    for is_paper in (False, True):
+                        ts = str(int(time.time() * 1000))
+                        pre = f"{ts}GET{req_path}"
+                        sign = base64.b64encode(
+                            hmac.new(api_secret.encode("utf-8"), pre.encode("utf-8"), hashlib.sha256).digest()
+                        ).decode("utf-8")
+                        hdrs = {
+                            "ACCESS-KEY": api_key,
+                            "ACCESS-SIGN": sign,
+                            "ACCESS-TIMESTAMP": ts,
+                            "ACCESS-PASSPHRASE": passphrase,
+                            "Content-Type": "application/json",
+                            "locale": "zh-CN",
                         }
+                        if is_paper:
+                            hdrs["paptrading"] = "1"
+                        r = await client.get(f"https://api.bitget.com{req_path}", headers=hdrs)
+                        b = r.json()
+                        if str(b.get("code", "")) == "00000":
+                            usdt_eq = 0.0
+                            pos_mode_cn = "双向持仓"
+                            for row in b.get("data", []):
+                                if row.get("marginCoin") == "USDT":
+                                    usdt_eq = float(
+                                        row.get("accountEquity")
+                                        or row.get("usdtEquity")
+                                        or row.get("available")
+                                        or 0.0
+                                    )
+                                    if row.get("posMode") == "one_way_mode":
+                                        pos_mode_cn = "单向持仓"
+                            env_tag = "Bitget V2 模拟合约" if is_paper else "Bitget V2 实盘合约"
+                            return {
+                                "ok": True,
+                                "auth_status": "VERIFIED",
+                                "auth_message": f"已配置且验证通过 ({env_tag} · {pos_mode_cn} · 权益: {usdt_eq:.2f} USDT)",
+                                "account_equity_usdt": round(usdt_eq, 2),
+                            }
                     return {
                         "ok": False,
                         "auth_status": "ERROR",
@@ -876,7 +918,7 @@ class ExecutionAdapter:
                     "account_equity_usdt": 0.0,
                 }
 
-        # 5. Real Gate.io V4 Futures Verification (/api/v4/futures/usdt/accounts)
+        # 5. Real Gate.io V4 Futures Verification (/api/v4/futures/usdt/accounts per Gate V4 docs)
         if ex_id == "gate":
             try:
                 ts = str(int(time.time()))
@@ -884,16 +926,23 @@ class ExecutionAdapter:
                 empty_sha512 = hashlib.sha512(b"").hexdigest()
                 pre = f"GET\n{req_path}\n\n{empty_sha512}\n{ts}"
                 sign = hmac.new(api_secret.encode("utf-8"), pre.encode("utf-8"), hashlib.sha512).hexdigest()
-                hdrs = {"KEY": api_key, "Timestamp": ts, "SIGN": sign, "Accept": "application/json"}
+                hdrs = {
+                    "KEY": api_key,
+                    "Timestamp": ts,
+                    "SIGN": sign,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                }
                 async with httpx.AsyncClient(proxy=proxy, timeout=6.0) as client:
                     r = await client.get(f"https://api.gateio.ws{req_path}", headers=hdrs)
                     b = r.json()
                     if r.status_code == 200 and isinstance(b, dict) and "total" in b:
-                        eq = float(b.get("total") or 0.0)
+                        eq = float(b.get("total") or 0.0) + float(b.get("unrealised_pnl") or 0.0)
+                        dual_str = "双向持仓" if b.get("in_dual_mode") else "单向持仓"
                         return {
                             "ok": True,
                             "auth_status": "VERIFIED",
-                            "auth_message": f"已配置且验证通过 (Gate V4 永续 · 权益: {eq:.2f} USDT)",
+                            "auth_message": f"已配置且验证通过 (Gate V4 永续 · {dual_str} · 权益: {eq:.2f} USDT)",
                             "account_equity_usdt": round(eq, 2),
                         }
                     err_label = b.get("label", r.status_code) if isinstance(b, dict) else r.status_code
@@ -912,7 +961,62 @@ class ExecutionAdapter:
                     "account_equity_usdt": 0.0,
                 }
 
-        # 6. Traditional Securities Brokers Verification (富途牛牛 Futu / moomoo / IBKR 盈透 / Charles Schwab 嘉信)
+        # 6. Real Kraken Futures v3 Verification (/derivatives/api/v3/accounts per Kraken Futures v3 docs)
+        if ex_id == "krakenfutures":
+            try:
+                endpoint_path = "/api/v3/accounts"
+                req_path = "/derivatives/api/v3/accounts"
+                nonce = str(int(time.time() * 1000))
+                concat = f"{nonce}{endpoint_path}"
+                sha256_hash = hashlib.sha256(concat.encode("utf-8")).digest()
+                try:
+                    sec_bytes = base64.b64decode(api_secret, validate=False)
+                    if not sec_bytes:
+                        sec_bytes = api_secret.encode("utf-8")
+                except Exception:
+                    sec_bytes = api_secret.encode("utf-8")
+                authent = base64.b64encode(hmac.new(sec_bytes, sha256_hash, hashlib.sha512).digest()).decode("utf-8")
+                hdrs = {
+                    "APIKey": api_key,
+                    "Nonce": nonce,
+                    "Authent": authent,
+                    "Accept": "application/json",
+                }
+                async with httpx.AsyncClient(proxy=proxy, timeout=6.0) as client:
+                    for kf_base, env_label in (
+                        ("https://futures.kraken.com", "Kraken Futures 实盘"),
+                        ("https://demo-futures.kraken.com", "Kraken Futures 模拟盘"),
+                    ):
+                        r = await client.get(f"{kf_base}{req_path}", headers=hdrs)
+                        b = r.json()
+                        if r.status_code == 200 and isinstance(b, dict) and str(b.get("result", "")).lower() == "success":
+                            accts = b.get("accounts") or {}
+                            flex = accts.get("flex") or accts.get("cash") or {}
+                            eq = float(flex.get("portfolioValue") or flex.get("balanceValue") or flex.get("availableMargin") or 0.0)
+                            return {
+                                "ok": True,
+                                "auth_status": "VERIFIED",
+                                "auth_message": f"已配置且验证通过 ({env_label} · 权益: {eq:.2f} USD)",
+                                "account_equity_usdt": round(eq, 2),
+                            }
+                        err_msg = b.get("error") or b.get("errors") or "认证未通过"
+                        if kf_base == "https://futures.kraken.com" and "authenticationError" in str(err_msg):
+                            continue
+                        return {
+                            "ok": False,
+                            "auth_status": "ERROR",
+                            "auth_message": f"Kraken Futures API 验证失败: {err_msg}",
+                            "account_equity_usdt": 0.0,
+                        }
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "auth_status": "ERROR",
+                    "auth_message": f"连接 Kraken Futures 验证接口失败 ({type(e).__name__})",
+                    "account_equity_usdt": 0.0,
+                }
+
+        # 7. Traditional Securities Brokers Verification (富途牛牛 Futu / moomoo / IBKR 盈透 / Charles Schwab 嘉信)
         if ex_id in ("futu", "moomoo", "ibkr", "schwab"):
             broker_labels = {
                 "futu": "富途牛牛 (Futu OpenD 证券接口)",
@@ -928,7 +1032,144 @@ class ExecutionAdapter:
                     "auth_message": f"{b_label} 凭证格式无效：请填写有效的 API Key / Account ID 与 Secret / Token（长度至少 4 位）",
                     "account_equity_usdt": 0.0,
                 }
-            # If user configured an explicit HTTP/HTTPS gateway URL (e.g., IBKR Client Portal or local OpenD HTTP bridge), probe it
+
+            # 7a. Futu OpenD / Moomoo OpenD (TCP `host:port` default 127.0.0.1:11111 + Trd_UnlockTrade pwdMD5 spec)
+            if ex_id in ("futu", "moomoo"):
+                pwd_md5 = (
+                    hashlib.md5(passphrase.encode("utf-8")).hexdigest()
+                    if (passphrase and len(passphrase) != 32)
+                    else passphrase
+                )
+                if ":" in api_key and not api_key.startswith(("http://", "https://")):
+                    host_p, _, port_s = api_key.rpartition(":")
+                    if host_p and port_s.isdigit():
+                        try:
+                            reader, writer = await asyncio.wait_for(
+                                asyncio.open_connection(host_p.strip("[]"), int(port_s)), timeout=3.0
+                            )
+                            writer.close()
+                            try:
+                                await writer.wait_closed()
+                            except Exception:
+                                pass
+                            return {
+                                "ok": True,
+                                "auth_status": "VERIFIED",
+                                "auth_message": f"已连通 {b_label} OpenD 守护进程 ({api_key}) · pwdMD5={pwd_md5[:6] if pwd_md5 else '已就绪'}***",
+                                "account_equity_usdt": 0.0,
+                            }
+                        except Exception as e:
+                            return {
+                                "ok": False,
+                                "auth_status": "ERROR",
+                                "auth_message": f"无法连接 {b_label} OpenD 端口 ({api_key}): {type(e).__name__}，请确认 OpenD 已启动并监听该端口",
+                                "account_equity_usdt": 0.0,
+                            }
+
+            # 7b. IBKR Client Portal Web API v1 (`/v1/api/iserver/auth/status` & `/v1/api/portfolio/accounts`)
+            if ex_id == "ibkr" and api_key.startswith(("http://", "https://")):
+                base_gw = api_key.rstrip("/")
+                if not base_gw.endswith("/v1/api"):
+                    base_gw = f"{base_gw}/v1/api" if "/v1/api" not in base_gw else base_gw
+                try:
+                    hdrs_ib = {"Accept": "application/json", "User-Agent": "LeadLagSniper/2.0"}
+                    if api_secret and api_secret not in ("local", "gateway"):
+                        hdrs_ib["Authorization"] = f"Bearer {api_secret}"
+                    async with httpx.AsyncClient(proxy=proxy, timeout=5.0, verify=False) as client:
+                        st_r = await client.get(f"{base_gw}/iserver/auth/status", headers=hdrs_ib)
+                        if st_r.status_code == 200 and isinstance(st_r.json(), dict):
+                            st_b = st_r.json()
+                            if not st_b.get("authenticated", True):
+                                return {
+                                    "ok": False,
+                                    "auth_status": "ERROR",
+                                    "auth_message": f"IBKR Client Portal 网关 ({base_gw}) 已连接但尚未登录认证 (authenticated=false)",
+                                    "account_equity_usdt": 0.0,
+                                }
+                        ac_r = await client.get(f"{base_gw}/portfolio/accounts", headers=hdrs_ib)
+                        eq_usd = 0.0
+                        acct_id = passphrase or ""
+                        if ac_r.status_code == 200 and isinstance(ac_r.json(), list) and ac_r.json():
+                            acct_id = str(ac_r.json()[0].get("accountId") or ac_r.json()[0].get("id") or acct_id)
+                            if acct_id:
+                                lg_r = await client.get(f"{base_gw}/portfolio/{acct_id}/ledger", headers=hdrs_ib)
+                                if lg_r.status_code == 200 and isinstance(lg_r.json(), dict):
+                                    usd_lg = lg_r.json().get("USD") or lg_r.json().get("BASE") or {}
+                                    eq_usd = float(usd_lg.get("netliquidationvalue") or usd_lg.get("cashbalance") or 0.0)
+                        return {
+                            "ok": True,
+                            "auth_status": "VERIFIED",
+                            "auth_message": f"已连通并验证通过 (IBKR Client Portal Web API · 账户: {acct_id or '已授权'} · 净值: {eq_usd:.2f} USD)",
+                            "account_equity_usdt": round(eq_usd, 2),
+                        }
+                except Exception as e:
+                    return {
+                        "ok": False,
+                        "auth_status": "ERROR",
+                        "auth_message": f"连接 IBKR Client Portal 网关 ({base_gw}) 失败 ({type(e).__name__})",
+                        "account_equity_usdt": 0.0,
+                    }
+
+            # 7c. Charles Schwab Trader API v1 (`https://api.schwabapi.com/v1/oauth/token` & `/trader/v1/accounts`)
+            if ex_id == "schwab" and (
+                passphrase.startswith(("refresh:", "I0.")) or api_secret.startswith("Bearer ")
+            ):
+                try:
+                    async with httpx.AsyncClient(proxy=proxy, timeout=6.0) as client:
+                        bearer_tok = api_secret[7:].strip() if api_secret.startswith("Bearer ") else ""
+                        if not bearer_tok:
+                            ref_tok = passphrase[8:].strip() if passphrase.startswith("refresh:") else passphrase
+                            basic_b64 = base64.b64encode(f"{api_key}:{api_secret}".encode("utf-8")).decode("utf-8")
+                            tk_r = await client.post(
+                                "https://api.schwabapi.com/v1/oauth/token",
+                                headers={
+                                    "Authorization": f"Basic {basic_b64}",
+                                    "Content-Type": "application/x-www-form-urlencoded",
+                                },
+                                data={"grant_type": "refresh_token", "refresh_token": ref_tok},
+                            )
+                            tk_b = tk_r.json()
+                            if tk_r.status_code != 200 or not tk_b.get("access_token"):
+                                return {
+                                    "ok": False,
+                                    "auth_status": "ERROR",
+                                    "auth_message": f"Schwab OAuth2 Token 刷新失败 ({tk_r.status_code}): {tk_b.get('error_description') or tk_b.get('error', '认证未通过')}",
+                                    "account_equity_usdt": 0.0,
+                                }
+                            bearer_tok = str(tk_b["access_token"])
+
+                        ac_r = await client.get(
+                            "https://api.schwabapi.com/trader/v1/accounts",
+                            headers={"Authorization": f"Bearer {bearer_tok}", "Accept": "application/json"},
+                        )
+                        ac_b = ac_r.json()
+                        if ac_r.status_code == 200 and isinstance(ac_b, list):
+                            eq_usd = 0.0
+                            if ac_b and isinstance(ac_b[0], dict):
+                                sec_acc = ac_b[0].get("securitiesAccount") or {}
+                                cur_bal = sec_acc.get("currentBalances") or {}
+                                eq_usd = float(cur_bal.get("liquidationValue") or cur_bal.get("availableFunds") or 0.0)
+                            return {
+                                "ok": True,
+                                "auth_status": "VERIFIED",
+                                "auth_message": f"已配置且验证通过 (Charles Schwab Trader API v1 · 账户净值: {eq_usd:.2f} USD)",
+                                "account_equity_usdt": round(eq_usd, 2),
+                            }
+                        return {
+                            "ok": False,
+                            "auth_status": "ERROR",
+                            "auth_message": f"Schwab Trader API 账户查询失败 ({ac_r.status_code})",
+                            "account_equity_usdt": 0.0,
+                        }
+                except Exception as e:
+                    return {
+                        "ok": False,
+                        "auth_status": "ERROR",
+                        "auth_message": f"连接 Charles Schwab Trader API 失败 ({type(e).__name__})",
+                        "account_equity_usdt": 0.0,
+                    }
+
+            # 7d. Generic HTTP/HTTPS gateway probe for Futu/Moomoo HTTP bridges
             if api_key.startswith(("http://", "https://")):
                 try:
                     async with httpx.AsyncClient(proxy=proxy, timeout=4.0, verify=False) as client:

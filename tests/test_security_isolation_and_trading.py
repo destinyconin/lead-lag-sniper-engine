@@ -4055,6 +4055,99 @@ def test_traditional_brokers_sp500_catalog_and_per_symbol_exchange_selection():
             assert spy_tel["grid"]["center_price"] > 500.0
             assert len(spy_tel["grid"]["levels"]) == 6
 
+            # 4) Verify VIP_FEE_TIERS covers all 10 exchanges/brokers
+            for all_ex in ("binanceusdm", "okx", "bybit", "gate", "bitget", "krakenfutures", "futu", "moomoo", "ibkr", "schwab"):
+                f_res = client.post(f"/api/exchanges/fetch-fees?exchange_id={all_ex}&vip_level=VIP%201")
+                assert f_res.status_code == 200
+                assert f_res.json()["exchange_id"] == all_ex
+                assert f_res.json()["taker_fee"] > 0
+
+    # 5) Verify official API protocol adapters (Kraken Futures v3, IBKR Client Portal v1, Schwab OAuth2 v1, Symbol Formats)
+    from backend.market_gateway import (
+        to_bybit_symbol,
+        to_bitget_symbol,
+        to_gate_contract,
+        to_kraken_futures_symbol,
+        to_futu_moomoo_code,
+        to_us_equity_symbol,
+    )
+
+    assert to_bybit_symbol("PEPE/USDT:USDT") == "1000PEPEUSDT"
+    assert to_bybit_symbol("XRP/USDT:USDT") == "XRPUSDT"
+    assert to_bitget_symbol("SOL/USDT:USDT") == "SOLUSDT"
+    assert to_gate_contract("ETH/USDT:USDT") == "ETH_USDT"
+    assert to_kraken_futures_symbol("BTC/USDT:USDT") == "PF_XBTUSD"
+    assert to_kraken_futures_symbol("DOGE/USDT:USDT") == "PF_XDGUSD"
+    assert to_futu_moomoo_code("SPY/USDT:USDT") == "US.SPY"
+    assert to_futu_moomoo_code("BRKB/USDT:USDT") == "US.BRK.B"
+    assert to_us_equity_symbol("BRKB/USDT:USDT") == "BRK.B"
+
+    async def _test_api_protocols():
+        adapter = ExecutionAdapter(get_math_state=lambda _: None, get_risk_cfg=lambda: GlobalRiskConfig())
+        # Bitget requires passphrase -> missing passphrase returns CONFIG_INCOMPLETE
+        bg_incomplete = await adapter.verify_exchange_credentials(
+            {"exchange_id": "bitget", "api_key": "bg_key_12345", "_decrypted_secret": "bg_sec_12345", "_decrypted_passphrase": ""}
+        )
+        assert bg_incomplete["ok"] is False
+        assert bg_incomplete["auth_status"] == "CONFIG_INCOMPLETE"
+        assert "Passphrase" in bg_incomplete["auth_message"]
+
+        # Kraken Futures v3 mock verification (/derivatives/api/v3/accounts)
+        class _FakeResp:
+            def __init__(self, status_code, data):
+                self.status_code = status_code
+                self._data = data
+
+            def json(self):
+                return self._data
+
+        async def _mock_get(url, headers=None, **kwargs):
+            if "futures.kraken.com/derivatives/api/v3/accounts" in url:
+                assert "APIKey" in headers and "Nonce" in headers and "Authent" in headers
+                return _FakeResp(200, {"result": "success", "accounts": {"flex": {"portfolioValue": 1280.55}}})
+            if "/v1/api/iserver/auth/status" in url:
+                return _FakeResp(200, {"authenticated": True, "connected": True})
+            if "/v1/api/portfolio/accounts" in url:
+                return _FakeResp(200, [{"accountId": "U9988776"}])
+            if "/v1/api/portfolio/U9988776/ledger" in url:
+                return _FakeResp(200, {"USD": {"netliquidationvalue": 54321.0}})
+            if "api.schwabapi.com/trader/v1/accounts" in url:
+                assert headers.get("Authorization") == "Bearer schwab_access_tok_123"
+                return _FakeResp(200, [{"securitiesAccount": {"currentBalances": {"liquidationValue": 88500.25}}}])
+            return _FakeResp(404, {})
+
+        async def _mock_post(url, headers=None, data=None, **kwargs):
+            if "api.schwabapi.com/v1/oauth/token" in url:
+                assert headers.get("Authorization", "").startswith("Basic ")
+                assert data.get("grant_type") == "refresh_token"
+                return _FakeResp(200, {"access_token": "schwab_access_tok_123"})
+            return _FakeResp(404, {})
+
+        with (
+            patch("httpx.AsyncClient.get", new=AsyncMock(side_effect=_mock_get)),
+            patch("httpx.AsyncClient.post", new=AsyncMock(side_effect=_mock_post)),
+        ):
+            kf_res = await adapter.verify_exchange_credentials(
+                {"exchange_id": "krakenfutures", "api_key": "kf_key_12345678", "_decrypted_secret": "a2Zfc2VjcmV0X2Jhc2U2NA==", "_decrypted_passphrase": ""}
+            )
+            assert kf_res["ok"] is True
+            assert kf_res["account_equity_usdt"] == 1280.55
+
+            ib_res = await adapter.verify_exchange_credentials(
+                {"exchange_id": "ibkr", "api_key": "https://127.0.0.1:5000", "_decrypted_secret": "gateway", "_decrypted_passphrase": "U9988776"}
+            )
+            assert ib_res["ok"] is True
+            assert ib_res["account_equity_usdt"] == 54321.0
+
+            sc_res = await adapter.verify_exchange_credentials(
+                {"exchange_id": "schwab", "api_key": "schwab_client_id", "_decrypted_secret": "schwab_client_secret", "_decrypted_passphrase": "refresh:I0.schwab_refresh_tok"}
+            )
+            assert sc_res["ok"] is True
+            assert sc_res["account_equity_usdt"] == 88500.25
+
+    asyncio.run(_test_api_protocols())
+
+
 
 
 

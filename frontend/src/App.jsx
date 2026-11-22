@@ -4701,7 +4701,7 @@ export default function App() {
                             <div className="flex items-center justify-between mb-1.5">
                               <label className="font-bold text-main">{passLabel}</label>
                               <span className="text-[11px] font-mono text-dim">
-                                {ex.has_passphrase ? '已保存' : needsPass ? '欧易必填' : '选填'}
+                                {ex.has_passphrase ? '已保存' : needsPass ? '必填 (OKX/Bitget)' : '选填'}
                               </span>
                             </div>
                             <input
