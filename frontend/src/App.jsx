@@ -494,6 +494,7 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const [logFilter, setLogFilter] = useState('ALL');
   const [analyticsSymbolFilter, setAnalyticsSymbolFilter] = useState('ALL');
+  const [analyticsStrategyFilter, setAnalyticsStrategyFilter] = useState('ALL');
   const [showRunningOnly, setShowRunningOnly] = useState(true);
 
   // User Auth & Membership State
@@ -1766,9 +1767,38 @@ export default function App() {
     return true;
   });
 
-  const filteredRecentTrades = (stats.recent_trades || [])
-    .filter((tr) => analyticsSymbolFilter === 'ALL' || tr.symbol === analyticsSymbolFilter)
-    .map((tr) => {
+  const resolveTradeStrategyType = useCallback(
+    (tr) => {
+      if (
+        tr?.strategy_type &&
+        ['LEAD_LAG', 'LONG_SHORT_GRID', 'REVERSE_GRID', 'TREND_GRID', 'ADAPTIVE_GRID'].includes(tr.strategy_type)
+      ) {
+        return tr.strategy_type;
+      }
+      const symItem =
+        (stats.symbol_pnl_breakdown || []).find((s) => s.symbol === tr?.symbol) ||
+        strategies.find((s) => s.symbol === tr?.symbol);
+      const curSt = symItem?.strategy_type || 'LEAD_LAG';
+      const reason = String(tr?.reason || '');
+      const idStr = String(tr?.id || '');
+      if (reason.startsWith('TREND_')) {
+        return curSt === 'TREND_GRID' || curSt === 'ADAPTIVE_GRID' ? curSt : 'TREND_GRID';
+      }
+      if (reason.startsWith('GRID_') || idStr.startsWith('grid-')) {
+        return curSt === 'LONG_SHORT_GRID' || curSt === 'REVERSE_GRID' || curSt === 'ADAPTIVE_GRID'
+          ? curSt
+          : 'LONG_SHORT_GRID';
+      }
+      if (['TAKE_PROFIT', 'TRAILING_TP', 'REVERSAL_SL', 'HARD_SL', 'TIMEOUT'].includes(reason)) {
+        return 'LEAD_LAG';
+      }
+      return curSt;
+    },
+    [stats.symbol_pnl_breakdown, strategies]
+  );
+
+  const decoratedRecentTrades = useMemo(() => {
+    return (stats.recent_trades || []).map((tr) => {
       const reason = String(tr.reason || '');
       const mSlot = reason.match(/^(.*)_(L\d+|S\d+)$/);
       const baseReason = mSlot
@@ -1786,8 +1816,60 @@ export default function App() {
             text: slotSuffix ? `${baseBadge.text} (${slotSuffix})` : baseBadge.text,
           }
         : { text: reason || '--', cls: 'surface-subtle text-sub' };
-      return { ...tr, _badge: badge };
+      const stType = resolveTradeStrategyType(tr);
+      return {
+        ...tr,
+        _badge: badge,
+        _strategyType: stType,
+        _strategyLabel: STRATEGY_LABEL_MAP[stType] || stType,
+      };
     });
+  }, [stats.recent_trades, resolveTradeStrategyType]);
+
+  const filteredRecentTrades = useMemo(() => {
+    return decoratedRecentTrades.filter(
+      (tr) =>
+        (analyticsSymbolFilter === 'ALL' || tr.symbol === analyticsSymbolFilter) &&
+        (analyticsStrategyFilter === 'ALL' || tr._strategyType === analyticsStrategyFilter)
+    );
+  }, [decoratedRecentTrades, analyticsSymbolFilter, analyticsStrategyFilter]);
+
+  const strategyTradeCounts = useMemo(() => {
+    const counts = {
+      ALL: 0,
+      LONG_SHORT_GRID: 0,
+      REVERSE_GRID: 0,
+      TREND_GRID: 0,
+      ADAPTIVE_GRID: 0,
+      LEAD_LAG: 0,
+    };
+    for (const tr of decoratedRecentTrades) {
+      if (analyticsSymbolFilter !== 'ALL' && tr.symbol !== analyticsSymbolFilter) continue;
+      counts.ALL += 1;
+      if (counts[tr._strategyType] !== undefined) {
+        counts[tr._strategyType] += 1;
+      }
+    }
+    return counts;
+  }, [decoratedRecentTrades, analyticsSymbolFilter]);
+
+  const filteredTradesSummary = useMemo(() => {
+    let wins = 0;
+    let losses = 0;
+    let netSum = 0;
+    for (const tr of filteredRecentTrades) {
+      const p = Number(tr.net_pnl || 0);
+      netSum += p;
+      if (p > 0) wins += 1;
+      else if (p < 0) losses += 1;
+    }
+    return {
+      total: filteredRecentTrades.length,
+      wins,
+      losses,
+      net_pnl: Number(netSum.toFixed(4)),
+    };
+  }, [filteredRecentTrades]);
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -5261,21 +5343,98 @@ export default function App() {
 
             {/* Historical Trades Table */}
             <div className="surface-card p-4 sm:p-6 lg:p-7">
-              <div className="flex flex-wrap items-center justify-between gap-3 mb-4 sm:mb-5">
-                <div>
-                  <h3 className="text-base sm:text-lg font-bold text-main">
-                    {isLiveMode ? '实盘通道历史成交复盘明细表' : '影子模拟盘历史狙击复盘明细表'}
-                    {analyticsSymbolFilter !== 'ALL' && (
-                      <span className="ml-2 text-sm font-mono text-emerald-600 dark:text-emerald-400">
-                        [{analyticsSymbolFilter}]
-                      </span>
-                    )}
-                  </h3>
-                  <p className="text-xs text-dim mt-1">
-                    由独立后台队列批量写入 SQLite 数据库，模拟盘与实盘通道账本严格分表隔离
-                  </p>
+              <div className="flex flex-col gap-3.5 mb-4 sm:mb-5">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="text-base sm:text-lg font-bold text-main">
+                        {isLiveMode ? '实盘通道历史成交复盘明细表' : '影子模拟盘历史狙击复盘明细表'}
+                      </h3>
+                      {analyticsStrategyFilter !== 'ALL' && (
+                        <span
+                          className={`px-2.5 py-0.5 rounded-full text-xs font-bold ${strategyBadgeClass(
+                            analyticsStrategyFilter,
+                            true
+                          )}`}
+                        >
+                          {STRATEGY_LABEL_MAP[analyticsStrategyFilter] || analyticsStrategyFilter}
+                        </span>
+                      )}
+                      {analyticsSymbolFilter !== 'ALL' && (
+                        <span className="text-sm font-mono font-bold text-emerald-600 dark:text-emerald-400">
+                          [{analyticsSymbolFilter}]
+                        </span>
+                      )}
+                      {(analyticsStrategyFilter !== 'ALL' || analyticsSymbolFilter !== 'ALL') && (
+                        <span className="px-2.5 py-0.5 rounded-full text-[11px] font-mono surface-subtle text-sub">
+                          筛选 {filteredTradesSummary.total} 笔 ({filteredTradesSummary.wins}盈/
+                          {filteredTradesSummary.losses}亏) · 净利{' '}
+                          <strong
+                            className={
+                              filteredTradesSummary.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'
+                            }
+                          >
+                            {filteredTradesSummary.net_pnl >= 0
+                              ? `+$${filteredTradesSummary.net_pnl.toFixed(4)}`
+                              : `-$${Math.abs(filteredTradesSummary.net_pnl).toFixed(4)}`}
+                          </strong>
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-dim mt-1">
+                      支持按策略类型与合约代号组合筛选复盘明细，由独立后台队列批量写入 SQLite 数据库
+                    </p>
+                  </div>
+
+                  {(analyticsStrategyFilter !== 'ALL' || analyticsSymbolFilter !== 'ALL') && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAnalyticsStrategyFilter('ALL');
+                        setAnalyticsSymbolFilter('ALL');
+                      }}
+                      className="btn-soft-pill px-3 py-1 text-xs font-semibold text-amber-600 dark:text-amber-400"
+                    >
+                      重置全部筛选
+                    </button>
+                  )}
                 </div>
-                <div className="flex items-center gap-1.5 text-xs overflow-x-auto no-scrollbar sm:flex-wrap w-full sm:w-auto pb-0.5 sm:pb-0">
+
+                {/* Strategy Filter Bar */}
+                <div className="flex items-center gap-1.5 text-xs overflow-x-auto no-scrollbar sm:flex-wrap pb-0.5 sm:pb-0">
+                  <span className="text-[11px] font-semibold text-dim mr-1 shrink-0">按策略筛选:</span>
+                  {[
+                    { id: 'ALL', label: '全部策略' },
+                    { id: 'LONG_SHORT_GRID', label: '传统震荡网格' },
+                    { id: 'REVERSE_GRID', label: '多空震荡网格' },
+                    { id: 'TREND_GRID', label: '顺势突破网格' },
+                    { id: 'ADAPTIVE_GRID', label: 'VCP 双模式' },
+                    { id: 'LEAD_LAG', label: '跨所脉冲狙击' },
+                  ].map((stOpt) => {
+                    const active = analyticsStrategyFilter === stOpt.id;
+                    const cnt = strategyTradeCounts[stOpt.id] ?? 0;
+                    return (
+                      <button
+                        key={stOpt.id}
+                        type="button"
+                        onClick={() => setAnalyticsStrategyFilter(stOpt.id)}
+                        className={`px-3 py-1 rounded-full font-semibold transition whitespace-nowrap shrink-0 ${
+                          active
+                            ? stOpt.id === 'ALL'
+                              ? 'btn-primary-pill'
+                              : `${strategyBadgeClass(stOpt.id, true)} shadow-sm`
+                            : 'btn-soft-pill'
+                        }`}
+                      >
+                        {stOpt.label} ({cnt})
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Symbol Filter Bar */}
+                <div className="flex items-center gap-1.5 text-xs overflow-x-auto no-scrollbar sm:flex-wrap w-full pb-0.5 sm:pb-0">
+                  <span className="text-[11px] font-semibold text-dim mr-1 shrink-0">按币种筛选:</span>
                   <button
                     type="button"
                     onClick={() => setAnalyticsSymbolFilter('ALL')}
@@ -5285,18 +5444,22 @@ export default function App() {
                   >
                     全部币种 ({(stats.recent_trades || []).length})
                   </button>
-                  {(stats.symbol_pnl_breakdown || []).map((item) => (
-                    <button
-                      key={item.symbol}
-                      type="button"
-                      onClick={() => setAnalyticsSymbolFilter(item.symbol)}
-                      className={`px-3 py-1 rounded-full font-mono text-[11px] font-semibold transition whitespace-nowrap shrink-0 ${
-                        analyticsSymbolFilter === item.symbol ? 'btn-primary-pill' : 'btn-soft-pill'
-                      }`}
-                    >
-                      {item.symbol.split('/')[0]} ({item.trades})
-                    </button>
-                  ))}
+                  {(stats.symbol_pnl_breakdown || [])
+                    .filter((item) =>
+                      analyticsStrategyFilter === 'ALL' ? true : item.strategy_type === analyticsStrategyFilter
+                    )
+                    .map((item) => (
+                      <button
+                        key={item.symbol}
+                        type="button"
+                        onClick={() => setAnalyticsSymbolFilter(item.symbol)}
+                        className={`px-3 py-1 rounded-full font-mono text-[11px] font-semibold transition whitespace-nowrap shrink-0 ${
+                          analyticsSymbolFilter === item.symbol ? 'btn-primary-pill' : 'btn-soft-pill'
+                        }`}
+                      >
+                        {item.symbol.split('/')[0]} ({item.trades})
+                      </button>
+                    ))}
                 </div>
               </div>
 
@@ -5305,7 +5468,7 @@ export default function App() {
                 {filteredRecentTrades.length === 0 ? (
                   <div className="py-10 text-center text-xs text-dim">
                     {isLiveMode
-                      ? '当前实盘通道尚无符合筛选条件的真实成交记录'
+                      ? '当前实盘通道尚无符合该策略/币种筛选条件的真实成交记录'
                       : '暂无符合筛选条件的成交记录，请等待脉冲信号或点击顶部「脉冲注入」按钮验证全流程'}
                   </div>
                 ) : (
@@ -5315,7 +5478,14 @@ export default function App() {
                         <div className="flex items-center gap-1.5 min-w-0">
                           <span className="font-mono font-bold text-main truncate">{tr.symbol}</span>
                           <span
-                            className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                            className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${strategyBadgeClass(
+                              tr._strategyType
+                            )}`}
+                          >
+                            {tr._strategyLabel}
+                          </span>
+                          <span
+                            className={`px-2 py-0.5 rounded-full text-[10px] font-semibold shrink-0 ${
                               tr.side === 'LONG' ? 'bg-emerald-500/12 text-emerald-600' : 'bg-rose-500/12 text-rose-600'
                             }`}
                           >
@@ -5345,11 +5515,12 @@ export default function App() {
 
               {/* Tablet / Desktop Table (>= md) */}
               <div className="hidden md:block overflow-x-auto">
-                <table className="w-full min-w-[980px] text-left border-collapse text-xs">
+                <table className="w-full min-w-[1040px] text-left border-collapse text-xs">
                   <thead>
                     <tr className="border-b border-line text-[11px] text-dim surface-subtle">
                       <th className="py-3 px-3.5 font-medium rounded-l-xl">触发时间</th>
                       <th className="py-3 px-3.5 font-medium">合约代号</th>
+                      <th className="py-3 px-3.5 font-medium">执行策略</th>
                       <th className="py-3 px-3.5 font-medium">方向</th>
                       <th className="py-3 px-3.5 font-medium">主所脉冲幅度</th>
                       <th className="py-3 px-3.5 font-medium">收敛系数 β</th>
@@ -5366,9 +5537,9 @@ export default function App() {
                   <tbody className="divide-y border-line font-mono">
                     {filteredRecentTrades.length === 0 ? (
                       <tr>
-                        <td colSpan={13} className="py-14 text-center text-dim font-sans">
+                        <td colSpan={14} className="py-14 text-center text-dim font-sans">
                           {isLiveMode
-                            ? '当前实盘通道尚无符合筛选条件的真实成交记录'
+                            ? '当前实盘通道尚无符合该策略/币种筛选条件的真实成交记录'
                             : '暂无符合筛选条件的成交记录，请等待脉冲信号或点击顶部「脉冲注入」按钮验证全流程'}
                         </td>
                       </tr>
@@ -5377,6 +5548,15 @@ export default function App() {
                           <tr key={tr.id || i} className="hover:opacity-90 transition">
                             <td className="py-3 px-3.5 text-dim">{tr.time}</td>
                             <td className="py-3 px-3.5 font-bold text-main">{tr.symbol}</td>
+                            <td className="py-3 px-3.5 font-sans">
+                              <span
+                                className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold ${strategyBadgeClass(
+                                  tr._strategyType
+                                )}`}
+                              >
+                                {tr._strategyLabel}
+                              </span>
+                            </td>
                             <td className="py-3 px-3.5 font-sans">
                               <span
                                 className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${

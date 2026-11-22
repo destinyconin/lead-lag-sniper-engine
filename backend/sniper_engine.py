@@ -1001,6 +1001,7 @@ class BidirectionalSniperEngine:
             trade_record = {
                 "time": now_dt.strftime("%H:%M:%S.") + f"{int(now_dt.microsecond / 1000):03d}",
                 "symbol": sym,
+                "strategy_type": "LEAD_LAG",
                 "leader_ex": follower_ex["exchange_id"],
                 "follower_ex": follower_ex["exchange_id"],
                 "side": side,
@@ -3099,6 +3100,7 @@ class BidirectionalSniperEngine:
         trade_record = {
             "time": now_time_str,
             "symbol": sym,
+            "strategy_type": cfg.strategy_type,
             "leader_ex": leader_ex["exchange_id"],
             "follower_ex": follower_ex["exchange_id"],
             "side": side,
@@ -3799,6 +3801,7 @@ class BidirectionalSniperEngine:
             trade_record = {
                 "time": datetime.now().strftime("%H:%M:%S.") + f"{int(datetime.now().microsecond / 1000):03d}",
                 "symbol": sym,
+                "strategy_type": "LEAD_LAG",
                 "leader_ex": leader_ex["exchange_id"],
                 "follower_ex": follower_ex["exchange_id"],
                 "side": sig.side,
@@ -3940,10 +3943,27 @@ class BidirectionalSniperEngine:
         sym_stat["avg_hold_ms"] = int(sym_stat["_hold_ms_sum"] / max(1, sym_stat["trades"]))
         sym_stat["last_trade_time"] = tr.get("time") or str(tr.get("created_at", ""))[-8:]
 
+        sym_cfg = self.strategies.get(tr["symbol"])
+        cur_st = str(getattr(sym_cfg, "strategy_type", "LEAD_LAG") or "LEAD_LAG") if sym_cfg else "LEAD_LAG"
+        raw_st = str(tr.get("strategy_type") or "").strip()
+        reason_s = str(tr.get("exit_reason") or "TAKE_PROFIT")
+        oid_s = str(tr.get("order_id") or "")
+        if raw_st in ("LEAD_LAG", "LONG_SHORT_GRID", "REVERSE_GRID", "TREND_GRID", "ADAPTIVE_GRID"):
+            resolved_st = raw_st
+        elif reason_s.startswith("TREND_"):
+            resolved_st = cur_st if cur_st in ("TREND_GRID", "ADAPTIVE_GRID") else "TREND_GRID"
+        elif reason_s.startswith("GRID_") or oid_s.startswith("grid-"):
+            resolved_st = cur_st if cur_st in ("LONG_SHORT_GRID", "REVERSE_GRID", "ADAPTIVE_GRID") else "LONG_SHORT_GRID"
+        elif reason_s in ("TAKE_PROFIT", "TRAILING_TP", "REVERSAL_SL", "HARD_SL", "TIMEOUT"):
+            resolved_st = "LEAD_LAG"
+        else:
+            resolved_st = cur_st
+
         ui_trade = {
             "id": tr.get("id") or tr.get("order_id"),
             "time": tr.get("time") or str(tr.get("created_at", ""))[-8:],
             "symbol": tr["symbol"],
+            "strategy_type": resolved_st,
             "follower_ex": tr.get("follower_ex", "okx"),
             "side": side,
             "trading_mode": target_mode,
