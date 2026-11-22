@@ -1584,7 +1584,13 @@ class BidirectionalSniperEngine:
                     t_mono = now_m - i * 45.0
                     m_state.on_follower_tick(f_bbo[0], f_bbo[1], f_bbo[2], f_bbo[3], now_mono=t_mono)
                     m_state.on_leader_tick(l_bbo[0], l_bbo[1], l_bbo[2], l_bbo[3], cfg, is_locked=False, now_mono=t_mono)
-            return
+                tracker = self.grid_trackers.get(sym)
+                if tracker is not None and m_state.latest_follower:
+                    tracker.sync_config(cfg, current_mid=m_state.latest_follower.mid)
+                return
+            # Traditional brokers / S&P 500 symbols without an OKX swap WS feed still seed reference ticks & grid levels
+            if str(getattr(cfg, "exchange_id", "okx") or "okx").lower() not in ("futu", "moomoo", "ibkr", "schwab") and get_okx_instrument_spec(sym) is not None:
+                return
 
         base_px = get_default_base_price(sym)
         now_m = mono_ms()
@@ -1601,6 +1607,9 @@ class BidirectionalSniperEngine:
             m_state.on_leader_tick(
                 l_mid - half_sp, l_mid + half_sp, 2200.0, 2200.0, cfg, is_locked=False, now_mono=t_mono
             )
+        tracker = self.grid_trackers.get(sym)
+        if tracker is not None and m_state.latest_follower:
+            tracker.sync_config(cfg, current_mid=m_state.latest_follower.mid)
 
     def add_or_update_symbol(self, cfg: SymbolStrategy):
         is_new = cfg.symbol not in self.strategies
@@ -1783,8 +1792,9 @@ class BidirectionalSniperEngine:
                         w_list = calc_pyramid_weights(int(new_cfg.grid_levels), True)
                         thinnest_leg_usdt = round(float(new_cfg.order_usdt) * int(new_cfg.grid_levels) * min(w_list), 2)
 
-                # 2. Check OKX contract spec / minimum notional / precision
-                if spec:
+                # 2. Check OKX contract spec / minimum notional / precision (skip OKX swap checks for traditional brokers)
+                is_trad_broker = str(getattr(new_cfg, "exchange_id", "okx") or "okx").lower() in ("futu", "moomoo", "ibkr", "schwab")
+                if spec and not is_trad_broker:
                     min_notional = float(spec.get("minSz") or 0.0) * float(spec.get("ctVal") or 1.0) * ref_px
                     if ref_px > 0 and min_notional > new_cfg.order_usdt * 1.35:
                         issues.append(

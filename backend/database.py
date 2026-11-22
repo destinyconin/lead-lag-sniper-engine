@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS symbol_configs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL DEFAULT 0,
     symbol VARCHAR(32) NOT NULL,
+    exchange_id VARCHAR(32) DEFAULT 'okx',
     strategy_type VARCHAR(24) DEFAULT 'LEAD_LAG',
     direction VARCHAR(16) DEFAULT 'BOTH',
     order_usdt DECIMAL(12, 2) DEFAULT 300,
@@ -200,6 +201,10 @@ DEFAULT_EXCHANGES = [
     ("gate", "Gate.io Futures (芝麻开门)", "follower", "VIP 2", 0.0005, 0.00015, 0),
     ("bitget", "Bitget Futures (Bitget合约)", "follower", "VIP 1", 0.0006, 0.00020, 0),
     ("krakenfutures", "Kraken Futures (Kraken合约)", "follower", "Tier 2", 0.0005, 0.00020, 0),
+    ("futu", "富途牛牛 (Futu OpenD 证券接口)", "follower", "美股标准", 0.0003, 0.00010, 0),
+    ("moomoo", "moomoo (Moomoo OpenD 国际证券)", "follower", "US Tier 1", 0.0003, 0.00010, 0),
+    ("ibkr", "IBKR (盈透证券 TWS / Client Portal API)", "follower", "IBKR Pro", 0.0002, 0.00008, 0),
+    ("schwab", "Charles Schwab (嘉信理财 Trader API)", "follower", "Zero-Comm", 0.0001, 0.00005, 0),
 ]
 
 DEFAULT_SYMBOLS = [
@@ -364,6 +369,7 @@ class AsyncDatabaseManager:
         """Additive column migration for multi-strategy (`LEAD_LAG` / `LONG_SHORT_GRID` / `REVERSE_GRID` / `TREND_GRID` / `ADAPTIVE_GRID`) fields."""
         existing = {row[1] for row in conn.execute("PRAGMA table_info(symbol_configs)").fetchall()}
         additions = [
+            ("exchange_id", "ALTER TABLE symbol_configs ADD COLUMN exchange_id VARCHAR(32) DEFAULT 'okx'"),
             ("strategy_type", "ALTER TABLE symbol_configs ADD COLUMN strategy_type VARCHAR(24) DEFAULT 'LEAD_LAG'"),
             ("grid_side_mode", "ALTER TABLE symbol_configs ADD COLUMN grid_side_mode VARCHAR(16) DEFAULT 'LONG_SHORT'"),
             ("grid_levels", "ALTER TABLE symbol_configs ADD COLUMN grid_levels INTEGER DEFAULT 3"),
@@ -405,14 +411,20 @@ class AsyncDatabaseManager:
         conn = self._connect()
         try:
             cur = conn.cursor()
-            ex_cnt = cur.execute("SELECT COUNT(*) FROM exchanges WHERE user_id = ?", (user_id,)).fetchone()[0]
-            if ex_cnt == 0:
-                for ex_id, name, role, vip, taker, maker, active in DEFAULT_EXCHANGES:
+            existing_ex = {
+                r[0]
+                for r in cur.execute("SELECT exchange_id FROM exchanges WHERE user_id = ?", (user_id,)).fetchall()
+            }
+            is_brand_new = len(existing_ex) == 0
+            for ex_id, name, role, vip, taker, maker, active in DEFAULT_EXCHANGES:
+                if ex_id not in existing_ex:
+                    eff_role = role if is_brand_new else "follower"
+                    eff_active = active if is_brand_new else 0
                     cur.execute(
                         """INSERT OR IGNORE INTO exchanges
                            (user_id, exchange_id, display_name, role, vip_level, taker_fee, maker_fee, is_active)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (user_id, ex_id, name, role, vip, taker, maker, active),
+                        (user_id, ex_id, name, eff_role, vip, taker, maker, eff_active),
                     )
             sym_cnt = cur.execute("SELECT COUNT(*) FROM symbol_configs WHERE user_id = ?", (user_id,)).fetchone()[0]
             if sym_cnt == 0:
@@ -702,6 +714,8 @@ class AsyncDatabaseManager:
                 d["grid_recenter_enabled"] = bool(d.get("grid_recenter_enabled", 1) if d.get("grid_recenter_enabled") is not None else 1)
                 d["trend_pyramid_decay"] = bool(d.get("trend_pyramid_decay", 1) if d.get("trend_pyramid_decay") is not None else 1)
                 d["trend_use_bb_breakout"] = bool(d.get("trend_use_bb_breakout", 1) if d.get("trend_use_bb_breakout") is not None else 1)
+                if not d.get("exchange_id"):
+                    d["exchange_id"] = "okx"
                 if not d.get("strategy_type"):
                     d["strategy_type"] = "LEAD_LAG"
                 if not d.get("grid_side_mode"):
@@ -733,7 +747,7 @@ class AsyncDatabaseManager:
         try:
             conn.execute(
                 """INSERT INTO symbol_configs (
-                    user_id, symbol, strategy_type, direction, order_usdt, leverage, window_ms, min_jump_pct,
+                    user_id, symbol, exchange_id, strategy_type, direction, order_usdt, leverage, window_ms, min_jump_pct,
                     adaptive_z_score, lag_confirm_max_pct, take_profit_pct, stop_loss_pct,
                     reversal_stop_ratio, trailing_stop_enabled, trailing_retracement_pct,
                     max_hold_ms, slippage_pct, beta_coeff, auto_beta_enabled,
@@ -744,8 +758,9 @@ class AsyncDatabaseManager:
                     grid_recenter_enabled, trend_dead_zone_mult, trend_trailing_mult,
                     trend_pyramid_decay, trend_use_bb_breakout, bbw_timeframe,
                     bbw_squeeze_percentile, is_running, auto_disabled_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, symbol) DO UPDATE SET
+                    exchange_id=excluded.exchange_id,
                     strategy_type=excluded.strategy_type,
                     direction=excluded.direction,
                     order_usdt=excluded.order_usdt,
@@ -791,6 +806,7 @@ class AsyncDatabaseManager:
                 (
                     user_id,
                     cfg.symbol,
+                    str(getattr(cfg, "exchange_id", "okx") or "okx"),
                     cfg.strategy_type,
                     cfg.direction,
                     cfg.order_usdt,

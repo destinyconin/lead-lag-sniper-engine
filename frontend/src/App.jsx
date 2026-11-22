@@ -70,6 +70,34 @@ const STRATEGY_LABEL_MAP = {
   ADAPTIVE_GRID: 'VCP双模式',
 };
 
+const EXCHANGE_SHORT_LABEL_MAP = {
+  okx: 'OKX',
+  binanceusdm: '币安',
+  bybit: 'Bybit',
+  gate: 'Gate.io',
+  bitget: 'Bitget',
+  krakenfutures: 'Kraken',
+  futu: '富途牛牛',
+  moomoo: 'moomoo',
+  ibkr: 'IBKR盈透',
+  schwab: 'Schwab嘉信',
+};
+
+const EXCHANGE_SELECT_OPTIONS = [
+  { id: 'okx', label: 'OKX Swap (欧易永续)', group: 'crypto' },
+  { id: 'binanceusdm', label: 'Binance USDM (币安合约)', group: 'crypto' },
+  { id: 'bybit', label: 'Bybit Unified (Bybit永续)', group: 'crypto' },
+  { id: 'gate', label: 'Gate.io Futures (芝麻开门)', group: 'crypto' },
+  { id: 'bitget', label: 'Bitget Futures (Bitget合约)', group: 'crypto' },
+  { id: 'krakenfutures', label: 'Kraken Futures (Kraken合约)', group: 'crypto' },
+  { id: 'futu', label: '富途牛牛 (Futu OpenD 证券)', group: 'broker' },
+  { id: 'moomoo', label: 'moomoo (Moomoo OpenD 国际)', group: 'broker' },
+  { id: 'ibkr', label: 'IBKR (盈透证券 TWS/Web API)', group: 'broker' },
+  { id: 'schwab', label: 'Charles Schwab (嘉信理财 API)', group: 'broker' },
+];
+
+const TRADITIONAL_BROKER_IDS = new Set(['futu', 'moomoo', 'ibkr', 'schwab']);
+
 const isGridStrategyType = (st) =>
   st === 'LONG_SHORT_GRID' || st === 'REVERSE_GRID' || st === 'TREND_GRID' || st === 'ADAPTIVE_GRID';
 
@@ -462,6 +490,7 @@ export default function App() {
   const [riskForm, setRiskForm] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedSector, setSelectedSector] = useState('ALL');
+  const [selectedExchangeFilter, setSelectedExchangeFilter] = useState('ALL');
   const [toast, setToast] = useState(null);
   const [logFilter, setLogFilter] = useState('ALL');
   const [analyticsSymbolFilter, setAnalyticsSymbolFilter] = useState('ALL');
@@ -926,6 +955,7 @@ export default function App() {
     const rawQtyPrec = Number(cfg.qty_precision);
     const sanitizedCfg = {
       ...cfg,
+      exchange_id: cfg.exchange_id || 'okx',
       order_usdt: orderUsdt,
       leverage,
       price_precision: Math.min(12, Math.max(0, Math.round(Number.isFinite(rawPricePrec) ? rawPricePrec : 4))),
@@ -988,34 +1018,48 @@ export default function App() {
     }
   };
 
-  const handleAddSymbolByCode = async (rawSymbolInput) => {
+  const handleAddSymbolByCode = async (rawSymbolInput, explicitExchangeId = '') => {
     const target = (rawSymbolInput || searchQuery).trim();
     if (!target) {
-      showToast('请输入或选择要添加的合约代号（如 SHIB、PEPE、SUI、ARB）', 'error');
+      showToast('请输入或选择要添加的标的代号（如 SPY、SPX、AAPL、NVDA、SUI、ARB）', 'error');
       return;
     }
+    const effExId = explicitExchangeId || (selectedExchangeFilter !== 'ALL' ? selectedExchangeFilter : '');
     try {
-      const verifyResp = await fetch(`/api/symbol/verify?symbol=${encodeURIComponent(target)}`, {
+      const qs = `/api/symbol/verify?symbol=${encodeURIComponent(target)}${
+        effExId ? `&exchange_id=${encodeURIComponent(effExId)}` : ''
+      }`;
+      const verifyResp = await fetch(qs, {
         headers: { ...authHeaders },
       });
       const vRes = await verifyResp.json().catch(() => ({}));
       if (!verifyResp.ok || !vRes || vRes.verified === false) {
         showToast(
-          vRes?.error || vRes?.detail || `无法添加合约「${target}」：未在交易所找到该永续合约，请检查代号是否正确`,
+          vRes?.error || vRes?.detail || `无法添加标的「${target}」：未在当前所选交易所/券商找到该标的，请检查代号`,
           'error'
         );
         return;
       }
       if (vRes.already_monitored || strategies.some((s) => s.symbol === vRes.symbol)) {
+        const existingCfg = strategies.find((s) => s.symbol === vRes.symbol);
+        if (existingCfg && effExId && existingCfg.exchange_id !== effExId) {
+          await handleSaveSymbol(
+            { ...existingCfg, exchange_id: effExId },
+            `已将 ${vRes.symbol} 的执行通道切换为 [${effExId.toUpperCase()}]`
+          );
+        } else {
+          showToast(`标的 ${vRes.symbol} 已在监控列表中，已为您直接定位并选中`, 'info');
+        }
         setSelectedSymbol(vRes.symbol);
         setSearchQuery('');
-        showToast(`合约 ${vRes.symbol} 已在监控列表中，已为您直接定位并选中该合约`, 'info');
         return;
       }
       const defaultStrat = vRes.recommended_strategy_type || 'LEAD_LAG';
       const defaultOrderUsdt = Number(vRes.recommended_order_usdt) > 0 ? Number(vRes.recommended_order_usdt) : 300;
+      const targetExId = vRes.recommended_exchange_id || effExId || 'okx';
       const newCfg = {
         symbol: vRes.symbol,
+        exchange_id: targetExId,
         strategy_type: defaultStrat,
         direction: 'BOTH',
         order_usdt: defaultOrderUsdt,
@@ -1483,13 +1527,26 @@ export default function App() {
 
   const filteredCatalog = useMemo(() => {
     const monitoredSet = new Set(strategies.map((s) => s.symbol));
-    return catalog.filter((item) => {
+    const isTradFilter = ['futu', 'moomoo', 'ibkr', 'schwab'].includes(selectedExchangeFilter);
+    const list = catalog.filter((item) => {
       const matchesSector = selectedSector === 'ALL' || item.sector === selectedSector;
+      const matchesExchange =
+        selectedExchangeFilter === 'ALL' ||
+        !Array.isArray(item.exchanges) ||
+        item.exchanges.includes(selectedExchangeFilter);
       const q = searchQuery.trim().toUpperCase();
-      const matchesQuery = !q || item.symbol.includes(q) || item.base.includes(q);
-      return matchesSector && matchesQuery && !monitoredSet.has(item.symbol);
+      const matchesQuery =
+        !q ||
+        item.symbol.includes(q) ||
+        item.base.includes(q) ||
+        (item.name_cn && item.name_cn.toUpperCase().includes(q));
+      return matchesSector && matchesExchange && matchesQuery && !monitoredSet.has(item.symbol);
     });
-  }, [catalog, strategies, selectedSector, searchQuery]);
+    if (isTradFilter || selectedSector === '标普500') {
+      return [...list].sort((a, b) => (a.sector === '标普500' ? -1 : 1) - (b.sector === '标普500' ? -1 : 1));
+    }
+    return list;
+  }, [catalog, strategies, selectedSector, selectedExchangeFilter, searchQuery]);
 
   const currentStrategyIdx = strategies.findIndex((s) => s.symbol === selectedSymbol);
   const currentStrategy =
@@ -2729,12 +2786,13 @@ export default function App() {
               <div>
                 <h2 className="text-lg sm:text-xl font-bold text-main">策略参数矩阵与监控合约库</h2>
                 <p className="text-xs sm:text-sm text-dim mt-1">
-                  内置 {catalog.length} 个永续合约与任意币种搜索添加，支持独立配置每个合约的脉冲窗口与止盈止损参数
+                  内置 {catalog.length} 个加密永续与标普500指数/成分股标的，支持按交易所或传统券商（富途/moomoo/IBKR/Schwab）选标的与独立配置策略参数
                 </p>
               </div>
               <div className="flex items-center gap-1.5 text-xs overflow-x-auto no-scrollbar sm:flex-wrap w-full sm:w-auto pb-0.5 sm:pb-0">
                 {[
                   { id: 'ALL', label: '全部热门' },
+                  { id: '标普500', label: '标普500 (S&P 500)' },
                   { id: 'AI与DeFi中小盘', label: 'AI与DeFi中小盘' },
                   { id: '高弹性Meme与中小市值', label: '高弹性Meme' },
                   { id: '公链生态', label: '主流公链' },
@@ -3090,7 +3148,70 @@ export default function App() {
               {/* Left Sidebar: Pill Search + Solid Black Add Button + Full-Height Monitored Contract List */}
               <div className="lg:col-span-4 lg:relative border-b lg:border-b-0 lg:border-r border-line">
                 <div className="lg:absolute lg:inset-0 p-4 sm:p-6 flex flex-col">
-                  <div className="shrink-0 space-y-3.5 sm:space-y-4">
+                  <div className="shrink-0 space-y-3 sm:space-y-3.5">
+                    {/* Exchange / Broker Selector for Picking Symbols */}
+                    <div className="surface-subtle p-2.5 sm:p-3 rounded-2xl space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-bold text-main">选择交易所 / 券商选标的</span>
+                        <select
+                          value={selectedExchangeFilter}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setSelectedExchangeFilter(val);
+                            if (TRADITIONAL_BROKER_IDS.has(val)) {
+                              setSelectedSector('标普500');
+                            }
+                          }}
+                          className="rounded-xl bg-[var(--bg-card)] border border-line px-2.5 py-1 text-xs font-semibold text-main outline-none"
+                        >
+                          <option value="ALL">全部交易所与券商</option>
+                          <optgroup label="加密货币合约交易所">
+                            {EXCHANGE_SELECT_OPTIONS.filter((o) => o.group === 'crypto').map((o) => (
+                              <option key={o.id} value={o.id}>
+                                {o.label}
+                              </option>
+                            ))}
+                          </optgroup>
+                          <optgroup label="传统美股/标普500券商">
+                            {EXCHANGE_SELECT_OPTIONS.filter((o) => o.group === 'broker').map((o) => (
+                              <option key={o.id} value={o.id}>
+                                {o.label}
+                              </option>
+                            ))}
+                          </optgroup>
+                        </select>
+                      </div>
+                      <div className="flex items-center gap-1 overflow-x-auto no-scrollbar pb-0.5">
+                        {[
+                          { id: 'ALL', label: '全部' },
+                          { id: 'okx', label: 'OKX' },
+                          { id: 'binanceusdm', label: '币安' },
+                          { id: 'futu', label: '富途牛牛' },
+                          { id: 'moomoo', label: 'moomoo' },
+                          { id: 'ibkr', label: 'IBKR' },
+                          { id: 'schwab', label: 'Schwab' },
+                        ].map((exOpt) => (
+                          <button
+                            key={exOpt.id}
+                            type="button"
+                            onClick={() => {
+                              setSelectedExchangeFilter(exOpt.id);
+                              if (TRADITIONAL_BROKER_IDS.has(exOpt.id)) {
+                                setSelectedSector('标普500');
+                              }
+                            }}
+                            className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold transition whitespace-nowrap shrink-0 ${
+                              selectedExchangeFilter === exOpt.id
+                                ? 'bg-[#0f1419] text-white dark:bg-sky-500'
+                                : 'bg-[var(--bg-card)] text-sub hover:text-main'
+                            }`}
+                          >
+                            {exOpt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
                     {/* Pill Search Input (Matching Screenshot 3 `搜索工单...`) */}
                     <div className="relative">
                       <Search className="w-4 h-4 text-dim absolute left-4 top-1/2 -translate-y-1/2" strokeWidth={1.75} />
@@ -3101,7 +3222,7 @@ export default function App() {
                         onKeyDown={(e) => {
                           if (e.key === 'Enter') handleAddSymbolByCode(searchQuery);
                         }}
-                        placeholder="搜索或输入币种代号 (如 SUI / ARB / WIF)..."
+                        placeholder="搜索加密或标普500标的 (如 SPY / SPX / AAPL / NVDA / SUI)..."
                         className="w-full rounded-full surface-subtle pl-10 pr-4 py-2.5 text-base sm:text-xs font-mono text-main outline-none"
                       />
                     </div>
@@ -3112,7 +3233,12 @@ export default function App() {
                       className="btn-primary-pill w-full py-2.5 sm:py-3 text-xs"
                     >
                       <Plus className="w-4 h-4" strokeWidth={2} />
-                      <span>+ 添加并激活监控合约</span>
+                      <span>
+                        + 添加并激活监控标的
+                        {selectedExchangeFilter !== 'ALL'
+                          ? ` (${EXCHANGE_SHORT_LABEL_MAP[selectedExchangeFilter] || selectedExchangeFilter.toUpperCase()})`
+                          : ''}
+                      </span>
                     </button>
                   </div>
 
@@ -3174,6 +3300,17 @@ export default function App() {
                               <div className="flex items-center gap-1.5">
                                 <span className="font-mono font-bold text-sm truncate">{item.symbol}</span>
                                 <span
+                                  className={`px-1.5 py-0.5 rounded-full text-[10px] font-semibold shrink-0 ${
+                                    active
+                                      ? 'bg-white/15 text-white'
+                                      : TRADITIONAL_BROKER_IDS.has(item.exchange_id)
+                                      ? 'bg-indigo-500/15 text-indigo-600 dark:text-indigo-300'
+                                      : 'bg-slate-500/15 text-sub'
+                                  }`}
+                                >
+                                  {EXCHANGE_SHORT_LABEL_MAP[item.exchange_id || 'okx'] || (item.exchange_id || 'OKX').toUpperCase()}
+                                </span>
+                                <span
                                   className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${strategyBadgeClass(
                                     st,
                                     active
@@ -3229,16 +3366,46 @@ export default function App() {
 
                   {/* Quick-Add Recommended Contract Chips */}
                   <div className="shrink-0 pt-4 mt-4 border-t border-line">
-                    <div className="text-xs font-bold text-dim mb-2">一键快速添加推荐合约</div>
+                    <div className="flex items-center justify-between gap-2 mb-2">
+                      <div className="text-xs font-bold text-dim">
+                        一键快速添加推荐标的
+                        {selectedExchangeFilter !== 'ALL'
+                          ? ` · ${EXCHANGE_SHORT_LABEL_MAP[selectedExchangeFilter] || selectedExchangeFilter.toUpperCase()}`
+                          : ''}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSelectedSector((prev) => (prev === '标普500' ? 'ALL' : '标普500'))
+                        }
+                        className={`px-2 py-0.5 rounded-full text-[10px] font-bold transition ${
+                          selectedSector === '标普500'
+                            ? 'bg-indigo-600 text-white'
+                            : 'bg-indigo-500/15 text-indigo-600 dark:text-indigo-300'
+                        }`}
+                      >
+                        {selectedSector === '标普500' ? '显示全部板块' : '标普500专区'}
+                      </button>
+                    </div>
                     <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
-                      {filteredCatalog.slice(0, 14).map((item) => (
+                      {filteredCatalog.slice(0, 18).map((item) => (
                         <button
                           key={item.symbol}
                           onClick={() => handleAddSymbolByCode(item.symbol)}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full surface-subtle hover:opacity-80 text-xs font-mono transition"
+                          title={item.name_cn ? `${item.base} (${item.name_cn})` : item.symbol}
+                          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full hover:opacity-80 text-xs font-mono transition ${
+                            item.sector === '标普500'
+                              ? 'bg-indigo-500/12 border border-indigo-500/25 text-indigo-700 dark:text-indigo-300'
+                              : 'surface-subtle text-main'
+                          }`}
                         >
-                          <Plus className="w-3 h-3 text-main" strokeWidth={2} />
-                          <span className="font-bold text-main">{item.base}</span>
+                          <Plus className="w-3 h-3 shrink-0" strokeWidth={2} />
+                          <span className="font-bold">{item.base}</span>
+                          {item.name_cn && (
+                            <span className="text-[10px] font-sans opacity-80">
+                              {item.name_cn.split(' ')[0]}
+                            </span>
+                          )}
                         </button>
                       ))}
                     </div>
@@ -3274,6 +3441,27 @@ export default function App() {
                       </div>
 
                       <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-2 sm:gap-2.5 w-full sm:w-auto">
+                        <select
+                          value={currentStrategy.exchange_id || 'okx'}
+                          onChange={(e) => updateCurrentStrategyField({ exchange_id: e.target.value })}
+                          title="选择该标的绑定的执行交易所或传统券商通道"
+                          className="input-field py-2 px-3 sm:px-3.5 text-sm sm:text-xs font-semibold sm:w-auto"
+                        >
+                          <optgroup label="加密货币合约交易所">
+                            {EXCHANGE_SELECT_OPTIONS.filter((o) => o.group === 'crypto').map((o) => (
+                              <option key={o.id} value={o.id}>
+                                {o.label}
+                              </option>
+                            ))}
+                          </optgroup>
+                          <optgroup label="传统美股/标普500券商">
+                            {EXCHANGE_SELECT_OPTIONS.filter((o) => o.group === 'broker').map((o) => (
+                              <option key={o.id} value={o.id}>
+                                {o.label}
+                              </option>
+                            ))}
+                          </optgroup>
+                        </select>
                         {isGridStrategyType(currentStrategy.strategy_type || 'LEAD_LAG') ? (
                           <select
                             value={currentStrategy.grid_side_mode || 'LONG_SHORT'}
@@ -4329,6 +4517,31 @@ export default function App() {
                   authStatus === 'ACCOUNT_MODE_UNSUPPORTED' ||
                   authStatus === 'READ_ONLY_KEY';
                 const needsPass = ex.exchange_id === 'okx' || ex.exchange_id === 'bitget';
+                const isTradBroker = TRADITIONAL_BROKER_IDS.has(ex.exchange_id);
+                const keyLabel =
+                  ex.exchange_id === 'futu' || ex.exchange_id === 'moomoo'
+                    ? 'OpenD 网关地址 / API Key (Account ID)'
+                    : ex.exchange_id === 'ibkr'
+                    ? 'IBKR Client Portal 网关 / Consumer Key'
+                    : ex.exchange_id === 'schwab'
+                    ? 'Schwab App Key (Client ID)'
+                    : 'API Key';
+                const secLabel =
+                  ex.exchange_id === 'futu' || ex.exchange_id === 'moomoo'
+                    ? 'RSA 私钥签名 / API Secret'
+                    : ex.exchange_id === 'ibkr'
+                    ? 'OAuth Access Token / Secret'
+                    : ex.exchange_id === 'schwab'
+                    ? 'App Secret / Refresh Token'
+                    : 'API Secret';
+                const passLabel =
+                  ex.exchange_id === 'futu' || ex.exchange_id === 'moomoo'
+                    ? '交易解锁密码 (Unlock PIN)'
+                    : ex.exchange_id === 'ibkr'
+                    ? 'IBKR 账户号 (如 U1234567)'
+                    : ex.exchange_id === 'schwab'
+                    ? 'Account Hash (加密账户ID)'
+                    : 'Passphrase';
 
                 return (
                   <div key={ex.exchange_id} className="surface-card p-4 sm:p-6 lg:p-7 flex flex-col justify-between space-y-5">
@@ -4337,6 +4550,11 @@ export default function App() {
                         <div className="min-w-0">
                           <div className="flex flex-wrap items-center gap-2">
                             <span className="font-bold text-base text-main">{ex.display_name}</span>
+                            {isTradBroker && (
+                              <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-500/15 text-indigo-600 dark:text-indigo-300">
+                                传统券商 · 标普500
+                              </span>
+                            )}
                             <span
                               className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${
                                 isVerified
@@ -4435,7 +4653,7 @@ export default function App() {
 
                         <div>
                           <div className="flex items-center justify-between mb-1.5">
-                            <label className="font-bold text-main">API Key</label>
+                            <label className="font-bold text-main">{keyLabel}</label>
                             <span className="text-[11px] font-mono text-dim">
                               {ex.has_api_key ? `已存 (${ex.api_key_masked})` : '必填'}
                             </span>
@@ -4443,7 +4661,13 @@ export default function App() {
                           <input
                             type="text"
                             value={ex.api_key || ''}
-                            placeholder={ex.has_api_key ? `已存: ${ex.api_key_masked} (输入新值覆盖)` : '输入完整 API Key'}
+                            placeholder={
+                              ex.has_api_key
+                                ? `已存: ${ex.api_key_masked} (输入新值覆盖)`
+                                : isTradBroker
+                                ? '输入券商 API Key / Account ID 或网关地址'
+                                : '输入完整 API Key'
+                            }
                             onChange={(e) => {
                               const next = [...exchanges];
                               next[idx] = { ...ex, api_key: e.target.value };
@@ -4456,7 +4680,7 @@ export default function App() {
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                           <div>
                             <div className="flex items-center justify-between mb-1.5">
-                              <label className="font-bold text-main">API Secret</label>
+                              <label className="font-bold text-main">{secLabel}</label>
                               <span className="text-[11px] font-mono text-dim">
                                 {ex.has_api_secret ? '已保存' : '未填'}
                               </span>
@@ -4464,7 +4688,7 @@ export default function App() {
                             <input
                               type="password"
                               value={ex.api_secret || ''}
-                              placeholder={ex.has_api_secret ? '已加密保存' : '输入 Secret'}
+                              placeholder={ex.has_api_secret ? '已加密保存' : '输入 Secret / Token'}
                               onChange={(e) => {
                                 const next = [...exchanges];
                                 next[idx] = { ...ex, api_secret: e.target.value };
@@ -4475,7 +4699,7 @@ export default function App() {
                           </div>
                           <div>
                             <div className="flex items-center justify-between mb-1.5">
-                              <label className="font-bold text-main">Passphrase</label>
+                              <label className="font-bold text-main">{passLabel}</label>
                               <span className="text-[11px] font-mono text-dim">
                                 {ex.has_passphrase ? '已保存' : needsPass ? '欧易必填' : '选填'}
                               </span>
@@ -4483,7 +4707,13 @@ export default function App() {
                             <input
                               type="password"
                               value={ex.passphrase || ''}
-                              placeholder={ex.has_passphrase ? '已加密保存' : '创建API时设的密码'}
+                              placeholder={
+                                ex.has_passphrase
+                                  ? '已加密保存'
+                                  : isTradBroker
+                                  ? '交易解锁密码或证券账户号'
+                                  : '创建API时设的密码'
+                              }
                               onChange={(e) => {
                                 const next = [...exchanges];
                                 next[idx] = { ...ex, passphrase: e.target.value };

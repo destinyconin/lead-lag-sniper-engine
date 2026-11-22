@@ -21,6 +21,7 @@ from backend.engine_manager import EngineManager
 from backend.market_gateway import (
     BASE_PRICES,
     BINANCE_1000X_BASES,
+    SP500_SYMBOL_NAMES,
     _BINANCE_INSTRUMENT_CACHE,
     _OKX_INSTRUMENT_CACHE,
     get_binance_instrument_spec,
@@ -29,6 +30,8 @@ from backend.market_gateway import (
     to_okx_inst_id,
 )
 from backend.models import (
+    ALL_EXCHANGE_IDS,
+    TRADITIONAL_BROKER_IDS,
     AdminAuditOrderRequest,
     AdminCreateUserRequest,
     AdminGenerateVipCodesRequest,
@@ -47,6 +50,7 @@ from backend.models import (
     RegisterRequest,
     SymbolStrategy,
     is_grid_strategy,
+    is_traditional_broker,
 )
 from backend.payment_monitor import OnChainPaymentMonitor
 from backend.sniper_engine import BidirectionalSniperEngine
@@ -184,6 +188,19 @@ SECTOR_MAP = {
     "ENA": "AI与DeFi中小盘", "ONDO": "AI与DeFi中小盘", "JUP": "AI与DeFi中小盘",
     "PYTH": "AI与DeFi中小盘", "CRV": "AI与DeFi中小盘", "LDO": "AI与DeFi中小盘",
     "DYDX": "AI与DeFi中小盘",
+    **{k: "标普500" for k in SP500_SYMBOL_NAMES.keys()},
+}
+
+SP500_ALIASES: Dict[str, str] = {
+    "S&P500": "SPX",
+    "S&P": "SPX",
+    "SPX500": "SPX",
+    "GSPC": "SPX",
+    "US500": "SPX",
+    "BRK.B": "BRKB",
+    "BRK-B": "BRKB",
+    "BRK/B": "BRKB",
+    "GOOG": "GOOGL",
 }
 
 
@@ -193,16 +210,26 @@ def build_perp_catalog():
         base = sym.split("/")[0]
         p_prec, q_prec, min_q = _infer_precision(px)
         sector = SECTOR_MAP.get(base, "高弹性Meme与中小市值")
+        is_sp500 = sector == "标普500"
+        if is_sp500:
+            ex_list = ["futu", "moomoo", "ibkr", "schwab", "okx"]
+            if base in ("NVDA", "TSLA", "SNDK", "SPCX", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "COIN", "MSTR"):
+                ex_list = ["okx", "futu", "moomoo", "ibkr", "schwab", "bybit", "gate", "bitget"]
+        elif base in ("BTC", "ETH", "SOL"):
+            ex_list = ["binanceusdm", "okx", "bybit", "gate", "bitget", "krakenfutures", "futu", "moomoo", "ibkr", "schwab"]
+        else:
+            ex_list = ["binanceusdm", "okx", "bybit", "gate", "bitget", "krakenfutures"]
         catalog.append(
             {
                 "symbol": sym,
                 "base": base,
+                "name_cn": SP500_SYMBOL_NAMES.get(base, ""),
                 "sector": sector,
                 "ref_price": px,
                 "price_prec": p_prec,
                 "qty_prec": q_prec,
                 "min_qty": min_q,
-                "exchanges": ["binanceusdm", "okx", "bybit", "gate", "bitget", "krakenfutures"],
+                "exchanges": ex_list,
             }
         )
     return catalog
@@ -223,6 +250,23 @@ VIP_FEE_TIERS: Dict[str, Dict[str, tuple[float, float]]] = {
         "VIP 1": (0.00045, 0.00015),
         "VIP 2": (0.00040, 0.00010),
         "VIP 3": (0.00035, 0.00008),
+    },
+    "futu": {
+        "美股标准": (0.00030, 0.00010),
+        "VIP 1": (0.00025, 0.00008),
+    },
+    "moomoo": {
+        "US Tier 1": (0.00030, 0.00010),
+        "VIP 1": (0.00020, 0.00005),
+    },
+    "ibkr": {
+        "IBKR Pro": (0.00020, 0.00008),
+        "IBKR Lite": (0.00015, 0.00005),
+        "VIP 1": (0.00018, 0.00006),
+    },
+    "schwab": {
+        "Zero-Comm": (0.00010, 0.00005),
+        "VIP 1": (0.00010, 0.00005),
     },
 }
 
@@ -351,10 +395,25 @@ async def get_symbols(authorization: str = Header(default="")):
 
 
 @app.get("/api/symbol/verify")
-async def verify_symbol(symbol: str = Query(...), authorization: str = Header(default="")):
+async def verify_symbol(
+    symbol: str = Query(...),
+    exchange_id: str = Query(default=""),
+    authorization: str = Header(default=""),
+):
     _, eng = await _resolve_user_engine(authorization)
     leader, follower = eng.get_leader_And_follower_cfg()
-    raw = (symbol or "").strip().upper().replace("-SWAP", "").replace("-PERP", "").replace("_", "/")
+    req_ex_id = (exchange_id or "").strip().lower()
+    if req_ex_id in ("all", ""):
+        req_ex_id = ""
+    raw = (symbol or "").strip().upper()
+    for prefix in ("US.", "HK.", "$", "^"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix) :]
+    if raw in SP500_ALIASES:
+        raw = SP500_ALIASES[raw]
+    raw = raw.replace("-SWAP", "").replace("-PERP", "").replace("_", "/")
+    if raw in SP500_ALIASES:
+        raw = SP500_ALIASES[raw]
     if "-" in raw and "/" not in raw:
         raw = raw.replace("-", "/")
     if ":" in raw:
@@ -363,6 +422,7 @@ async def verify_symbol(symbol: str = Query(...), authorization: str = Header(de
         base_clean = raw.split("/")[0].strip()
     else:
         base_clean = raw[:-4].strip() if raw.endswith("USDT") and len(raw) > 4 else raw.strip()
+    base_clean = SP500_ALIASES.get(base_clean, base_clean).replace(".", "")
 
     if base_clean.startswith("1000") and base_clean[4:] in BINANCE_1000X_BASES:
         base_clean = base_clean[4:]
@@ -372,7 +432,7 @@ async def verify_symbol(symbol: str = Query(...), authorization: str = Header(de
             "symbol": symbol.strip().upper() or "--",
             "verified": False,
             "in_catalog": False,
-            "error": "币种代号格式无效，请输入有效的合约代号（如 SHIB、PEPE、SUI、ARB）",
+            "error": "标的代号格式无效，请输入有效的合约或标普500股票代号（如 SPY、SPX、AAPL、NVDA、SUI、ARB）",
         }
 
     norm_sym = f"{base_clean}/USDT:USDT"
@@ -380,8 +440,10 @@ async def verify_symbol(symbol: str = Query(...), authorization: str = Header(de
     match = next((item for item in SUPPORTED_PERP_CATALOG if item["symbol"] == norm_sym), None)
     okx_spec = get_okx_instrument_spec(norm_sym)
     bn_spec = get_binance_instrument_spec(norm_sym)
+    is_sp500_sym = base_clean in SP500_SYMBOL_NAMES or (match and match.get("sector") == "标普500")
+    is_trad_req = is_traditional_broker(req_ex_id)
 
-    if _OKX_INSTRUMENT_CACHE and not okx_spec and match is None:
+    if _OKX_INSTRUMENT_CACHE and not okx_spec and match is None and not is_trad_req:
         return {
             "symbol": norm_sym,
             "verified": False,
@@ -389,10 +451,10 @@ async def verify_symbol(symbol: str = Query(...), authorization: str = Header(de
             "already_monitored": already_monitored,
             "leader_supported": bool(bn_spec and bn_spec.get("status") == "TRADING"),
             "follower_supported": False,
-            "error": f"添加失败：执行端 OKX 未上线 {to_okx_inst_id(norm_sym)} 永续合约，请检查币种代号是否正确",
+            "error": f"添加失败：执行端 OKX 未上线 {to_okx_inst_id(norm_sym)} 永续合约（若添加美股/标普500标的，请先在上方切换至富途/moomoo/IBKR/Schwab券商通道）",
         }
 
-    if okx_spec and okx_spec.get("state") not in (None, "live"):
+    if not is_trad_req and okx_spec and okx_spec.get("state") not in (None, "live"):
         return {
             "symbol": norm_sym,
             "verified": False,
@@ -402,6 +464,10 @@ async def verify_symbol(symbol: str = Query(...), authorization: str = Header(de
             "follower_supported": False,
             "error": f"添加失败：OKX 合约 {to_okx_inst_id(norm_sym)} 当前状态为 {okx_spec.get('state')}，暂不可交易",
         }
+
+    target_exchange_id = req_ex_id if req_ex_id in ALL_EXCHANGE_IDS else (
+        "futu" if (is_sp500_sym and not okx_spec) else follower["exchange_id"]
+    )
 
     ref_px = match["ref_price"] if match else get_default_base_price(norm_sym)
     f_bbo = eng.gateway.real_follower_bbo.get(norm_sym)
@@ -414,7 +480,7 @@ async def verify_symbol(symbol: str = Query(...), authorization: str = Header(de
 
     p_prec, q_prec, min_q = _infer_precision(ref_px)
     min_notional_usdt = 0.0
-    if okx_spec:
+    if okx_spec and not is_traditional_broker(target_exchange_id):
         tick_str = str(okx_spec.get("tickSz_str") or "")
         if "." in tick_str:
             p_prec = min(12, max(p_prec, len(tick_str.rstrip("0").split(".")[1])))
@@ -422,23 +488,27 @@ async def verify_symbol(symbol: str = Query(...), authorization: str = Header(de
         if min_base > 0:
             min_q = round(min_base, 8)
             min_notional_usdt = round(min_base * ref_px, 4)
+    elif is_traditional_broker(target_exchange_id) or is_sp500_sym:
+        p_prec = 2
+        q_prec = 2
+        min_q = 0.01
 
     leader_supported = (
         bool(bn_spec and bn_spec.get("status") == "TRADING")
-        if _BINANCE_INSTRUMENT_CACHE
+        if (_BINANCE_INSTRUMENT_CACHE and not is_traditional_broker(target_exchange_id))
         else True
     )
-    follower_supported = okx_spec is None or okx_spec.get("state") == "live"
+    follower_supported = is_traditional_broker(target_exchange_id) or is_sp500_sym or okx_spec is None or okx_spec.get("state") == "live"
 
     # Infer sensible strategy & order_usdt defaults from the user's current portfolio
     existing = list(eng.strategies.values())
     grid_configs = [s for s in existing if is_grid_strategy(s.strategy_type)]
     if grid_configs and len(grid_configs) >= len(existing) / 2:
         rec_strategy = grid_configs[0].strategy_type
-        base_order_usdt = float(grid_configs[0].order_usdt or 5.0)
-    elif not leader_supported:
-        rec_strategy = "LONG_SHORT_GRID"
-        base_order_usdt = 10.0
+        base_order_usdt = float(grid_configs[0].order_usdt or 20.0)
+    elif is_traditional_broker(target_exchange_id) or is_sp500_sym or not leader_supported:
+        rec_strategy = "TREND_GRID" if (is_sp500_sym or is_traditional_broker(target_exchange_id)) else "LONG_SHORT_GRID"
+        base_order_usdt = 20.0 if (is_sp500_sym or is_traditional_broker(target_exchange_id)) else 10.0
     else:
         rec_strategy = "LEAD_LAG"
         base_order_usdt = float(existing[0].order_usdt if existing else 300.0)
@@ -449,7 +519,10 @@ async def verify_symbol(symbol: str = Query(...), authorization: str = Header(de
         rec_order_usdt = base_order_usdt
 
     warnings = []
-    if _BINANCE_INSTRUMENT_CACHE and not leader_supported:
+    if is_sp500_sym or is_traditional_broker(target_exchange_id):
+        sp_title = SP500_SYMBOL_NAMES.get(base_clean, base_clean)
+        warnings.append(f"标普500/美股标的 {sp_title} 已绑定执行通道 [{target_exchange_id.upper()}]")
+    elif _BINANCE_INSTRUMENT_CACHE and not leader_supported:
         warnings.append(f"{norm_sym} 在主所 Binance 未上线，已自动设为 OKX「多空动态网格」策略")
     if min_notional_usdt > base_order_usdt * 1.35:
         warnings.append(
@@ -458,15 +531,19 @@ async def verify_symbol(symbol: str = Query(...), authorization: str = Header(de
 
     return {
         "symbol": norm_sym,
+        "base": base_clean,
+        "name_cn": SP500_SYMBOL_NAMES.get(base_clean, ""),
+        "sector": "标普500" if is_sp500_sym else (match["sector"] if match else "自定义标的"),
         "verified": True,
         "already_monitored": already_monitored,
-        "in_catalog": match is not None or okx_spec is not None,
+        "in_catalog": match is not None or okx_spec is not None or is_trad_req,
         "ref_price": ref_px,
         "min_notional_usdt": min_notional_usdt,
         "leader_supported": leader_supported,
         "follower_supported": follower_supported,
         "leader_exchange": leader["exchange_id"],
-        "follower_exchange": follower["exchange_id"],
+        "follower_exchange": target_exchange_id,
+        "recommended_exchange_id": target_exchange_id,
         "okx_spec": okx_spec,
         "recommended_strategy_type": rec_strategy,
         "recommended_order_usdt": rec_order_usdt,

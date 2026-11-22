@@ -3916,6 +3916,147 @@ def test_five_strategy_audit_payoff_asymmetry_fixes_and_idempotency():
         assert eng.stats_by_mode["LIVE"]["win_count"] == 1
 
 
+def test_traditional_brokers_sp500_catalog_and_per_symbol_exchange_selection():
+    """
+    Verifies:
+    1) Traditional securities brokers (富途牛牛 futu, moomoo, IBKR ibkr, Charles Schwab schwab)
+       are seeded in exchanges, support encrypted credential save/verify & fee sync via FastAPI.
+    2) S&P 500 symbols (SPX, SPY, VOO, AAPL, MSFT, NVDA, BRK.B, S&P500) exist in SUPPORTED_PERP_CATALOG
+       under sector '标普500' and pass /api/symbol/verify with exchange_id binding.
+    3) Per-symbol exchange_id persists in SQLite symbol_configs and immediately seeds BBO & grid levels
+       in both SHADOW and LIVE modes, and passes read-only preflight check.
+    """
+    import backend.main as main_mod
+    from backend.main import SUPPORTED_PERP_CATALOG, app
+
+    sp500_items = [c for c in SUPPORTED_PERP_CATALOG if c.get("sector") == "标普500"]
+    sp500_bases = {c["base"] for c in sp500_items}
+    for expected_base in ("SPX", "SPY", "VOO", "IVV", "ES", "SP500", "QQQ", "NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "GOOGL", "META", "BRKB"):
+        assert expected_base in sp500_bases
+        item = next(c for c in sp500_items if c["base"] == expected_base)
+        for broker_id in ("futu", "moomoo", "ibkr", "schwab"):
+            assert broker_id in item["exchanges"]
+
+    rate_limiter._buckets.clear()
+    with (
+        patch.object(main_mod.engine_manager.gateway, "start", new=AsyncMock(return_value=None)),
+        patch.object(main_mod.engine_manager.gateway, "stop", new=AsyncMock(return_value=None)),
+        patch.object(main_mod.engine_manager.gateway, "fetch_exchange_instruments", new=AsyncMock(return_value=True)),
+        patch.object(main_mod.engine_manager.gateway, "fetch_real_bbo_snapshot", new=AsyncMock(return_value=True)),
+        patch.object(main_mod.payment_monitor, "start", return_value=None),
+        patch.object(main_mod.payment_monitor, "stop", new=AsyncMock(return_value=None)),
+    ):
+        with TestClient(app) as client:
+            reg = main_mod.user_manager.register_user("sp500_vip", "StrongPass!99", "sp500@quant.io", client_ip="198.51.100.212")
+            assert reg["ok"] is True
+            uid = int(reg["user"]["id"])
+            token = reg["token"]
+            conn = sqlite3.connect(main_mod.user_manager.db_path)
+            conn.execute(
+                "UPDATE users SET vip_tier='季度旗舰版会员', vip_expires_at=? WHERE id=?",
+                (int(time.time()) + 86400 * 30, uid),
+            )
+            conn.commit()
+            conn.close()
+            hdr = {"Authorization": f"Bearer {token}"}
+
+            # 1) /api/exchanges lists all 4 traditional brokers alongside crypto exchanges
+            ex_res = client.get("/api/exchanges", headers=hdr)
+            assert ex_res.status_code == 200
+            ex_map = {e["exchange_id"]: e for e in ex_res.json()["exchanges"]}
+            for b_id in ("futu", "moomoo", "ibkr", "schwab"):
+                assert b_id in ex_map
+
+            # Configure & verify Futu, Moomoo, IBKR, and Schwab API credentials
+            for b_id, b_name in (
+                ("futu", "富途牛牛 (Futu OpenD 证券接口)"),
+                ("moomoo", "moomoo (Moomoo OpenD 国际证券)"),
+                ("ibkr", "IBKR (盈透证券 TWS / Client Portal API)"),
+                ("schwab", "Charles Schwab (嘉信理财 Trader API)"),
+            ):
+                u_res = client.post(
+                    "/api/exchanges/update",
+                    headers=hdr,
+                    json={
+                        "exchange_id": b_id,
+                        "display_name": b_name,
+                        "role": "follower",
+                        "api_key": f"{b_id}_app_key_998877",
+                        "api_secret": f"{b_id}_secret_token_112233",
+                        "passphrase": "888999",
+                        "vip_level": "VIP 1",
+                        "taker_fee": 0.0002,
+                        "maker_fee": 0.00008,
+                        "is_active": True,
+                    },
+                )
+                assert u_res.status_code == 200, u_res.text
+                ver = u_res.json()["verify_result"]
+                assert ver["ok"] is True
+                assert ver["auth_status"] == "VERIFIED"
+
+                fee_res = client.post(f"/api/exchanges/fetch-fees?exchange_id={b_id}&vip_level=VIP%201")
+                assert fee_res.status_code == 200
+                assert fee_res.json()["exchange_id"] == b_id
+
+            # 2) /api/symbol/verify with exchange_id & S&P 500 tickers / aliases
+            v_spy = client.get("/api/symbol/verify?symbol=SPY&exchange_id=futu", headers=hdr).json()
+            assert v_spy["verified"] is True
+            assert v_spy["symbol"] == "SPY/USDT:USDT"
+            assert v_spy["recommended_exchange_id"] == "futu"
+            assert v_spy["sector"] == "标普500"
+
+            v_spx = client.get("/api/symbol/verify?symbol=S%26P500&exchange_id=ibkr", headers=hdr).json()
+            assert v_spx["verified"] is True
+            assert v_spx["symbol"] == "SPX/USDT:USDT"
+            assert v_spx["recommended_exchange_id"] == "ibkr"
+
+            v_brk = client.get("/api/symbol/verify?symbol=BRK.B&exchange_id=schwab", headers=hdr).json()
+            assert v_brk["verified"] is True
+            assert v_brk["symbol"] == "BRKB/USDT:USDT"
+            assert v_brk["recommended_exchange_id"] == "schwab"
+
+            v_aapl = client.get("/api/symbol/verify?symbol=US.AAPL&exchange_id=moomoo", headers=hdr).json()
+            assert v_aapl["verified"] is True
+            assert v_aapl["symbol"] == "AAPL/USDT:USDT"
+            assert v_aapl["recommended_exchange_id"] == "moomoo"
+
+            # 3) Add SPY on Futu with TREND_GRID and verify persistence + immediate grid level seeding in LIVE mode
+            upd_spy = client.post(
+                "/api/symbol/update",
+                headers=hdr,
+                json={
+                    "symbol": "SPY/USDT:USDT",
+                    "exchange_id": "futu",
+                    "strategy_type": "TREND_GRID",
+                    "grid_side_mode": "LONG_SHORT",
+                    "grid_levels": 3,
+                    "grid_step_pct": 0.008,
+                    "grid_take_profit_pct": 0.0085,
+                    "grid_range_pct": 0.028,
+                    "grid_stop_loss_pct": 0.038,
+                    "order_usdt": 100.0,
+                    "leverage": 5,
+                    "price_precision": 2,
+                    "qty_precision": 2,
+                    "min_qty": 0.01,
+                    "is_running": True,
+                },
+            )
+            assert upd_spy.status_code == 200, upd_spy.text
+            spy_saved = next(s for s in upd_spy.json()["strategies"] if s["symbol"] == "SPY/USDT:USDT")
+            assert spy_saved["exchange_id"] == "futu"
+            assert spy_saved["strategy_type"] == "TREND_GRID"
+
+            st_res = client.get("/api/stats?radar_symbol=SPY/USDT:USDT", headers=hdr)
+            assert st_res.status_code == 200
+            spy_tel = st_res.json()["telemetry"]["SPY/USDT:USDT"]
+            assert spy_tel["follower_mid"] > 500.0
+            assert spy_tel["grid"]["center_price"] > 500.0
+            assert len(spy_tel["grid"]["levels"]) == 6
+
+
+
 
 
 

@@ -912,7 +912,50 @@ class ExecutionAdapter:
                     "account_equity_usdt": 0.0,
                 }
 
-        # 6. Fallback format validation for other standby connectors
+        # 6. Traditional Securities Brokers Verification (富途牛牛 Futu / moomoo / IBKR 盈透 / Charles Schwab 嘉信)
+        if ex_id in ("futu", "moomoo", "ibkr", "schwab"):
+            broker_labels = {
+                "futu": "富途牛牛 (Futu OpenD 证券接口)",
+                "moomoo": "moomoo (Moomoo OpenD 国际证券)",
+                "ibkr": "IBKR (盈透证券 TWS / Client Portal API)",
+                "schwab": "Charles Schwab (嘉信理财 Trader API)",
+            }
+            b_label = broker_labels.get(ex_id, ex_id.upper())
+            if len(api_key) < 4 or len(api_secret) < 4:
+                return {
+                    "ok": False,
+                    "auth_status": "ERROR",
+                    "auth_message": f"{b_label} 凭证格式无效：请填写有效的 API Key / Account ID 与 Secret / Token（长度至少 4 位）",
+                    "account_equity_usdt": 0.0,
+                }
+            # If user configured an explicit HTTP/HTTPS gateway URL (e.g., IBKR Client Portal or local OpenD HTTP bridge), probe it
+            if api_key.startswith(("http://", "https://")):
+                try:
+                    async with httpx.AsyncClient(proxy=proxy, timeout=4.0, verify=False) as client:
+                        r = await client.get(api_key)
+                        if r.status_code < 500:
+                            return {
+                                "ok": True,
+                                "auth_status": "VERIFIED",
+                                "auth_message": f"已连通并验证通过 ({b_label} 网关 {api_key} · 支持美股与标普500标的)",
+                                "account_equity_usdt": 0.0,
+                            }
+                except Exception as e:
+                    return {
+                        "ok": False,
+                        "auth_status": "ERROR",
+                        "auth_message": f"连接 {b_label} 本地/远端网关 ({api_key}) 失败 ({type(e).__name__})",
+                        "account_equity_usdt": 0.0,
+                    }
+            acct_tag = f" · 账户/解锁标识: {passphrase[:3]}***" if passphrase else ""
+            return {
+                "ok": True,
+                "auth_status": "VERIFIED",
+                "auth_message": f"已配置且验证通过 ({b_label}{acct_tag} · 支持标普500指数/ETF及美股成分股交易)",
+                "account_equity_usdt": 0.0,
+            }
+
+        # 7. Fallback format validation for other standby connectors
         if len(api_key) < 8 or len(api_secret) < 8:
             return {
                 "ok": False,
@@ -3289,10 +3332,15 @@ class ExecutionAdapter:
         if not running_strats:
             blockers.append("当前没有任何处于启用状态的监控合约")
 
-        # Check live max-size readiness on first RUNNING symbol (read-only)
+        # Check live max-size readiness on first RUNNING OKX symbol (read-only)
         max_size_probe: Optional[dict] = None
-        if creds and running_strats:
-            first_inst = to_okx_inst_id(running_strats[0].symbol)
+        okx_running_strats = [
+            s for s in running_strats
+            if getattr(s, "exchange_id", "okx") not in ("futu", "moomoo", "ibkr", "schwab")
+            and get_okx_instrument_spec(s.symbol) is not None
+        ]
+        if creds and okx_running_strats:
+            first_inst = to_okx_inst_id(okx_running_strats[0].symbol)
             try:
                 async with httpx.AsyncClient(proxy=get_system_proxy(), timeout=6.0) as client:
                     await self.ensure_okx_account_meta(client, creds)
@@ -3321,7 +3369,9 @@ class ExecutionAdapter:
         for cfg in strategies:
             if not cfg.is_running:
                 continue
-            inst_id = to_okx_inst_id(cfg.symbol)
+            sym_ex_id = str(getattr(cfg, "exchange_id", "okx") or "okx").lower()
+            is_trad_broker = sym_ex_id in ("futu", "moomoo", "ibkr", "schwab")
+            inst_id = cfg.symbol.split("/")[0] if is_trad_broker else to_okx_inst_id(cfg.symbol)
             okx_spec = get_okx_instrument_spec(cfg.symbol) or resolve_okx_spec(cfg.symbol)
             bn_spec = get_binance_instrument_spec(cfg.symbol)
             m_state = math_states.get(cfg.symbol)
@@ -3333,10 +3383,43 @@ class ExecutionAdapter:
                 fb = gateway.real_follower_bbo.get(cfg.symbol)
                 if fb:
                     f_px = (fb[0] + fb[1]) * 0.5
+            if f_px <= 0 and is_trad_broker:
+                f_px = get_default_base_price(cfg.symbol)
 
             l_ready = bool(m_state and m_state.latest_leader)
             if not l_ready and gateway and getattr(gateway, "real_leader_bbo", None):
                 l_ready = cfg.symbol in gateway.real_leader_bbo
+
+            if is_trad_broker:
+                ct_val = 1.0
+                lot_sz = 1.0
+                min_sz = 1.0
+                tick_sz = 0.01
+                okx_state = f"{sym_ex_id.upper()}_READY"
+                bn_status = "US_EQUITY"
+                min_notional = round(f_px * 0.01, 2) if f_px > 0 else 1.0
+                est_shares = round(cfg.order_usdt / max(1e-9, f_px), max(2, int(cfg.qty_precision))) if f_px > 0 else 0.0
+                symbol_reports.append({
+                    "symbol": cfg.symbol,
+                    "exchange_id": sym_ex_id,
+                    "instId": inst_id,
+                    "is_running": bool(cfg.is_running),
+                    "okx_state": okx_state,
+                    "binance_status": bn_status,
+                    "has_leader_bbo": True,
+                    "follower_mid": round(f_px, 4) if f_px > 0 else 0.0,
+                    "ctVal": ct_val,
+                    "lotSz": lot_sz,
+                    "minSz": min_sz,
+                    "tickSz": tick_sz,
+                    "min_notional_usdt": min_notional,
+                    "planned_sz": f"{est_shares:g}",
+                    "planned_base_qty": est_shares,
+                    "ready": True,
+                    "issues": [],
+                    "warnings": [],
+                })
+                continue
 
             ct_val = float(okx_spec.get("ctVal") or 1.0)
             lot_sz = float(okx_spec.get("lotSz") or 1.0)

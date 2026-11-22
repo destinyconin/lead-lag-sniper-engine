@@ -23,9 +23,39 @@ class SniperState(str, Enum):
     COOLDOWN = "COOLDOWN"       # Post-trade debounce
 
 
+TRADITIONAL_BROKER_IDS = ("futu", "moomoo", "ibkr", "schwab")
+ALL_EXCHANGE_IDS = (
+    "binanceusdm",
+    "okx",
+    "krakenfutures",
+    "bybit",
+    "gate",
+    "bitget",
+    "futu",
+    "moomoo",
+    "ibkr",
+    "schwab",
+)
+
+
+def is_traditional_broker(exchange_id: Optional[str]) -> bool:
+    return str(exchange_id or "").lower() in TRADITIONAL_BROKER_IDS
+
+
 class ExchangeConfigModel(BaseModel):
     id: Optional[int] = None
-    exchange_id: Literal["binanceusdm", "okx", "krakenfutures", "bybit", "gate", "bitget"] = "binanceusdm"
+    exchange_id: Literal[
+        "binanceusdm",
+        "okx",
+        "krakenfutures",
+        "bybit",
+        "gate",
+        "bitget",
+        "futu",
+        "moomoo",
+        "ibkr",
+        "schwab",
+    ] = "binanceusdm"
     display_name: str = "Binance USDM Futures"
     role: Literal["leader", "follower"] = "leader"
     api_key: str = ""
@@ -45,7 +75,11 @@ def is_grid_strategy(strategy_type: Optional[str]) -> bool:
 
 
 class SymbolStrategy(BaseModel):
-    symbol: str = Field(default="XRP/USDT:USDT", description="Unified perpetual swap symbol")
+    symbol: str = Field(default="XRP/USDT:USDT", description="Unified perpetual swap or S&P 500 symbol")
+    exchange_id: str = Field(
+        default="okx",
+        description="Target execution exchange or traditional broker ID (okx, binanceusdm, bybit, gate, bitget, krakenfutures, futu, moomoo, ibkr, schwab)",
+    )
     strategy_type: Literal["LEAD_LAG", "LONG_SHORT_GRID", "REVERSE_GRID", "TREND_GRID", "ADAPTIVE_GRID"] = Field(
         default="LEAD_LAG",
         description="Per-symbol running strategy: LEAD_LAG, LONG_SHORT_GRID, REVERSE_GRID, TREND_GRID, or ADAPTIVE_GRID",
