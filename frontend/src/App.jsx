@@ -1336,6 +1336,23 @@ export default function App() {
     return val.toFixed(prec);
   };
 
+  const formatTradePrice = useCallback(
+    (px, sym) => {
+      const val = Number(px || 0);
+      if (!val || !Number.isFinite(val)) return '--';
+      const matched = strategies.find((s) => s.symbol === sym);
+      const basePrec = Number(matched?.price_precision ?? 4);
+      let maxPrec = Math.max(basePrec + 2, 6);
+      if (val < 0.0001) maxPrec = Math.max(basePrec + 2, 10);
+      else if (val < 0.01) maxPrec = Math.max(basePrec + 2, 8);
+      else if (val >= 100) maxPrec = Math.max(basePrec + 1, 4);
+      maxPrec = Math.min(12, Math.max(2, Math.round(maxPrec)));
+      // Strip IEEE-754 floating-point trailing noise (e.g. 0.1154050000000001 -> 0.115405)
+      return Number(val.toFixed(maxPrec)).toString();
+    },
+    [strategies]
+  );
+
   const handleRunPreflight = async () => {
     if (!authToken) {
       openAuthModal('login');
@@ -1379,9 +1396,12 @@ export default function App() {
       setActiveTab('membership');
       return;
     }
+    const bFilter = batchForm.strategy_filter || 'ALL_GRID';
+    const isTrendOnlyBatch = bFilter === 'TREND_GRID';
+    const isOscOnlyBatch = bFilter === 'LONG_SHORT_GRID' || bFilter === 'REVERSE_GRID';
     const payload = {
       action,
-      strategy_filter: batchForm.strategy_filter || 'ALL_GRID',
+      strategy_filter: bFilter,
       only_running: Boolean(batchForm.only_running),
       auto_fix_anomalies: Boolean(batchForm.auto_fix_anomalies),
     };
@@ -1398,9 +1418,11 @@ export default function App() {
       if (batchForm.grid_step_pct_str !== '' && Number.isFinite(stepPct) && stepPct > 0) {
         payload.grid_step_pct = Number((stepPct / 100).toFixed(6));
       }
-      const tpPct = Number(batchForm.grid_take_profit_pct_str);
-      if (batchForm.grid_take_profit_pct_str !== '' && Number.isFinite(tpPct) && tpPct > 0) {
-        payload.grid_take_profit_pct = Number((tpPct / 100).toFixed(6));
+      if (!isTrendOnlyBatch) {
+        const tpPct = Number(batchForm.grid_take_profit_pct_str);
+        if (batchForm.grid_take_profit_pct_str !== '' && Number.isFinite(tpPct) && tpPct > 0) {
+          payload.grid_take_profit_pct = Number((tpPct / 100).toFixed(6));
+        }
       }
       const rngPct = Number(batchForm.grid_range_pct_str);
       if (batchForm.grid_range_pct_str !== '' && Number.isFinite(rngPct) && rngPct >= 0.1) {
@@ -1410,14 +1432,18 @@ export default function App() {
       if (batchForm.grid_stop_loss_pct_str !== '' && Number.isFinite(slPct) && slPct >= 0.2) {
         payload.grid_stop_loss_pct = Number((slPct / 100).toFixed(6));
       }
-      const trailMult = Number(batchForm.trend_trailing_mult_str);
-      if (batchForm.trend_trailing_mult_str !== '' && Number.isFinite(trailMult) && trailMult >= 0.3) {
-        payload.trend_trailing_mult = Number(trailMult.toFixed(3));
+      if (!isOscOnlyBatch) {
+        const trailMult = Number(batchForm.trend_trailing_mult_str);
+        if (batchForm.trend_trailing_mult_str !== '' && Number.isFinite(trailMult) && trailMult >= 0.3) {
+          payload.trend_trailing_mult = Number(trailMult.toFixed(3));
+        }
       }
-      if (batchForm.use_post_only_tp_mode === 'on') {
-        payload.use_post_only_tp = true;
-      } else if (batchForm.use_post_only_tp_mode === 'off') {
-        payload.use_post_only_tp = false;
+      if (!isTrendOnlyBatch) {
+        if (batchForm.use_post_only_tp_mode === 'on') {
+          payload.use_post_only_tp = true;
+        } else if (batchForm.use_post_only_tp_mode === 'off') {
+          payload.use_post_only_tp = false;
+        }
       }
       if (batchForm.sl_trigger_px_type_mode === 'mark' || batchForm.sl_trigger_px_type_mode === 'last') {
         payload.sl_trigger_px_type = batchForm.sl_trigger_px_type_mode;
@@ -1627,13 +1653,13 @@ export default function App() {
     const isCenterAnchoredSl = st === 'LONG_SHORT_GRID' || st === 'ADAPTIVE_GRID';
     const n = Math.max(1, Math.min(30, Math.round(Number(currentStrategy.grid_levels ?? 5) || 5)));
     const step = Math.max(0.0005, Number(currentStrategy.grid_step_pct ?? 0.006) || 0.006);
-    const dz = Math.max(0.5, Number(currentStrategy.trend_dead_zone_mult ?? 2.0) || 2.0);
+    const dz = Math.max(0.5, Number(currentStrategy.trend_dead_zone_mult ?? 1.25) || 1.25);
     const minRng = isTrendLike
       ? Math.max(suggestLinkedGridRange(n, step), dz * step * 1.3)
       : suggestLinkedGridRange(n, step);
     const nextRng = Math.min(0.8, Math.ceil(minRng * 1000) / 1000);
     const nextTp = Number(Math.max(Number(currentStrategy.grid_take_profit_pct ?? 0.0065) || 0.0065, step + 0.0005).toFixed(6));
-    const curSl = Number(currentStrategy.grid_stop_loss_pct ?? 0.08) || 0.08;
+    const curSl = Number(currentStrategy.grid_stop_loss_pct ?? 0.038) || 0.038;
     const nextSl = isCenterAnchoredSl
       ? curSl <= nextRng + 0.002
         ? Number(Math.min(0.9, Math.ceil((nextRng + 0.01) * 1000) / 1000).toFixed(4))
@@ -1641,6 +1667,18 @@ export default function App() {
       : st === 'REVERSE_GRID' && curSl <= step + 1e-6
       ? Number(Math.min(0.9, Math.max(nextRng + 0.003, step * 2.5, step + 0.005)).toFixed(4))
       : curSl;
+    if (st === 'TREND_GRID') {
+      updateCurrentStrategyField({
+        grid_range_pct: nextRng,
+        grid_stop_loss_pct: nextSl,
+      });
+      const trailPct = ((Number(currentStrategy.trend_trailing_mult ?? 1.25) || 1.25) * step * 100).toFixed(2);
+      showToast(
+        `已对齐 ${currentStrategy.symbol}：重锚跨度 ±${(nextRng * 100).toFixed(1)}% · 追踪回撤 ${trailPct}% · 首格止损 ${(nextSl * 100).toFixed(1)}%（请点击保存生效）`,
+        'success'
+      );
+      return;
+    }
     updateCurrentStrategyField({
       grid_range_pct: nextRng,
       grid_take_profit_pct: nextTp,
@@ -1852,6 +1890,30 @@ export default function App() {
     }
     return counts;
   }, [decoratedRecentTrades, analyticsSymbolFilter]);
+
+  const { symbolFilterOptions, strategyFilteredTotalTrades } = useMemo(() => {
+    const bySymbol = new Map();
+    let totalMatchingStrategy = 0;
+    for (const tr of decoratedRecentTrades) {
+      if (analyticsStrategyFilter !== 'ALL' && tr._strategyType !== analyticsStrategyFilter) continue;
+      totalMatchingStrategy += 1;
+      bySymbol.set(tr.symbol, (bySymbol.get(tr.symbol) || 0) + 1);
+    }
+    for (const item of stats.symbol_pnl_breakdown || []) {
+      if (!item?.symbol) continue;
+      if (analyticsStrategyFilter !== 'ALL' && item.strategy_type !== analyticsStrategyFilter) continue;
+      if (!bySymbol.has(item.symbol)) {
+        bySymbol.set(item.symbol, 0);
+      }
+    }
+    const list = Array.from(bySymbol.entries())
+      .map(([symbol, trades]) => ({ symbol, trades }))
+      .sort((a, b) => b.trades - a.trades || a.symbol.localeCompare(b.symbol));
+    return {
+      symbolFilterOptions: list,
+      strategyFilteredTotalTrades: totalMatchingStrategy,
+    };
+  }, [decoratedRecentTrades, stats.symbol_pnl_breakdown, analyticsStrategyFilter]);
 
   const filteredTradesSummary = useMemo(() => {
     let wins = 0;
@@ -2970,177 +3032,203 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5 items-end">
-                <div>
-                  <label className="block text-[11px] font-semibold text-dim mb-1">作用范围</label>
-                  <select
-                    value={batchForm.strategy_filter}
-                    onChange={(e) => setBatchForm((prev) => ({ ...prev, strategy_filter: e.target.value }))}
-                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
-                  >
-                    <option value="ALL_GRID">全部网格策略</option>
-                    <option value="ADAPTIVE_GRID">仅 VCP 双模式</option>
-                    <option value="TREND_GRID">仅顺势突破网格</option>
-                    <option value="LONG_SHORT_GRID">仅传统震荡网格</option>
-                    <option value="REVERSE_GRID">仅多空震荡网格 (反向)</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-[11px] font-semibold text-dim mb-1">名义金额 (USDT)</label>
-                  <input
-                    type="number"
-                    step="5"
-                    min="5"
-                    max="500000"
-                    placeholder="留空不改 (如 20)"
-                    value={batchForm.order_usdt_str}
-                    onChange={(e) => setBatchForm((prev) => ({ ...prev, order_usdt_str: e.target.value }))}
-                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] font-semibold text-dim mb-1">单边层数 (N)</label>
-                  <input
-                    type="number"
-                    step="1"
-                    min="1"
-                    max="30"
-                    placeholder="留空不改 (如 3 或 5)"
-                    value={batchForm.grid_levels_str}
-                    onChange={(e) => updateBatchFieldWithLinkage('grid_levels_str', e.target.value)}
-                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] font-semibold text-dim mb-1">目标步长 (%)</label>
-                  <input
-                    type="number"
-                    step="0.05"
-                    min="0.05"
-                    max="20"
-                    placeholder="留空不改"
-                    value={batchForm.grid_step_pct_str}
-                    onChange={(e) => updateBatchFieldWithLinkage('grid_step_pct_str', e.target.value)}
-                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] font-semibold text-dim mb-1">目标止盈 (%)</label>
-                  <input
-                    type="number"
-                    step="0.05"
-                    min="0.05"
-                    max="25"
-                    placeholder="留空不改"
-                    value={batchForm.grid_take_profit_pct_str}
-                    onChange={(e) => setBatchForm((prev) => ({ ...prev, grid_take_profit_pct_str: e.target.value }))}
-                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] font-semibold text-dim mb-1">区间总跨度 ±(%)</label>
-                  <input
-                    type="number"
-                    step="0.1"
-                    min="0.5"
-                    max="80"
-                    placeholder="留空按层数自动匹配"
-                    value={batchForm.grid_range_pct_str}
-                    onChange={(e) => setBatchForm((prev) => ({ ...prev, grid_range_pct_str: e.target.value }))}
-                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] font-semibold text-dim mb-1">
-                    价格止损 (%)
-                    {batchForm.grid_stop_loss_pct_str !== '' && Number(batchForm.grid_stop_loss_pct_str) > 0 && (
-                      <span className="ml-1 text-amber-600 dark:text-amber-300 font-mono">
-                        5x≈{(Number(batchForm.grid_stop_loss_pct_str) * 5).toFixed(1)}%
-                      </span>
-                    )}
-                  </label>
-                  <input
-                    type="number"
-                    step="0.2"
-                    min="0.2"
-                    max="90"
-                    placeholder="留空不改 (如 4.5)"
-                    value={batchForm.grid_stop_loss_pct_str}
-                    onChange={(e) => updateBatchFieldWithLinkage('grid_stop_loss_pct_str', e.target.value)}
-                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] font-semibold text-dim mb-1">顺势追踪倍率 (x)</label>
-                  <input
-                    type="number"
-                    step="0.1"
-                    min="0.3"
-                    max="10"
-                    placeholder="留空不改 (如 2.2)"
-                    value={batchForm.trend_trailing_mult_str}
-                    onChange={(e) => setBatchForm((prev) => ({ ...prev, trend_trailing_mult_str: e.target.value }))}
-                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] font-semibold text-dim mb-1">Maker挂单止盈</label>
-                  <select
-                    value={batchForm.use_post_only_tp_mode}
-                    onChange={(e) => setBatchForm((prev) => ({ ...prev, use_post_only_tp_mode: e.target.value }))}
-                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
-                  >
-                    <option value="keep">保持原状</option>
-                    <option value="on">一键开启 (省费)</option>
-                    <option value="off">关闭 (仅Taker)</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-[11px] font-semibold text-dim mb-1">条件止损触发价</label>
-                  <select
-                    value={batchForm.sl_trigger_px_type_mode}
-                    onChange={(e) => setBatchForm((prev) => ({ ...prev, sl_trigger_px_type_mode: e.target.value }))}
-                    className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
-                  >
-                    <option value="keep">保持原状</option>
-                    <option value="mark">标记价 Mark (抗插针推荐)</option>
-                    <option value="last">最新价 Last</option>
-                  </select>
-                </div>
-              </div>
+              {(() => {
+                const bFilter = batchForm.strategy_filter || 'ALL_GRID';
+                const showBatchFixedTp = bFilter !== 'TREND_GRID';
+                const showBatchTrendTrail = bFilter === 'ALL_GRID' || bFilter === 'TREND_GRID' || bFilter === 'ADAPTIVE_GRID';
+                const showBatchMakerPo = bFilter !== 'TREND_GRID';
+                return (
+                  <>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5 items-end">
+                      <div>
+                        <label className="block text-[11px] font-semibold text-dim mb-1">作用范围</label>
+                        <select
+                          value={batchForm.strategy_filter}
+                          onChange={(e) => setBatchForm((prev) => ({ ...prev, strategy_filter: e.target.value }))}
+                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
+                        >
+                          <option value="ALL_GRID">全部网格策略</option>
+                          <option value="LONG_SHORT_GRID">仅传统震荡网格</option>
+                          <option value="REVERSE_GRID">仅多空震荡网格 (反向)</option>
+                          <option value="TREND_GRID">仅顺势突破网格</option>
+                          <option value="ADAPTIVE_GRID">仅 VCP 双模式</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-semibold text-dim mb-1">名义金额 (USDT)</label>
+                        <input
+                          type="number"
+                          step="5"
+                          min="5"
+                          max="500000"
+                          placeholder="留空不改 (如 20)"
+                          value={batchForm.order_usdt_str}
+                          onChange={(e) => setBatchForm((prev) => ({ ...prev, order_usdt_str: e.target.value }))}
+                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-semibold text-dim mb-1">
+                          {bFilter === 'TREND_GRID' ? '单边金字塔层数 (N)' : '单边层数 (N)'}
+                        </label>
+                        <input
+                          type="number"
+                          step="1"
+                          min="1"
+                          max="30"
+                          placeholder="留空不改 (如 3 或 5)"
+                          value={batchForm.grid_levels_str}
+                          onChange={(e) => updateBatchFieldWithLinkage('grid_levels_str', e.target.value)}
+                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-semibold text-dim mb-1">
+                          {bFilter === 'TREND_GRID' ? '金字塔加仓间距 (%)' : '目标步长 (%)'}
+                        </label>
+                        <input
+                          type="number"
+                          step="0.05"
+                          min="0.05"
+                          max="20"
+                          placeholder="留空不改"
+                          value={batchForm.grid_step_pct_str}
+                          onChange={(e) => updateBatchFieldWithLinkage('grid_step_pct_str', e.target.value)}
+                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                        />
+                      </div>
+                      {showBatchFixedTp && (
+                        <div>
+                          <label className="block text-[11px] font-semibold text-dim mb-1">单格止盈目标 (%)</label>
+                          <input
+                            type="number"
+                            step="0.05"
+                            min="0.05"
+                            max="25"
+                            placeholder="留空不改"
+                            value={batchForm.grid_take_profit_pct_str}
+                            onChange={(e) => setBatchForm((prev) => ({ ...prev, grid_take_profit_pct_str: e.target.value }))}
+                            className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                          />
+                        </div>
+                      )}
+                      <div>
+                        <label className="block text-[11px] font-semibold text-dim mb-1">
+                          {bFilter === 'TREND_GRID' ? '空仓重锚跨度 ±(%)' : '区间总跨度 ±(%)'}
+                        </label>
+                        <input
+                          type="number"
+                          step="0.1"
+                          min="0.5"
+                          max="80"
+                          placeholder="留空按层数自动匹配"
+                          value={batchForm.grid_range_pct_str}
+                          onChange={(e) => setBatchForm((prev) => ({ ...prev, grid_range_pct_str: e.target.value }))}
+                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-semibold text-dim mb-1">
+                          {bFilter === 'TREND_GRID' ? '首格假突破止损 (%)' : bFilter === 'REVERSE_GRID' ? '单格价格止损 (%)' : '价格止损 (%)'}
+                          {batchForm.grid_stop_loss_pct_str !== '' && Number(batchForm.grid_stop_loss_pct_str) > 0 && (
+                            <span className="ml-1 text-amber-600 dark:text-amber-300 font-mono">
+                              5x≈{(Number(batchForm.grid_stop_loss_pct_str) * 5).toFixed(1)}%
+                            </span>
+                          )}
+                        </label>
+                        <input
+                          type="number"
+                          step="0.2"
+                          min="0.2"
+                          max="90"
+                          placeholder="留空不改 (如 3.8)"
+                          value={batchForm.grid_stop_loss_pct_str}
+                          onChange={(e) => updateBatchFieldWithLinkage('grid_stop_loss_pct_str', e.target.value)}
+                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                        />
+                      </div>
+                      {showBatchTrendTrail && (
+                        <div>
+                          <label className="block text-[11px] font-semibold text-dim mb-1">顺势追踪倍率 (x)</label>
+                          <input
+                            type="number"
+                            step="0.1"
+                            min="0.3"
+                            max="10"
+                            placeholder="留空不改 (如 1.25)"
+                            value={batchForm.trend_trailing_mult_str}
+                            onChange={(e) => setBatchForm((prev) => ({ ...prev, trend_trailing_mult_str: e.target.value }))}
+                            className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                          />
+                        </div>
+                      )}
+                      {showBatchMakerPo && (
+                        <div>
+                          <label className="block text-[11px] font-semibold text-dim mb-1">Maker挂单止盈</label>
+                          <select
+                            value={batchForm.use_post_only_tp_mode}
+                            onChange={(e) => setBatchForm((prev) => ({ ...prev, use_post_only_tp_mode: e.target.value }))}
+                            className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
+                          >
+                            <option value="keep">保持原状</option>
+                            <option value="on">一键开启 (省费)</option>
+                            <option value="off">关闭 (仅Taker)</option>
+                          </select>
+                        </div>
+                      )}
+                      <div>
+                        <label className="block text-[11px] font-semibold text-dim mb-1">条件止损触发价</label>
+                        <select
+                          value={batchForm.sl_trigger_px_type_mode}
+                          onChange={(e) => setBatchForm((prev) => ({ ...prev, sl_trigger_px_type_mode: e.target.value }))}
+                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
+                        >
+                          <option value="keep">保持原状</option>
+                          <option value="mark">标记价 Mark (抗插针推荐)</option>
+                          <option value="last">最新价 Last</option>
+                        </select>
+                      </div>
+                    </div>
 
-              <div className="flex flex-wrap items-center gap-4 pt-0.5">
-                <label className="flex items-center gap-2 text-xs text-sub cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={batchForm.auto_link_batch}
-                    onChange={(e) => setBatchForm((prev) => ({ ...prev, auto_link_batch: e.target.checked }))}
-                    className="rounded accent-emerald-600"
-                  />
-                  <span>输入层数/步长自动联动区间与止盈</span>
-                </label>
-                <label className="flex items-center gap-2 text-xs text-sub cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={batchForm.auto_fix_anomalies}
-                    onChange={(e) => setBatchForm((prev) => ({ ...prev, auto_fix_anomalies: e.target.checked }))}
-                    className="rounded accent-emerald-600"
-                  />
-                  <span>自动修复倒挂/精度/区间匹配</span>
-                </label>
-                <label className="flex items-center gap-2 text-xs text-sub cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={batchForm.only_running}
-                    onChange={(e) => setBatchForm((prev) => ({ ...prev, only_running: e.target.checked }))}
-                    className="rounded accent-emerald-600"
-                  />
-                  <span>仅作用于运行中合约</span>
-                </label>
-                <span className="text-[11px] text-dim">
-                  提示：价格止损 1.0% 在 5x 杠杆下对应保证金亏损 5.0%（传统 5 格网建议价格止损 ≥ 3.5%，或缩小格数至 3 格）
-                </span>
-              </div>
+                    <div className="flex flex-wrap items-center gap-4 pt-0.5">
+                      <label className="flex items-center gap-2 text-xs text-sub cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={batchForm.auto_link_batch}
+                          onChange={(e) => setBatchForm((prev) => ({ ...prev, auto_link_batch: e.target.checked }))}
+                          className="rounded accent-emerald-600"
+                        />
+                        <span>
+                          {bFilter === 'TREND_GRID'
+                            ? '输入层数/间距自动联动重锚跨度与止损'
+                            : '输入层数/步长自动联动区间与止盈'}
+                        </span>
+                      </label>
+                      <label className="flex items-center gap-2 text-xs text-sub cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={batchForm.auto_fix_anomalies}
+                          onChange={(e) => setBatchForm((prev) => ({ ...prev, auto_fix_anomalies: e.target.checked }))}
+                          className="rounded accent-emerald-600"
+                        />
+                        <span>自动修复倒挂/精度/区间匹配</span>
+                      </label>
+                      <label className="flex items-center gap-2 text-xs text-sub cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={batchForm.only_running}
+                          onChange={(e) => setBatchForm((prev) => ({ ...prev, only_running: e.target.checked }))}
+                          className="rounded accent-emerald-600"
+                        />
+                        <span>仅作用于运行中合约</span>
+                      </label>
+                      <span className="text-[11px] text-dim">
+                        仅展示当前所选作用范围策略生效的参数（不在此策略生效的参数已自动隐藏）
+                      </span>
+                    </div>
+                  </>
+                );
+              })()}
 
               {batchReport && (
                 <div className="rounded-2xl border border-line surface-subtle p-3.5 space-y-2.5">
@@ -3691,6 +3779,16 @@ export default function App() {
                     </div>
 
                     {isGridStrategyType(currentStrategy.strategy_type) ? (() => {
+                      const st = currentStrategy.strategy_type || 'LONG_SHORT_GRID';
+                      const isTrendGrid = st === 'TREND_GRID';
+                      const isAdaptiveGrid = st === 'ADAPTIVE_GRID';
+                      const isReverseGrid = st === 'REVERSE_GRID';
+                      const isLongShortGrid = st === 'LONG_SHORT_GRID';
+                      const showFixedTpInput = !isTrendGrid;
+                      const showRangeInput = !isTrendGrid || Boolean(currentStrategy.grid_recenter_enabled ?? true);
+                      const showMrRangeFittingButtons = !isTrendGrid;
+                      const showMakerPostOnlySwitch = !isTrendGrid;
+                      const showBbwSqueezePercentile = isAdaptiveGrid;
                       const symTel = snapshot?.telemetry?.[currentStrategy.symbol] || {};
                       const gridDiag = buildGridPreviewAndDiagnostics(
                         currentStrategy,
@@ -3699,6 +3797,35 @@ export default function App() {
                       );
                       const fitLevelsByRange = Math.max(1, Math.min(30, Math.floor((gridDiag.rng + 1e-9) / gridDiag.step)));
                       const fitStepByRange = Number(Math.max(0.0005, gridDiag.rng / gridDiag.n).toFixed(4));
+                      const gridToggleOptions = [
+                        {
+                          field: 'is_running',
+                          title: '启用该合约策略运行',
+                          desc: '关闭后暂停该合约的新网格开仓触发',
+                        },
+                        {
+                          field: 'grid_recenter_enabled',
+                          title: isTrendGrid
+                            ? '空仓超出跨度或止盈后自动重锚中枢'
+                            : '空仓超出区间自动重锚网格中枢',
+                          desc: isAdaptiveGrid
+                            ? '无持仓突破 ±区间或 VCP 波动率状态切换时自动重置网格中枢'
+                            : isTrendGrid
+                            ? '无持仓偏离中枢超过重锚跨度或顺势止盈平仓后，自动以最新价重锚'
+                            : '无持仓且价格突破 ±铺网区间总跨度时，自动以最新盘口价重置网格中枢',
+                        },
+                        ...(showMakerPostOnlySwitch
+                          ? [
+                              {
+                                field: 'use_post_only_tp',
+                                title: isAdaptiveGrid
+                                  ? '震荡模式真实 Maker Post-Only 挂单止盈 + 条件止损'
+                                  : '真实 Maker Post-Only 挂单止盈 + OKX 条件止损',
+                                desc: '成交即在交易所挂出被动限价止盈单（省 60% 平仓费）与条件止损单防断网插针',
+                              },
+                            ]
+                          : []),
+                      ];
                       return (
                       <>
                         {/* Auto-Linkage Control Bar */}
@@ -3712,7 +3839,9 @@ export default function App() {
                             />
                             <span>参数自动联动匹配</span>
                             <span className="font-normal text-[11px] text-dim hidden sm:inline">
-                              （改层数/步长自动匹配区间±缓冲与止盈止损，关闭后可自由微调）
+                              {isTrendGrid
+                                ? '（改层数/加仓间距自动匹配重锚跨度与止损，仅展示本策略生效参数）'
+                                : '（改层数/步长自动匹配区间±缓冲与止盈止损，仅展示本策略生效参数）'}
                             </span>
                           </label>
                           <button
@@ -3724,12 +3853,14 @@ export default function App() {
                           </button>
                         </div>
 
-                        {/* Common Grid Parameters */}
+                        {/* Active Strategy Parameter Grid (Only Effective Fields for Selected Strategy) */}
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 text-xs">
                           <div>
                             <label className="font-bold text-main block mb-2">
-                              {currentStrategy.strategy_type === 'TREND_GRID'
+                              {isTrendGrid
                                 ? '单格基准名义金额 (USDT · 递减分配)'
+                                : isAdaptiveGrid
+                                ? '单格基准名义金额 (USDT)'
                                 : '每格下单名义金额 (USDT)'}
                             </label>
                             <input
@@ -3751,7 +3882,9 @@ export default function App() {
                           </div>
 
                           <div>
-                            <label className="font-bold text-main block mb-2">单边网格层数 (建议顺势设3~5层)</label>
+                            <label className="font-bold text-main block mb-2">
+                              {isTrendGrid ? '单边金字塔追单层数 (建议 3~5 层)' : '单边网格层数'}
+                            </label>
                             <input
                               type="number"
                               min={1}
@@ -3761,7 +3894,8 @@ export default function App() {
                               className="input-field font-mono"
                             />
                             <div className="text-[10px] text-dim mt-1 leading-snug">
-                              满网覆盖半径：{gridDiag.n}×{(gridDiag.step * 100).toFixed(2)}% ={' '}
+                              {isTrendGrid ? '单边满仓加仓跨度：' : '满网覆盖半径：'}
+                              {gridDiag.n}×{(gridDiag.step * 100).toFixed(2)}% ={' '}
                               <span className="font-mono font-bold text-main">
                                 ±{(gridDiag.totalSpan * 100).toFixed(2)}%
                               </span>
@@ -3769,7 +3903,9 @@ export default function App() {
                           </div>
 
                           <div>
-                            <label className="font-bold text-main block mb-2">每格触发间距 (%)</label>
+                            <label className="font-bold text-main block mb-2">
+                              {isTrendGrid ? '金字塔加仓间距 (%)' : '每格触发间距 (%)'}
+                            </label>
                             <PercentNumberInput
                               step="0.05"
                               valueRatio={currentStrategy.grid_step_pct}
@@ -3781,12 +3917,14 @@ export default function App() {
                             </div>
                           </div>
 
-                          {currentStrategy.strategy_type !== 'TREND_GRID' && (
+                          {showFixedTpInput && (
                             <div>
                               <label className="font-bold text-main block mb-2">
-                                {currentStrategy.strategy_type === 'REVERSE_GRID'
+                                {isReverseGrid
                                   ? '多空震荡单格止盈目标 (%)'
-                                  : '传统模式单格止盈目标 (%)'}
+                                  : isAdaptiveGrid
+                                  ? '震荡阶段单格止盈目标 (%)'
+                                  : '传统网格单格止盈目标 (%)'}
                               </label>
                               <PercentNumberInput
                                 step="0.05"
@@ -3801,52 +3939,64 @@ export default function App() {
                             </div>
                           )}
 
-                          <div>
-                            <label className="font-bold text-main block mb-2">区间总跨度 ±(%)</label>
-                            <PercentNumberInput
-                              step="0.1"
-                              valueRatio={currentStrategy.grid_range_pct}
-                              defaultRatio={0.05}
-                              onChangeRatio={(v) => updateGridParamWithLinkage('grid_range_pct', v)}
-                            />
-                            <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
-                              <button
-                                type="button"
-                                onClick={() => updateCurrentStrategyField({ grid_levels: fitLevelsByRange })}
-                                className="px-2 py-0.5 rounded-full surface-subtle text-[10px] font-semibold text-sub hover:text-main transition"
-                              >
-                                按步长适配层数→{fitLevelsByRange}层
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  updateCurrentStrategyField({
-                                    grid_step_pct: fitStepByRange,
-                                    grid_take_profit_pct: Number(
-                                      Math.max(
-                                        Number(currentStrategy.grid_take_profit_pct ?? 0.0065),
-                                        fitStepByRange + 0.0005
-                                      ).toFixed(6)
-                                    ),
-                                  })
-                                }
-                                className="px-2 py-0.5 rounded-full surface-subtle text-[10px] font-semibold text-sub hover:text-main transition"
-                              >
-                                按层数适配步长→{(fitStepByRange * 100).toFixed(2)}%
-                              </button>
+                          {showRangeInput && (
+                            <div>
+                              <label className="font-bold text-main block mb-2">
+                                {isTrendGrid ? '空仓自动重锚触发跨度 ±(%)' : '铺网区间总跨度 ±(%)'}
+                              </label>
+                              <PercentNumberInput
+                                step="0.1"
+                                valueRatio={currentStrategy.grid_range_pct}
+                                defaultRatio={0.05}
+                                onChangeRatio={(v) => updateGridParamWithLinkage('grid_range_pct', v)}
+                              />
+                              {showMrRangeFittingButtons ? (
+                                <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => updateCurrentStrategyField({ grid_levels: fitLevelsByRange })}
+                                    className="px-2 py-0.5 rounded-full surface-subtle text-[10px] font-semibold text-sub hover:text-main transition"
+                                  >
+                                    按步长适配层数→{fitLevelsByRange}层
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      updateCurrentStrategyField({
+                                        grid_step_pct: fitStepByRange,
+                                        grid_take_profit_pct: Number(
+                                          Math.max(
+                                            Number(currentStrategy.grid_take_profit_pct ?? 0.0065),
+                                            fitStepByRange + 0.0005
+                                          ).toFixed(6)
+                                        ),
+                                      })
+                                    }
+                                    className="px-2 py-0.5 rounded-full surface-subtle text-[10px] font-semibold text-sub hover:text-main transition"
+                                  >
+                                    按层数适配步长→{(fitStepByRange * 100).toFixed(2)}%
+                                  </button>
+                                </div>
+                              ) : (
+                                <div className="text-[10px] text-dim mt-1 leading-snug">
+                                  空仓偏离中枢超过该跨度时自动重锚，不裁切顺势追单层数
+                                </div>
+                              )}
                             </div>
-                          </div>
+                          )}
 
                           <div>
                             <label className="font-bold text-main block mb-2">
-                              {currentStrategy.strategy_type === 'REVERSE_GRID'
+                              {isReverseGrid
                                 ? '单格硬止损上限 (% · 相对开仓价)'
-                                : '破网硬止损上限 (% · 标的价格)'}
+                                : isTrendGrid
+                                ? '首格假突破止损上限 (% · 标的价格)'
+                                : '破网硬止损上限 (% · 相对中枢价)'}
                             </label>
                             <PercentNumberInput
                               step="0.2"
                               valueRatio={currentStrategy.grid_stop_loss_pct}
-                              defaultRatio={0.08}
+                              defaultRatio={0.038}
                               onChangeRatio={(v) => updateGridParamWithLinkage('grid_stop_loss_pct', v)}
                             />
                             <div className="text-[10px] text-amber-600 dark:text-amber-300 mt-1 leading-snug">
@@ -3855,6 +4005,23 @@ export default function App() {
                               （如欲控制保证金止损 15%，此处设 {(15 / Math.max(1, currentStrategy.leverage ?? 5)).toFixed(2)}%）
                             </div>
                           </div>
+
+                          {isLongShortGrid && (
+                            <div>
+                              <label className="font-bold text-main block mb-2">EMA 趋势防逆势过滤周期</label>
+                              <select
+                                value={currentStrategy.bbw_timeframe || '15m'}
+                                onChange={(e) => updateCurrentStrategyField({ bbw_timeframe: e.target.value })}
+                                className="w-full rounded-xl surface-subtle px-3 py-2.5 text-xs font-semibold text-main outline-none"
+                              >
+                                <option value="15m">15 分钟 (15m · 灵敏识别单边)</option>
+                                <option value="1H">1 小时 (1H · 稳健趋势过滤)</option>
+                              </select>
+                              <div className="text-[10px] text-dim mt-1 leading-snug">
+                                强单边行情下自动暂停逆势方向挂网，防止单边接飞刀
+                              </div>
+                            </div>
+                          )}
 
                           <div>
                             <label className="font-bold text-main block mb-2">OKX 条件止损触发价类型</label>
@@ -3929,9 +4096,13 @@ export default function App() {
                               </div>
                             </div>
                             <div className="rounded-xl surface-card px-3 py-2.5">
-                              <div className="text-[10px] text-dim">覆盖半径 vs 区间边界</div>
+                              <div className="text-[10px] text-dim">
+                                {isTrendGrid ? '首格死区 vs 满网追单跨度' : '覆盖半径 vs 区间边界'}
+                              </div>
                               <div className="font-mono font-bold text-main mt-0.5">
-                                ±{(gridDiag.totalSpan * 100).toFixed(2)}% / ±{(gridDiag.rng * 100).toFixed(1)}%
+                                {isTrendGrid
+                                  ? `±${((currentStrategy.trend_dead_zone_mult ?? 1.25) * gridDiag.step * 100).toFixed(2)}% / ±${(((currentStrategy.trend_dead_zone_mult ?? 1.25) + Math.max(0, gridDiag.n - 1)) * gridDiag.step * 100).toFixed(2)}%`
+                                  : `±${(gridDiag.totalSpan * 100).toFixed(2)}% / ±${(gridDiag.rng * 100).toFixed(1)}%`}
                               </div>
                             </div>
                             <div className="rounded-xl surface-card px-3 py-2.5">
@@ -3968,9 +4139,7 @@ export default function App() {
                                 }`}
                               >
                                 {lg.slot}: {lg.usdt.toFixed(1)}U
-                                {(currentStrategy.strategy_type === 'TREND_GRID' ||
-                                  currentStrategy.strategy_type === 'ADAPTIVE_GRID') &&
-                                (currentStrategy.trend_pyramid_decay ?? true)
+                                {(isTrendGrid || isAdaptiveGrid) && (currentStrategy.trend_pyramid_decay ?? true)
                                   ? ` (${lg.weightPct}%)`
                                   : ` (±${(lg.mrDistPct * 100).toFixed(2)}%)`}
                                 {lg.clippedInMr ? ' [被裁切]' : lg.belowMin ? ' [不足最小额]' : ''}
@@ -3984,23 +4153,32 @@ export default function App() {
                           </div>
                         </div>
 
-                        {/* Trend Breakout & VCP Adaptive Parameters */}
-                        {(currentStrategy.strategy_type === 'TREND_GRID' ||
-                          currentStrategy.strategy_type === 'ADAPTIVE_GRID') && (
+                        {/* Trend Breakout & VCP Adaptive Parameters (Only Effective Fields for TREND_GRID or ADAPTIVE_GRID) */}
+                        {(isTrendGrid || isAdaptiveGrid) && (
                           <div className="p-4 rounded-2xl border border-violet-500/25 bg-violet-500/[0.04] space-y-4 text-xs">
                             <div className="flex flex-wrap items-center justify-between gap-2">
                               <div>
                                 <div className="font-bold text-main flex items-center gap-1.5">
                                   <TrendingUp className="w-3.5 h-3.5 shrink-0 text-violet-500" strokeWidth={1.75} />
-                                  <span>顺势突破（反向网格）与 VCP 波动率切换参数</span>
+                                  <span>
+                                    {isTrendGrid
+                                      ? '顺势突破网格专属参数（死区确认 · 递减金字塔 · 移动追踪止盈）'
+                                      : 'VCP 波动率切换与顺势突破阶段参数'}
+                                  </span>
                                 </div>
                                 <div className="text-[11px] text-dim mt-0.5">
-                                  取消固定止盈封顶，使用移动追踪止盈一键全平盈利槽位；每加一格自动将前序仓位止损上移至保本/上一格位
+                                  {isTrendGrid
+                                    ? '取消固定止盈封顶，使用移动追踪止盈一键全平盈利槽位；多格加仓达到净盈后自动将全部仓位止损上移至组合保本线'
+                                    : 'BBW 极度压缩时自动切入顺势突破阶段：取消固定止盈封顶，使用移动追踪止盈与组合保本上移止损'}
                                 </div>
                               </div>
                             </div>
 
-                            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3.5">
+                            <div
+                              className={`grid grid-cols-1 sm:grid-cols-2 ${
+                                showBbwSqueezePercentile ? 'md:grid-cols-4' : 'md:grid-cols-3'
+                              } gap-3.5`}
+                            >
                               <div>
                                 <label className="font-bold text-main block mb-1.5">首格缓冲死区倍数 (×间距)</label>
                                 <input
@@ -4046,7 +4224,9 @@ export default function App() {
                               </div>
 
                               <div>
-                                <label className="font-bold text-main block mb-1.5">VCP / BBW 检测 K 线周期</label>
+                                <label className="font-bold text-main block mb-1.5">
+                                  {isTrendGrid ? '布林带突破与 EMA 趋势周期' : 'VCP / BBW 检测 K 线周期'}
+                                </label>
                                 <select
                                   value={currentStrategy.bbw_timeframe || '15m'}
                                   onChange={(e) => updateCurrentStrategyField({ bbw_timeframe: e.target.value })}
@@ -4057,24 +4237,26 @@ export default function App() {
                                 </select>
                               </div>
 
-                              <div>
-                                <label className="font-bold text-main block mb-1.5">BBW 极度压缩分位阈值 (%)</label>
-                                <input
-                                  type="number"
-                                  step="1"
-                                  min={1}
-                                  max={50}
-                                  value={currentStrategy.bbw_squeeze_percentile ?? 20}
-                                  onChange={(e) =>
-                                    updateCurrentStrategyField({ bbw_squeeze_percentile: Number(e.target.value) })
-                                  }
-                                  className="input-field font-mono"
-                                />
-                                <div className="text-[10px] text-dim mt-1">
-                                  ≤{currentStrategy.bbw_squeeze_percentile ?? 20}% 切顺势，≥
-                                  {Math.min(85, Number(currentStrategy.bbw_squeeze_percentile ?? 20) + 15)}% 回震荡
+                              {showBbwSqueezePercentile && (
+                                <div>
+                                  <label className="font-bold text-main block mb-1.5">BBW 极度压缩分位阈值 (%)</label>
+                                  <input
+                                    type="number"
+                                    step="1"
+                                    min={1}
+                                    max={50}
+                                    value={currentStrategy.bbw_squeeze_percentile ?? 20}
+                                    onChange={(e) =>
+                                      updateCurrentStrategyField({ bbw_squeeze_percentile: Number(e.target.value) })
+                                    }
+                                    className="input-field font-mono"
+                                  />
+                                  <div className="text-[10px] text-dim mt-1">
+                                    ≤{currentStrategy.bbw_squeeze_percentile ?? 20}% 切顺势，≥
+                                    {Math.min(85, Number(currentStrategy.bbw_squeeze_percentile ?? 20) + 15)}% 回震荡
+                                  </div>
                                 </div>
-                              </div>
+                              )}
                             </div>
 
                             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -4082,7 +4264,7 @@ export default function App() {
                                 <div>
                                   <div className="text-xs font-bold text-main">递减金字塔仓位（底仓最重）</div>
                                   <div className="text-[11px] text-dim mt-0.5">
-                                    3层按 50% / 30% / 20%（5层按 38%/25%/17%/12%/8%）分配总预算，降低持仓均价
+                                    3层按 50% / 30% / 20%（5层按 30%/24%/19%/15%/12%）分配总预算，降低持仓均价
                                   </div>
                                 </div>
                                 <input
@@ -4114,24 +4296,12 @@ export default function App() {
                           </div>
                         )}
 
-                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2">
-                          {[
-                            {
-                              field: 'is_running',
-                              title: '启用该合约策略运行',
-                              desc: '关闭后暂停该合约的新网格开仓触发',
-                            },
-                            {
-                              field: 'grid_recenter_enabled',
-                              title: '空仓超出区间自动重锚网格中枢',
-                              desc: '无持仓突破 ±区间或 VCP 波动率状态切换时自动重置网格',
-                            },
-                            {
-                              field: 'use_post_only_tp',
-                              title: '真实 Maker Post-Only 挂单止盈 + OKX 条件止损',
-                              desc: '成交即在交易所挂出被动限价止盈单（省 60% 平仓费）与条件止损单防断网插针',
-                            },
-                          ].map((opt) => (
+                        <div
+                          className={`grid grid-cols-1 ${
+                            gridToggleOptions.length >= 3 ? 'sm:grid-cols-3' : 'sm:grid-cols-2'
+                          } gap-3 pt-2`}
+                        >
+                          {gridToggleOptions.map((opt) => (
                             <label
                               key={opt.field}
                               className="surface-subtle p-4 flex items-center justify-between gap-3 cursor-pointer"
@@ -4428,6 +4598,18 @@ export default function App() {
                               onChangeRatio={(v) => updateCurrentStrategyField({ lag_confirm_max_pct: v })}
                             />
                           </div>
+
+                          {Boolean(currentStrategy.trailing_stop_enabled) && (
+                            <div>
+                              <label className="font-bold text-main block mb-2">移动追踪止盈回撤阈值 (%)</label>
+                              <PercentNumberInput
+                                step="0.01"
+                                valueRatio={currentStrategy.trailing_retracement_pct}
+                                defaultRatio={0.0008}
+                                onChangeRatio={(v) => updateCurrentStrategyField({ trailing_retracement_pct: v })}
+                              />
+                            </div>
+                          )}
                         </div>
 
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
@@ -5417,7 +5599,18 @@ export default function App() {
                       <button
                         key={stOpt.id}
                         type="button"
-                        onClick={() => setAnalyticsStrategyFilter(stOpt.id)}
+                        onClick={() => {
+                          setAnalyticsStrategyFilter(stOpt.id);
+                          if (
+                            stOpt.id !== 'ALL' &&
+                            analyticsSymbolFilter !== 'ALL' &&
+                            !decoratedRecentTrades.some(
+                              (tr) => tr._strategyType === stOpt.id && tr.symbol === analyticsSymbolFilter
+                            )
+                          ) {
+                            setAnalyticsSymbolFilter('ALL');
+                          }
+                        }}
                         className={`px-3 py-1 rounded-full font-semibold transition whitespace-nowrap shrink-0 ${
                           active
                             ? stOpt.id === 'ALL'
@@ -5442,24 +5635,20 @@ export default function App() {
                       analyticsSymbolFilter === 'ALL' ? 'btn-primary-pill' : 'btn-soft-pill'
                     }`}
                   >
-                    全部币种 ({(stats.recent_trades || []).length})
+                    全部币种 ({strategyFilteredTotalTrades})
                   </button>
-                  {(stats.symbol_pnl_breakdown || [])
-                    .filter((item) =>
-                      analyticsStrategyFilter === 'ALL' ? true : item.strategy_type === analyticsStrategyFilter
-                    )
-                    .map((item) => (
-                      <button
-                        key={item.symbol}
-                        type="button"
-                        onClick={() => setAnalyticsSymbolFilter(item.symbol)}
-                        className={`px-3 py-1 rounded-full font-mono text-[11px] font-semibold transition whitespace-nowrap shrink-0 ${
-                          analyticsSymbolFilter === item.symbol ? 'btn-primary-pill' : 'btn-soft-pill'
-                        }`}
-                      >
-                        {item.symbol.split('/')[0]} ({item.trades})
-                      </button>
-                    ))}
+                  {symbolFilterOptions.map((item) => (
+                    <button
+                      key={item.symbol}
+                      type="button"
+                      onClick={() => setAnalyticsSymbolFilter(item.symbol)}
+                      className={`px-3 py-1 rounded-full font-mono text-[11px] font-semibold transition whitespace-nowrap shrink-0 ${
+                        analyticsSymbolFilter === item.symbol ? 'btn-primary-pill' : 'btn-soft-pill'
+                      }`}
+                    >
+                      {item.symbol.split('/')[0]} ({item.trades})
+                    </button>
+                  ))}
                 </div>
               </div>
 
@@ -5478,33 +5667,33 @@ export default function App() {
                         <div className="flex items-center gap-1.5 min-w-0">
                           <span className="font-mono font-bold text-main truncate">{tr.symbol}</span>
                           <span
-                            className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${strategyBadgeClass(
+                            className={`inline-flex items-center whitespace-nowrap px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${strategyBadgeClass(
                               tr._strategyType
                             )}`}
                           >
                             {tr._strategyLabel}
                           </span>
                           <span
-                            className={`px-2 py-0.5 rounded-full text-[10px] font-semibold shrink-0 ${
+                            className={`inline-flex items-center whitespace-nowrap px-2 py-0.5 rounded-full text-[10px] font-semibold shrink-0 ${
                               tr.side === 'LONG' ? 'bg-emerald-500/12 text-emerald-600' : 'bg-rose-500/12 text-rose-600'
                             }`}
                           >
                             {tr.side === 'LONG' ? '做多' : '做空'}
                           </span>
                         </div>
-                        <span className={`font-mono font-bold ${tr.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                        <span className={`font-mono font-bold whitespace-nowrap ${tr.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
                           {tr.net_pnl >= 0 ? `+${Number(tr.net_pnl).toFixed(4)}` : Number(tr.net_pnl).toFixed(4)} U
                         </span>
                       </div>
                       <div className="grid grid-cols-2 gap-1.5 font-mono text-[11px] text-sub">
-                        <div>开/平: {tr.entry} → {tr.exit}</div>
-                        <div className="text-right">耗时: {tr.hold_ms}ms · {tr.signal_to_fill_ms}ms</div>
+                        <div>开/平: {formatTradePrice(tr.entry, tr.symbol)} → {formatTradePrice(tr.exit, tr.symbol)}</div>
+                        <div className="text-right">耗时: {tr.hold_ms}ms · {Number(tr.signal_to_fill_ms || 0).toFixed(1)}ms</div>
                         <div>脉冲: {tr.jump_pct >= 0 ? `+${tr.jump_pct}%` : `${tr.jump_pct}%`}</div>
                         <div className="text-right text-dim">手续费: {Number(tr.fee).toFixed(4)}</div>
                       </div>
                       <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-line">
                         <span className="text-[11px] font-mono text-dim">{tr.time}</span>
-                        <span className={`px-2 py-0.5 rounded-full border text-[10px] font-medium ${tr._badge.cls}`}>
+                        <span className={`inline-flex items-center whitespace-nowrap px-2 py-0.5 rounded-full border text-[10px] font-medium ${tr._badge.cls}`}>
                           {tr._badge.text}
                         </span>
                       </div>
@@ -5515,23 +5704,23 @@ export default function App() {
 
               {/* Tablet / Desktop Table (>= md) */}
               <div className="hidden md:block overflow-x-auto">
-                <table className="w-full min-w-[1040px] text-left border-collapse text-xs">
+                <table className="w-full min-w-[1160px] text-left border-collapse text-xs">
                   <thead>
                     <tr className="border-b border-line text-[11px] text-dim surface-subtle">
-                      <th className="py-3 px-3.5 font-medium rounded-l-xl">触发时间</th>
-                      <th className="py-3 px-3.5 font-medium">合约代号</th>
-                      <th className="py-3 px-3.5 font-medium">执行策略</th>
-                      <th className="py-3 px-3.5 font-medium">方向</th>
-                      <th className="py-3 px-3.5 font-medium">主所脉冲幅度</th>
-                      <th className="py-3 px-3.5 font-medium">收敛系数 β</th>
-                      <th className="py-3 px-3.5 font-medium">开仓均价</th>
-                      <th className="py-3 px-3.5 font-medium">平仓均价</th>
-                      <th className="py-3 px-3.5 font-medium">信号至成交</th>
-                      <th className="py-3 px-3.5 font-medium">持仓耗时</th>
-                      <th className="py-3 px-3.5 font-medium">平仓方式</th>
-                      <th className="py-3 px-3.5 font-medium">双边手续费</th>
-                      <th className="py-3 px-3.5 font-medium">净收益 (USDT)</th>
-                      <th className="py-3 px-3.5 font-medium rounded-r-xl">平仓归因</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap rounded-l-xl">触发时间</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap">合约代号</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap">执行策略</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap">方向</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap">主所脉冲幅度</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap">收敛系数 β</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap">开仓均价</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap">平仓均价</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap">信号至成交</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap">持仓耗时</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap">平仓方式</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap">双边手续费</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap">净收益 (USDT)</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap rounded-r-xl">平仓归因</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y border-line font-mono">
@@ -5546,20 +5735,20 @@ export default function App() {
                     ) : (
                       filteredRecentTrades.map((tr, i) => (
                           <tr key={tr.id || i} className="hover:opacity-90 transition">
-                            <td className="py-3 px-3.5 text-dim">{tr.time}</td>
-                            <td className="py-3 px-3.5 font-bold text-main">{tr.symbol}</td>
-                            <td className="py-3 px-3.5 font-sans">
+                            <td className="py-3 px-3 text-dim whitespace-nowrap">{tr.time}</td>
+                            <td className="py-3 px-3 font-bold text-main whitespace-nowrap">{tr.symbol}</td>
+                            <td className="py-3 px-3 font-sans whitespace-nowrap">
                               <span
-                                className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold ${strategyBadgeClass(
+                                className={`inline-flex items-center whitespace-nowrap px-2.5 py-0.5 rounded-full text-[11px] font-bold ${strategyBadgeClass(
                                   tr._strategyType
                                 )}`}
                               >
                                 {tr._strategyLabel}
                               </span>
                             </td>
-                            <td className="py-3 px-3.5 font-sans">
+                            <td className="py-3 px-3 font-sans whitespace-nowrap">
                               <span
-                                className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${
+                                className={`inline-flex items-center whitespace-nowrap px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${
                                   tr.side === 'LONG'
                                     ? 'bg-emerald-500/12 text-emerald-600'
                                     : 'bg-rose-500/12 text-rose-600'
@@ -5569,32 +5758,32 @@ export default function App() {
                               </span>
                             </td>
                             <td
-                              className={`py-3 px-3.5 font-bold ${
+                              className={`py-3 px-3 font-bold whitespace-nowrap ${
                                 tr.jump_pct >= 0 ? 'text-emerald-500' : 'text-rose-500'
                               }`}
                             >
                               {tr.jump_pct >= 0 ? `+${tr.jump_pct}%` : `${tr.jump_pct}%`}
                             </td>
-                            <td className="py-3 px-3.5 text-sub">{tr.beta_est}</td>
-                            <td className="py-3 px-3.5 text-main">{tr.entry}</td>
-                            <td className="py-3 px-3.5 text-main">{tr.exit}</td>
-                            <td className="py-3 px-3.5 text-sub">{tr.signal_to_fill_ms} ms</td>
-                            <td className="py-3 px-3.5 text-sub">{tr.hold_ms} ms</td>
-                            <td className="py-3 px-3.5 font-sans">
-                              <span className="px-2.5 py-0.5 rounded-full text-[11px] surface-subtle text-sub">
+                            <td className="py-3 px-3 text-sub whitespace-nowrap">{tr.beta_est}</td>
+                            <td className="py-3 px-3 text-main whitespace-nowrap">{formatTradePrice(tr.entry, tr.symbol)}</td>
+                            <td className="py-3 px-3 text-main whitespace-nowrap">{formatTradePrice(tr.exit, tr.symbol)}</td>
+                            <td className="py-3 px-3 text-sub whitespace-nowrap">{Number(tr.signal_to_fill_ms || 0).toFixed(1)} ms</td>
+                            <td className="py-3 px-3 text-sub whitespace-nowrap">{tr.hold_ms} ms</td>
+                            <td className="py-3 px-3 font-sans whitespace-nowrap">
+                              <span className="inline-flex items-center whitespace-nowrap px-2.5 py-0.5 rounded-full text-[11px] surface-subtle text-sub">
                                 {tr.exit_order_type === 'MAKER_POST_ONLY' ? '被动挂单 (Maker)' : '主动吃单 (Taker)'}
                               </span>
                             </td>
-                            <td className="py-3 px-3.5 text-dim">{Number(tr.fee).toFixed(4)}</td>
+                            <td className="py-3 px-3 text-dim whitespace-nowrap">{Number(tr.fee).toFixed(4)}</td>
                             <td
-                              className={`py-3 px-3.5 font-bold ${
+                              className={`py-3 px-3 font-bold whitespace-nowrap ${
                                 tr.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'
                               }`}
                             >
                               {tr.net_pnl >= 0 ? `+${Number(tr.net_pnl).toFixed(4)}` : Number(tr.net_pnl).toFixed(4)}
                             </td>
-                            <td className="py-3 px-3.5 font-sans">
-                              <span className={`px-2.5 py-0.5 rounded-full border text-[11px] font-medium ${tr._badge.cls}`}>
+                            <td className="py-3 px-3 font-sans whitespace-nowrap">
+                              <span className={`inline-flex items-center whitespace-nowrap px-2.5 py-0.5 rounded-full border text-[11px] font-medium ${tr._badge.cls}`}>
                                 {tr._badge.text}
                               </span>
                             </td>

@@ -3959,6 +3959,20 @@ class BidirectionalSniperEngine:
         else:
             resolved_st = cur_st
 
+        raw_entry_px = float(tr.get("entry_price", 0.0) or 0.0)
+        raw_exit_px = float(tr.get("exit_price", 0.0) or 0.0)
+        base_prec = min(12, max(2, int(getattr(sym_cfg, "price_precision", 4) or 4))) if sym_cfg else 4
+        ref_px = raw_entry_px if raw_entry_px > 0 else raw_exit_px
+        if 0 < ref_px < 0.0001:
+            disp_prec = max(base_prec + 2, 10)
+        elif 0 < ref_px < 0.01:
+            disp_prec = max(base_prec + 2, 8)
+        elif 0 < ref_px < 1.0:
+            disp_prec = max(base_prec + 2, 6)
+        else:
+            disp_prec = max(base_prec + 1, 4)
+        disp_prec = min(12, disp_prec)
+
         ui_trade = {
             "id": tr.get("id") or tr.get("order_id"),
             "time": tr.get("time") or str(tr.get("created_at", ""))[-8:],
@@ -3971,10 +3985,10 @@ class BidirectionalSniperEngine:
             "jump_pct": round(float(tr.get("leader_jump_pct", 0.0)) * 100, 3),
             "expected_net_pct": round(float(tr.get("expected_net_pct", 0.0)) * 100, 3),
             "beta_est": round(float(tr.get("beta_est", 0.88)), 2),
-            "entry": float(tr.get("entry_price", 0.0)),
-            "exit": float(tr.get("exit_price", 0.0)),
-            "qty": float(tr.get("filled_qty", 0.0)),
-            "signal_to_fill_ms": float(tr.get("signal_to_fill_ms", 24.0)),
+            "entry": round(raw_entry_px, disp_prec),
+            "exit": round(raw_exit_px, disp_prec),
+            "qty": round(float(tr.get("filled_qty", 0.0)), 6),
+            "signal_to_fill_ms": round(float(tr.get("signal_to_fill_ms", 24.0)), 1),
             "hold_ms": int(tr.get("hold_duration_ms", 0)),
             "gross_pnl": round(gross, 4),
             "fee": round(fee, 4),
