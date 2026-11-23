@@ -185,7 +185,7 @@ class TrendBreakoutGridStrategy(BaseGridStrategy):
                 w = weights[idx_0]
                 slot_usdt = round(side_budget * w, 2) if cfg.trend_pyramid_decay else round(float(cfg.order_usdt), 2)
                 init_sl = (
-                    round(max(self.center_price, trig * max(0.05, 1.0 - sl_pct)), prec)
+                    round(trig * max(0.05, 1.0 - sl_pct), prec)
                     if i == 1
                     else long_triggers[idx_0 - 1]
                 )
@@ -229,7 +229,7 @@ class TrendBreakoutGridStrategy(BaseGridStrategy):
                 w = weights[idx_0]
                 slot_usdt = round(side_budget * w, 2) if cfg.trend_pyramid_decay else round(float(cfg.order_usdt), 2)
                 init_sl = (
-                    round(min(self.center_price, trig * (1.0 + sl_pct)), prec)
+                    round(trig * (1.0 + sl_pct), prec)
                     if i == 1
                     else short_triggers[idx_0 - 1]
                 )
@@ -335,20 +335,15 @@ class TrendBreakoutGridStrategy(BaseGridStrategy):
         prec = self._calc_prec(cfg)
         step_now = max(0.0001, float(cfg.grid_step_pct))
 
-        # 1. Trailing Stop, Solo/Pyramid SL Step-Up & False-Breakout Stop-Loss on OPEN slots
+        # 1. Trailing Stop, Solo/Pyramid SL Step-Up & Configured Percentage Hard Stop-Loss on OPEN slots
         trail_ratio = max(0.0005, float(cfg.trend_trailing_mult) * step_now)
         be_slip_buf = max(0.0016, step_now * 0.20)
         sl_room_buf = max(0.0025, step_now * 0.30)
         pyramid_profit_lock_move = max(0.45 * step_now, round_trip_fee + 0.0020)
-        solo_half_lock_move = max(0.65 * step_now, round_trip_fee + 0.0030)
-        solo_half_sl_dist = max(0.0045, 0.70 * step_now)
         solo_lock_move = max(0.85 * step_now, round_trip_fee + be_slip_buf + sl_room_buf + 0.0015)
         profit_floor_trigger = max(0.55 * step_now, 0.0040)
         pyramid_clear_move = max(0.30 * step_now, round_trip_fee + 0.0010)
-        max_l1_sl_dist = min(
-            float(cfg.grid_stop_loss_pct),
-            max(float(cfg.trend_dead_zone_mult) * step_now * 1.30, step_now * 2.55, 0.012),
-        )
+        cfg_sl_pct = max(0.002, float(cfg.grid_stop_loss_pct))
 
         open_longs = [lv for lv in self.levels.values() if lv["side"] == "LONG" and lv["status"] == "OPEN"]
         if open_longs:
@@ -386,13 +381,15 @@ class TrendBreakoutGridStrategy(BaseGridStrategy):
                 e_entry = float(lv.get("entry_price") or 0.0)
                 if e_entry > 0:
                     cur_sl = float(lv.get("sl_price") or 0.0)
-                    target_sl_l = round(e_entry * max(0.05, 1.0 - max_l1_sl_dist), prec)
+                    cfg_sl_l = round(e_entry * max(0.05, 1.0 - cfg_sl_pct), prec)
                     if self.long_peak_price >= e_entry * (1.0 + solo_lock_move):
-                        target_sl_l = max(target_sl_l, round(e_entry * (1.0 + round_trip_fee + be_slip_buf), prec))
-                    elif self.long_peak_price >= e_entry * (1.0 + solo_half_lock_move):
-                        target_sl_l = max(target_sl_l, round(e_entry * max(0.05, 1.0 - solo_half_sl_dist), prec))
-                    if cur_sl < target_sl_l - 1e-12 and bid >= target_sl_l * (1.0 + sl_room_buf):
-                        lv["sl_price"] = target_sl_l
+                        be_sl_l = round(e_entry * (1.0 + round_trip_fee + be_slip_buf), prec)
+                        if cur_sl < be_sl_l - 1e-12 and bid >= be_sl_l * (1.0 + sl_room_buf):
+                            lv["sl_price"] = be_sl_l
+                            lv["sl_needs_amend"] = True
+                    elif cur_sl < e_entry and abs(cur_sl - cfg_sl_l) > 1e-9 and bid >= cfg_sl_l * (1.0 + sl_room_buf):
+                        # Strictly honor user-configured grid_stop_loss_pct before breakeven lock (no premature narrowing)
+                        lv["sl_price"] = cfg_sl_l
                         lv["sl_needs_amend"] = True
             elif (
                 len(open_longs) >= 2
@@ -488,16 +485,15 @@ class TrendBreakoutGridStrategy(BaseGridStrategy):
                 e_entry = float(lv.get("entry_price") or 0.0)
                 if e_entry > 0 and self.short_trough_price > 0:
                     cur_sl = float(lv.get("sl_price") or 0.0)
-                    target_sl_s = round(e_entry * (1.0 + max_l1_sl_dist), prec)
+                    cfg_sl_s = round(e_entry * (1.0 + cfg_sl_pct), prec)
                     if self.short_trough_price <= e_entry * max(0.05, 1.0 - solo_lock_move):
-                        target_sl_s = min(
-                            target_sl_s,
-                            round(e_entry * max(0.05, 1.0 - round_trip_fee - be_slip_buf), prec),
-                        )
-                    elif self.short_trough_price <= e_entry * max(0.05, 1.0 - solo_half_lock_move):
-                        target_sl_s = min(target_sl_s, round(e_entry * (1.0 + solo_half_sl_dist), prec))
-                    if (cur_sl <= 0 or cur_sl > target_sl_s + 1e-12) and ask <= target_sl_s * max(0.05, 1.0 - sl_room_buf):
-                        lv["sl_price"] = target_sl_s
+                        be_sl_s = round(e_entry * max(0.05, 1.0 - round_trip_fee - be_slip_buf), prec)
+                        if (cur_sl <= 0 or cur_sl > be_sl_s + 1e-12) and ask <= be_sl_s * max(0.05, 1.0 - sl_room_buf):
+                            lv["sl_price"] = be_sl_s
+                            lv["sl_needs_amend"] = True
+                    elif (cur_sl <= 0 or cur_sl > e_entry) and abs(cur_sl - cfg_sl_s) > 1e-9 and ask <= cfg_sl_s * max(0.05, 1.0 - sl_room_buf):
+                        # Strictly honor user-configured grid_stop_loss_pct before breakeven lock (no premature narrowing)
+                        lv["sl_price"] = cfg_sl_s
                         lv["sl_needs_amend"] = True
             elif (
                 len(open_shorts) >= 2
@@ -754,7 +750,7 @@ class TrendBreakoutGridStrategy(BaseGridStrategy):
             self.long_peak_price = max(self.long_peak_price, entry_price)
             safe_cap_l = min(round(entry_price * max(0.05, 1.0 - sl_buf), prec), round(entry_price - tick_unit, prec))
             if lvl_idx <= 1:
-                raw_sl = round(max(self.center_price, entry_price * max(0.05, 1.0 - sl_pct)), prec)
+                raw_sl = round(entry_price * max(0.05, 1.0 - sl_pct), prec)
                 lv["sl_price"] = min(raw_sl, safe_cap_l)
             else:
                 prev_lv = self.levels.get(f"L{lvl_idx - 1}")
@@ -781,7 +777,7 @@ class TrendBreakoutGridStrategy(BaseGridStrategy):
             )
             safe_floor_s = max(round(entry_price * (1.0 + sl_buf), prec), round(entry_price + tick_unit, prec))
             if lvl_idx <= 1:
-                raw_sl = round(min(self.center_price, entry_price * (1.0 + sl_pct)), prec)
+                raw_sl = round(entry_price * (1.0 + sl_pct), prec)
                 lv["sl_price"] = max(raw_sl, safe_floor_s)
             else:
                 prev_lv = self.levels.get(f"S{lvl_idx - 1}")

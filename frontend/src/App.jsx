@@ -335,7 +335,7 @@ const EXIT_BADGE_MAP = {
     cls: 'bg-teal-500/15 text-teal-600 dark:text-teal-300 border-teal-500/30',
   },
   TREND_SL: {
-    text: '假突破止损',
+    text: '顺势硬止损',
     cls: 'bg-rose-500/10 text-rose-600 dark:text-rose-400 border-rose-500/30',
   },
   TREND_BE_SL: {
@@ -1626,6 +1626,8 @@ export default function App() {
         curSl <= step + 1e-6
       ) {
         mergedPatch.grid_stop_loss_pct = Number(Math.min(0.9, Math.max(curRng + 0.003, step * 2.5, step + 0.005)).toFixed(4));
+      } else if (patch.strategy_type === 'TREND_GRID') {
+        mergedPatch.grid_stop_loss_pct = 0.03;
       } else if (
         (patch.strategy_type === 'LONG_SHORT_GRID' || patch.strategy_type === 'ADAPTIVE_GRID') &&
         curSl <= curRng + 1e-6
@@ -3161,7 +3163,7 @@ export default function App() {
                       </div>
                       <div>
                         <label className="block text-[11px] font-semibold text-dim mb-1">
-                          {bFilter === 'TREND_GRID' ? '首格假突破止损 (%)' : bFilter === 'REVERSE_GRID' ? '单格价格止损 (%)' : '价格止损 (%)'}
+                          {bFilter === 'TREND_GRID' ? '首格硬止损 (%)' : bFilter === 'REVERSE_GRID' ? '单格价格止损 (%)' : '价格止损 (%)'}
                           {batchForm.grid_stop_loss_pct_str !== '' && Number(batchForm.grid_stop_loss_pct_str) > 0 && (
                             <span className="ml-1 text-amber-600 dark:text-amber-300 font-mono">
                               5x≈{(Number(batchForm.grid_stop_loss_pct_str) * 5).toFixed(1)}%
@@ -4037,13 +4039,13 @@ export default function App() {
                               {isReverseGrid
                                 ? '单格硬止损上限 (% · 相对开仓价)'
                                 : isTrendGrid
-                                ? '首格假突破止损上限 (% · 标的价格)'
+                                ? '首格硬止损 (% · 相对开仓价)'
                                 : '破网硬止损上限 (% · 相对中枢价)'}
                             </label>
                             <PercentNumberInput
                               step="0.2"
                               valueRatio={currentStrategy.grid_stop_loss_pct}
-                              defaultRatio={0.038}
+                              defaultRatio={isTrendGrid ? 0.03 : 0.038}
                               onChangeRatio={(v) => updateGridParamWithLinkage('grid_stop_loss_pct', v)}
                             />
                             <div className="text-[10px] text-amber-600 dark:text-amber-300 mt-1 leading-snug">

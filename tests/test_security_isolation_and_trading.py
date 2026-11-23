@@ -1511,8 +1511,8 @@ def test_trend_breakout_grid_and_adaptive_vcp_dual_mode_switching():
     en1, ex1 = tracker.evaluate_tick(102.50, 102.55, 102.52, trend_cfg, is_net_mode=True, round_trip_fee=0.0007)
     assert [e["slot_id"] for e in en1] == ["L1"]
     tracker.mark_entry_filled("L1", entry_price=102.55, filled_qty=1.46, contracts=1.46, ct_val=1.0, cfg=trend_cfg, round_trip_fee=0.0007)
-    # L1 initial SL sits at center_price (100.0) to cut false breakouts immediately
-    assert tracker.levels["L1"]["sl_price"] == 100.0
+    # L1 initial SL strictly honors configured grid_stop_loss_pct (8% below entry), NOT truncated to center_price!
+    assert tracker.levels["L1"]["sl_price"] == round(102.55 * (1.0 - trend_cfg.grid_stop_loss_pct), 2)
 
     # Price rallies to L2 (103.55) -> L2 opens and raises L1's SL to breakeven + fee, with monotonic L2 SL >= L1 SL!
     en2, _ = tracker.evaluate_tick(103.50, 103.55, 103.52, trend_cfg, is_net_mode=True, round_trip_fee=0.0007)
@@ -3348,7 +3348,7 @@ def test_trend_solo_profit_lock_pyramid_sl_buffer_and_post_sl_cooldown():
     en1, _ = trk.evaluate_tick(98.78, 98.80, 98.79, cfg, is_net_mode=False, round_trip_fee=0.0010)
     assert [e["slot_id"] for e in en1] == ["S1"]
     trk.mark_entry_filled("S1", 98.80, 0.15, 1.0, 0.15, cfg, round_trip_fee=0.0010)
-    assert trk.levels["S1"]["sl_price"] == 100.00  # Initial false-breakout SL at center
+    assert trk.levels["S1"]["sl_price"] == round(98.80 * (1.0 + cfg.grid_stop_loss_pct), 2)  # Strictly honors configured SL %
 
     # Price drops to 97.85 (favorable move = (98.80 - 97.86)/98.80 = 0.95% >= 0.85%*0.8%) -> S1 auto-locks breakeven SL!
     _, ex_hold = trk.evaluate_tick(97.84, 97.86, 97.85, cfg, is_net_mode=False, round_trip_fee=0.0010)
@@ -3859,12 +3859,13 @@ def test_five_strategy_audit_payoff_asymmetry_fixes_and_idempotency():
     en1, _ = trk.evaluate_tick(101.00, 101.02, 101.01, cfg, is_net_mode=True, round_trip_fee=0.0010)
     assert [e["slot_id"] for e in en1] == ["L1"]
     trk.mark_entry_filled("L1", 101.00, 0.30, 3.0, 0.1, cfg, round_trip_fee=0.0010)
-    assert trk.levels["L1"]["sl_price"] == 100.00
+    expected_init_sl = round(101.00 * (1.0 - cfg.grid_stop_loss_pct), 2)
+    assert trk.levels["L1"]["sl_price"] == expected_init_sl
 
     _, ex_half = trk.evaluate_tick(101.55, 101.57, 101.56, cfg, is_net_mode=True, round_trip_fee=0.0010)
     assert ex_half == []
-    # Half-risk step-up tightened L1 SL from 100.00 (-0.99%) to 101.00 * (1 - 0.70*0.008) = 100.43 (-0.56%, preserving breathing room)!
-    assert trk.levels["L1"]["sl_price"] == round(101.00 * (1.0 - max(0.0045, 0.70 * 0.008)), 2)
+    # Before reaching solo breakeven lock, TREND_GRID strictly preserves configured SL % (no premature pre-BE narrowing!)
+    assert trk.levels["L1"]["sl_price"] == expected_init_sl
     # Solo L1 trail stop stays at raw_trail (101.55 * (1 - 0.01) = 100.53), NOT choked at +0.34% (101.35)!
     assert trk.long_trail_stop_price == round(101.55 * (1.0 - 0.01), 2)
     _, ex_no_crumb = trk.evaluate_tick(101.30, 101.32, 101.31, cfg, is_net_mode=True, round_trip_fee=0.0010)
@@ -4780,6 +4781,15 @@ def test_audit_p0_p1_trading_and_execution_fixes(tmp_path):
         trk.mark_entry_filled("S1", 132.90, 0.10, 1.0, 0.10, cfg, round_trip_fee=0.0010)
         min_safe_sl_s = round(132.90 * (1.0 + max(0.0035, 0.006 * 0.55)), 2)
         assert trk.levels["S1"]["sl_price"] >= min_safe_sl_s, f"{stype} S1 SL bypassed sl_buf floor!"
+        if stype == "TREND_GRID":
+            # Plan A: TREND_GRID strictly honors configured grid_stop_loss_pct (not truncated to center_price)
+            assert trk.levels["S1"]["sl_price"] == round(132.90 * (1.0 + cfg.grid_stop_loss_pct), 2)
+            # Dynamically updating grid_stop_loss_pct to 3.0% updates open pre-BE SL immediately
+            cfg_3 = cfg.model_copy(update={"grid_stop_loss_pct": 0.03})
+            trk.evaluate_tick(132.46, 132.47, 132.465, cfg_3, is_net_mode=False, round_trip_fee=0.0010, bbw_info=bbw_trend)
+            assert trk.levels["S1"]["sl_price"] == round(132.90 * 1.03, 2)
+            assert trk.levels["S1"].get("sl_needs_amend") is True
+            cfg = cfg_3
 
         # Tiny +0.32% favorable move (132.90 -> 132.47) MUST NOT slam solo S1 SL to -0.30% whipsaw!
         orig_sl = trk.levels["S1"]["sl_price"]
@@ -4790,6 +4800,10 @@ def test_audit_p0_p1_trading_and_execution_fixes(tmp_path):
         trk.evaluate_tick(131.69, 131.70, 131.695, cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=bbw_trend)
         expected_be = round(132.90 * (1.0 - 0.0010 - max(0.0016, 0.006 * 0.20)), 2)
         assert trk.levels["S1"]["sl_price"] == expected_be
+        if stype == "TREND_GRID":
+            # Once in BE profit-lock, SL must NEVER widen back down to -3%
+            trk.evaluate_tick(131.80, 131.82, 131.81, cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=bbw_trend)
+            assert trk.levels["S1"]["sl_price"] == expected_be
 
         # Symmetric check on LONG L1 when entry fills close to center
         trk_l = LongShortGridTracker("NVDA/USDT:USDT", strategy_type=stype)
@@ -4797,6 +4811,8 @@ def test_audit_p0_p1_trading_and_execution_fixes(tmp_path):
         trk_l.mark_entry_filled("L1", 133.10, 0.10, 1.0, 0.10, cfg, round_trip_fee=0.0010)
         max_safe_sl_l = round(133.10 * (1.0 - max(0.0035, 0.006 * 0.55)), 2)
         assert trk_l.levels["L1"]["sl_price"] <= max_safe_sl_l, f"{stype} L1 SL bypassed sl_buf floor!"
+        if stype == "TREND_GRID":
+            assert trk_l.levels["L1"]["sl_price"] == round(133.10 * (1.0 - cfg.grid_stop_loss_pct), 2)
 
     # 3) restore_state preserves exact entry_price/contracts with recovered=False, restored_from_state=True
     rev_cfg = SymbolStrategy(
