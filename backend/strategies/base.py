@@ -68,8 +68,20 @@ class BaseGridStrategy:
     def supports_maker_tp(self, cfg: SymbolStrategy) -> bool:
         return bool(cfg.use_post_only_tp) and self.active_grid_mode != "TREND_BREAKOUT"
 
+    def should_place_maker_tp_for_slot(self, slot_id: str, cfg: SymbolStrategy) -> bool:
+        return self.supports_maker_tp(cfg)
+
     def uses_livermore_sl_amend(self) -> bool:
         return self.active_grid_mode == "TREND_BREAKOUT"
+
+    def consume_slot_conversions(self) -> List[dict]:
+        return []
+
+    def needs_post_cycle_flat_reconcile(self) -> bool:
+        return False
+
+    def mark_reconcile_verified_clean(self):
+        return None
 
     def get_rt_fee(self, cfg: SymbolStrategy, taker_fee: float, maker_fee: float) -> float:
         if self.supports_maker_tp(cfg):

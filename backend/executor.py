@@ -3304,6 +3304,172 @@ class ExecutionAdapter:
         except Exception as e:
             return {"ok": False, "message": f"连接 OKX 平仓接口异常 ({type(e).__name__})"}
 
+    async def reconcile_and_cleanup_symbol_flat(
+        self,
+        symbol: str,
+        exchange_cfg: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        """
+        Verifies an exchange symbol has ZERO open positions and ZERO pending normal/algo orders.
+        If any residual position or pending order is found (gap-skip, partial fill, API hiccup,
+        lot rounding), cancels all pending orders/algos for the symbol, market-closes every
+        residual position, and re-verifies zero balance before returning `is_flat=True`.
+        """
+        risk = self._get_risk_cfg()
+        creds = self._extract_okx_creds(exchange_cfg) if risk.trading_mode == "LIVE" else None
+        if not creds:
+            return {
+                "ok": True,
+                "is_flat": True,
+                "cleaned": False,
+                "residual_positions": 0,
+                "residual_orders": 0,
+                "message": "仿真模式无需交易所残仓对账",
+            }
+
+        inst_id = to_okx_inst_id(symbol)
+        proxy = get_system_proxy()
+
+        async def _inspect(client):
+            pos_r = await self._okx_request(
+                client, creds, "GET", f"/api/v5/account/positions?instType=SWAP&instId={inst_id}"
+            )
+            ord_r = await self._okx_request(
+                client, creds, "GET", f"/api/v5/trade/orders-pending?instType=SWAP&instId={inst_id}"
+            )
+            algo_r = await self._okx_request(
+                client,
+                creds,
+                "GET",
+                f"/api/v5/trade/orders-algo-pending?instType=SWAP&ordType=conditional&instId={inst_id}",
+            )
+            if (
+                str(pos_r.get("code", "")) != "0"
+                or str(ord_r.get("code", "")) != "0"
+                or str(algo_r.get("code", "")) != "0"
+            ):
+                return None, None, None
+            open_pos = []
+            for row in pos_r.get("data", []):
+                try:
+                    rp = float(row.get("pos") or 0.0)
+                except (TypeError, ValueError):
+                    rp = 0.0
+                if abs(rp) > 0.0:
+                    open_pos.append(row)
+            return open_pos, list(ord_r.get("data", []) or []), list(algo_r.get("data", []) or [])
+
+        try:
+            async with self._borrow_http_client(proxy, timeout=8.0) as client:
+                meta = await self.ensure_okx_account_meta(client, creds)
+                pos_mode = meta.get("posMode", "net_mode")
+                open_pos, pend_ords, pend_algos = await _inspect(client)
+                if open_pos is None:
+                    return {
+                        "ok": False,
+                        "is_flat": False,
+                        "cleaned": False,
+                        "residual_positions": -1,
+                        "residual_orders": -1,
+                        "message": "查询 OKX 持仓/挂单失败，等待下次重试对账",
+                    }
+
+                if not open_pos and not pend_ords and not pend_algos:
+                    for k in [k for k in list(self._active_maker_tp_orders.keys()) if k == symbol or k.startswith(f"{symbol}:")]:
+                        self._active_maker_tp_orders.pop(k, None)
+                    for k in [k for k in list(self._active_cond_sl_orders.keys()) if k == symbol or k.startswith(f"{symbol}:")]:
+                        self._active_cond_sl_orders.pop(k, None)
+                    return {
+                        "ok": True,
+                        "is_flat": True,
+                        "cleaned": False,
+                        "residual_positions": 0,
+                        "residual_orders": 0,
+                        "message": "交易所持仓与挂单均为 0",
+                    }
+
+                # Residual detected: 1) Cancel all pending normal orders (batches of <= 20)
+                ord_cancel_batch = [
+                    {"instId": inst_id, "ordId": str(o.get("ordId"))}
+                    for o in pend_ords
+                    if o.get("ordId")
+                ]
+                for i in range(0, len(ord_cancel_batch), 20):
+                    try:
+                        await self._okx_request(
+                            client, creds, "POST", "/api/v5/trade/cancel-batch-orders", ord_cancel_batch[i : i + 20]
+                        )
+                    except Exception:
+                        pass
+
+                # 2) Cancel all pending conditional algo orders (batches of <= 10)
+                algo_cancel_batch = [
+                    {"instId": inst_id, "algoId": str(a.get("algoId"))}
+                    for a in pend_algos
+                    if a.get("algoId")
+                ]
+                for i in range(0, len(algo_cancel_batch), 10):
+                    try:
+                        await self._okx_request(
+                            client, creds, "POST", "/api/v5/trade/cancel-algos", algo_cancel_batch[i : i + 10]
+                        )
+                    except Exception:
+                        pass
+
+                # 3) Market-close every residual position
+                for prow in open_pos:
+                    mgn_m = str(prow.get("mgnMode") or "cross")
+                    p_side = str(prow.get("posSide") or "net").lower()
+                    payload: Dict[str, Any] = {"instId": inst_id, "mgnMode": mgn_m, "autoCxl": True}
+                    if pos_mode == "long_short_mode" and p_side in ("long", "short"):
+                        payload["posSide"] = p_side
+                    try:
+                        await self._okx_request(client, creds, "POST", "/api/v5/trade/close-position", payload)
+                    except Exception:
+                        pass
+
+                for k in [k for k in list(self._active_maker_tp_orders.keys()) if k == symbol or k.startswith(f"{symbol}:")]:
+                    self._active_maker_tp_orders.pop(k, None)
+                for k in [k for k in list(self._active_cond_sl_orders.keys()) if k == symbol or k.startswith(f"{symbol}:")]:
+                    self._active_cond_sl_orders.pop(k, None)
+
+                # 4) Re-verify exchange is completely flat (0 positions, 0 pending orders/algos)
+                await asyncio.sleep(0.4)
+                pos_after, ord_after, algo_after = await _inspect(client)
+                if pos_after is None:
+                    return {
+                        "ok": False,
+                        "is_flat": False,
+                        "cleaned": True,
+                        "residual_positions": -1,
+                        "residual_orders": -1,
+                        "message": "已执行残仓清理但二次对账查询失败，稍后复查",
+                    }
+                rem_pos = len(pos_after)
+                rem_ord = len(ord_after) + len(algo_after)
+                is_flat = (rem_pos == 0 and rem_ord == 0)
+                return {
+                    "ok": True,
+                    "is_flat": is_flat,
+                    "cleaned": True,
+                    "residual_positions": rem_pos,
+                    "residual_orders": rem_ord,
+                    "message": (
+                        f"已清理残留({len(open_pos)}仓/{len(pend_ords)+len(pend_algos)}单)并二次对账清零"
+                        if is_flat
+                        else f"残仓清理后仍有未清零项(仓={rem_pos}, 单={rem_ord})，延后重锚"
+                    ),
+                }
+        except Exception as e:
+            return {
+                "ok": False,
+                "is_flat": False,
+                "cleaned": False,
+                "residual_positions": -1,
+                "residual_orders": -1,
+                "message": f"对账清仓接口异常 ({type(e).__name__})",
+            }
+
     async def _live_place_ioc_with_reconcile(
         self,
         cfg: SymbolStrategy,

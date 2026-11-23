@@ -204,8 +204,20 @@ class LongShortGridTracker:
     def supports_maker_tp(self, cfg: SymbolStrategy) -> bool:
         return self._strategy.supports_maker_tp(cfg)
 
+    def should_place_maker_tp_for_slot(self, slot_id: str, cfg: SymbolStrategy) -> bool:
+        return self._strategy.should_place_maker_tp_for_slot(slot_id, cfg)
+
     def uses_livermore_sl_amend(self) -> bool:
         return self._strategy.uses_livermore_sl_amend()
+
+    def consume_slot_conversions(self) -> List[dict]:
+        return self._strategy.consume_slot_conversions()
+
+    def needs_post_cycle_flat_reconcile(self) -> bool:
+        return self._strategy.needs_post_cycle_flat_reconcile()
+
+    def mark_reconcile_verified_clean(self):
+        self._strategy.mark_reconcile_verified_clean()
 
     def get_rt_fee(self, cfg: SymbolStrategy, taker_fee: float, maker_fee: float) -> float:
         return self._strategy.get_rt_fee(cfg, taker_fee, maker_fee)

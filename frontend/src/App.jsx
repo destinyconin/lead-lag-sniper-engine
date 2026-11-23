@@ -57,12 +57,12 @@ const STRATEGY_STATE_PIPELINES = {
     { key: 'RECENTER', step: '6', label: '套利闭环', desc: '空仓漂移重锚' },
   ],
   REVERSE_GRID: [
-    { key: 'ANCHOR', step: '1', label: '中枢布网', desc: '上多下空双向档' },
-    { key: 'WATCH', step: '2', label: '多空巡航', desc: '涨破开多·跌破开空' },
-    { key: 'ENTERING', step: '3', label: '突破建仓', desc: 'IOC滑点保护' },
-    { key: 'HOLDING', step: '4', label: '挂单守护', desc: 'Maker止盈·单格止损' },
-    { key: 'EXITING', step: '5', label: '平仓结算', desc: '止盈或单格止损' },
-    { key: 'REARM', step: '6', label: '撤防复装', desc: '回踩滞回重装' },
+    { key: 'ANCHOR', step: '1', label: '中枢待锁', desc: '涨破L1锁多·跌破S1锁空' },
+    { key: 'LOCKED', step: '2', label: '底仓锁向', desc: 'Q/Q\'底仓·逆向格套利' },
+    { key: 'PYRAMID', step: '3', label: '递减加仓', desc: '50%·30%·10%金字塔' },
+    { key: 'TRAILING', step: '4', label: '组移动止盈', desc: '均价保底·0.8%回撤' },
+    { key: 'EXITING', step: '5', label: '全平对账', desc: 'L5/S5或残仓清零' },
+    { key: 'COOLDOWN', step: '6', label: '冷却重锚', desc: '止盈4m·止损数小时' },
   ],
   TREND_GRID: [
     { key: 'DEADZONE', step: '1', label: '死区观察', desc: '过滤震荡噪音' },
@@ -163,25 +163,44 @@ function resolveStrategyStateMachine(cfg, tel) {
       { label: `套利闭环 (${cycles}轮)`, value: fmtSigned(gridNetPnl), tone: gridNetPnl >= 0 ? 'emerald' : 'rose' },
     ];
   } else if (st === 'REVERSE_GRID') {
-    const idleLevels = levels.filter((lv) => lv.status === 'IDLE');
-    const armedCount = idleLevels.filter((lv) => lv.armed !== false).length;
-    const disarmedCount = idleLevels.length - armedCount;
+    const lockedMode = String(grid?.locked_mode || 'NONE');
+    const groupTrailActive = Boolean(grid?.group_trail_active);
+    const groupVwap = Number(grid?.group_vwap || 0);
+    const groupFloor = Number(grid?.group_floor_price || 0);
+    const fullTpPx = Number(grid?.full_tp_price || 0);
+    const globalSlPx = Number(grid?.global_sl_price || 0);
+    const cyclePhase = String(grid?.cycle_phase || 'ACTIVE');
+    const cdRemSec = Number(grid?.restart_cooldown_rem_sec || 0);
+    const liveTrailPx =
+      lockedMode === 'LONG'
+        ? Number(grid?.long_trail_stop_price || 0)
+        : lockedMode === 'SHORT'
+        ? Number(grid?.short_trail_stop_price || 0)
+        : 0;
+    const hasPyrOpen = openSlots.some((lv) => lv.role === 'PYRAMID');
 
-    if (exitingSlots.length > 0) activeKey = 'EXITING';
-    else if (enteringSlots.length > 0) activeKey = 'ENTERING';
-    else if (openLong + openShort > 0) activeKey = 'HOLDING';
-    else if (centerPx > 0 && disarmedCount > 0) activeKey = 'REARM';
-    else if (centerPx > 0 && levels.length > 0) activeKey = 'WATCH';
+    if (cyclePhase === 'COOLDOWN' || cdRemSec > 0) activeKey = 'COOLDOWN';
+    else if (exitingSlots.length > 0 || cyclePhase === 'PENDING_RECONCILE') activeKey = 'EXITING';
+    else if (groupTrailActive) activeKey = 'TRAILING';
+    else if (hasPyrOpen) activeKey = 'PYRAMID';
+    else if (lockedMode === 'LONG' || lockedMode === 'SHORT') activeKey = 'LOCKED';
     else activeKey = 'ANCHOR';
 
-    subtitle = `多空震荡 · 步长 ${stepPct}% · 止盈 ${tpPct}% · 单格止损 ${slPct}% · ${cfg?.use_post_only_tp !== false ? 'Maker止盈' : 'Taker止盈'}`;
+    const lockLabel = lockedMode === 'LONG' ? '多头模式(锁定)' : lockedMode === 'SHORT' ? '空头模式(锁定)' : '待锁定方向';
+    subtitle = `${lockLabel} · 步长 ${stepPct}% · 全局止损 ${slPct}% · 递减 50/30/10%`;
     metrics = [
-      { label: '网格中枢价', value: fmtPx(centerPx), tone: 'main' },
-      { label: '活跃槽位 (多/空)', value: `${openLong} 多 / ${openShort} 空`, tone: openLong + openShort > 0 ? 'emerald' : 'main' },
+      { label: '网格中枢 / 锁定', value: `${fmtPx(centerPx)} · ${lockedMode === 'LONG' ? '多' : lockedMode === 'SHORT' ? '空' : 'NONE'}`, tone: lockedMode !== 'NONE' ? 'emerald' : 'main' },
+      { label: '在途槽位 (多/空)', value: `${openLong} 多 / ${openShort} 空`, tone: openLong + openShort > 0 ? 'emerald' : 'main' },
       {
-        label: '挂单 / 档位就绪',
-        value: `TP挂单 ${makerTpCount} · 就绪 ${armedCount}/${idleLevels.length}`,
-        tone: makerTpCount > 0 ? 'sky' : 'main',
+        label: groupTrailActive ? 'L/S组追踪线 / 均价' : cdRemSec > 0 ? '重启冷却倒计时' : '顶格全平 / 全局止损',
+        value: groupTrailActive
+          ? `${fmtPx(liveTrailPx)} (均 ${fmtPx(groupVwap || groupFloor)})`
+          : cdRemSec > 0
+          ? `${Math.ceil(cdRemSec)}s (${grid?.restart_reason === 'GLOBAL_SL_COOLDOWN' ? '止损长冷' : '止盈冷却'})`
+          : fullTpPx > 0
+          ? `${fmtPx(fullTpPx)} / ${fmtPx(globalSlPx)}`
+          : `L1/S1 待触发`,
+        tone: groupTrailActive ? 'emerald' : cdRemSec > 0 ? 'amber' : 'sky',
       },
       { label: `套利闭环 (${cycles}轮)`, value: fmtSigned(gridNetPnl), tone: gridNetPnl >= 0 ? 'emerald' : 'rose' },
     ];
@@ -531,6 +550,18 @@ const EXIT_BADGE_MAP = {
   GRID_TP: {
     text: '网格止盈',
     cls: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30',
+  },
+  GRID_TRAIL_TP: {
+    text: '组移动止盈',
+    cls: 'bg-teal-500/15 text-teal-600 dark:text-teal-300 border-teal-500/30',
+  },
+  GRID_GROUP_TP: {
+    text: '顶格全平止盈',
+    cls: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 border-emerald-500/40',
+  },
+  GRID_GLOBAL_SL: {
+    text: '全局止损清仓',
+    cls: 'bg-rose-500/15 text-rose-600 dark:text-rose-300 border-rose-500/40',
   },
   GRID_SL: {
     text: '网格止损',
@@ -2079,7 +2110,7 @@ export default function App() {
   const decoratedRecentTrades = useMemo(() => {
     return (stats.recent_trades || []).map((tr) => {
       const reason = String(tr.reason || '');
-      const mSlot = reason.match(/^(.*)_(L\d+|S\d+)$/);
+      const mSlot = reason.match(/^(.*)_(L\d+|S\d+|Q|QS|C|CS)$/);
       const baseReason = mSlot
         ? mSlot[1]
         : reason.startsWith('GRID_TP_')
@@ -3093,7 +3124,24 @@ export default function App() {
                               )}
                             </div>
                             <div className="text-[10px] text-dim truncate mt-0.5">
-                              {makerTpCnt > 0
+                              {isRev
+                                ? (() => {
+                                    const lk = String(grid?.locked_mode || 'NONE');
+                                    const trActive = Boolean(grid?.group_trail_active);
+                                    const trPx =
+                                      lk === 'LONG'
+                                        ? Number(grid?.long_trail_stop_price || 0)
+                                        : lk === 'SHORT'
+                                        ? Number(grid?.short_trail_stop_price || 0)
+                                        : 0;
+                                    const cdSec = Number(grid?.restart_cooldown_rem_sec || 0);
+                                    if (cdSec > 0) return `重启冷却 ${Math.ceil(cdSec)}s`;
+                                    if (trActive && trPx > 0) return `组追踪 ${fmtPx(trPx)}`;
+                                    if (lk === 'LONG') return `多头锁定 · 全局损 ${fmtPx(grid?.global_sl_price)}`;
+                                    if (lk === 'SHORT') return `空头锁定 · 全局损 ${fmtPx(grid?.global_sl_price)}`;
+                                    return `待锁方向 · 步长 ${stepPctVal.toFixed(2)}%`;
+                                  })()
+                                : makerTpCnt > 0
                                 ? `Maker挂单 ${makerTpCnt} · ${cycles}轮`
                                 : `步长 ${stepPctVal.toFixed(2)}% · ${cycles}轮`}
                             </div>
@@ -3103,7 +3151,9 @@ export default function App() {
                         <div className="mt-3 sm:mt-3.5 pt-2.5 sm:pt-3 border-t border-line space-y-1.5">
                           <div className="flex items-center justify-between gap-1 text-[10px] sm:text-[11px] font-mono text-dim">
                             <span className="truncate">
-                              盈 {tpPctVal.toFixed(2)}% · 损 {slPctVal.toFixed(1)}%
+                              {isRev
+                                ? `步 ${stepPctVal.toFixed(2)}% · 全局损 ${slPctVal.toFixed(1)}%`
+                                : `盈 ${tpPctVal.toFixed(2)}% · 损 ${slPctVal.toFixed(1)}%`}
                             </span>
                             <span
                               className={`truncate ${

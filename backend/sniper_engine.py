@@ -747,7 +747,7 @@ class BidirectionalSniperEngine:
     def _get_grid_rt_fee(cfg: SymbolStrategy, active_mode: str, follower_ex: Dict[str, Any]) -> float:
         taker_fee = float(follower_ex.get("taker_fee", 0.0005))
         maker_fee = float(follower_ex.get("maker_fee", 0.0002))
-        if active_mode in ("MEAN_REVERSION", "REVERSE_OSCILLATING") and cfg.use_post_only_tp:
+        if active_mode == "MEAN_REVERSION" and cfg.use_post_only_tp:
             return taker_fee + maker_fee
         return 2.0 * taker_fee
 
@@ -1201,9 +1201,9 @@ class BidirectionalSniperEngine:
                             # Protect recovered grid position on OKX immediately if not under kill switch!
                             sl_breached_on_recover = False
                             if not self.risk_config.kill_switch_active:
-                                slot_tp_px = float(lv.get("tp_price") or 0.0)
+                                slot_tp_px = float(lv.get("tp_price") or 0.0) if tracker.should_place_maker_tp_for_slot(slot_id, cfg) else 0.0
                                 slot_sl_px = float(lv.get("sl_price") or 0.0)
-                                if (cfg.use_post_only_tp and slot_tp_px > 0) or slot_sl_px > 0:
+                                if (slot_tp_px > 0) or slot_sl_px > 0:
                                     await self.executor.place_protective_orders(
                                         cfg=cfg,
                                         side=side,
@@ -2428,6 +2428,42 @@ class BidirectionalSniperEngine:
         regime_msg = tracker.consume_regime_log()
         if regime_msg:
             self.append_log("INFO", sym, regime_msg, mode=cur_mode)
+
+        # Sync any zero-order in-place slot conversions (e.g. REVERSE_GRID C -> Q or CS -> QS)
+        conversions = tracker.consume_slot_conversions()
+        if conversions:
+            for conv in conversions:
+                old_gk = f"{sym}:{conv['from_slot']}"
+                new_gk = f"{sym}:{conv['to_slot']}"
+                old_pos = self.active_grid_positions.pop(old_gk, None)
+                new_lv = tracker.levels.get(conv["to_slot"])
+                if old_pos and new_lv:
+                    old_pos["grid_slot_id"] = conv["to_slot"]
+                    old_pos["tp_price"] = float(new_lv.get("tp_price") or 0.0)
+                    old_pos["sl_price"] = float(new_lv.get("sl_price") or old_pos.get("sl_price") or 0.0)
+                    old_pos["maker_tp_live"] = False
+                    self.active_grid_positions[new_gk] = old_pos
+                if cur_mode == "LIVE" and conv.get("cancel_maker_tp_order_id"):
+                    self._spawn_task(
+                        self.executor.cancel_slot_protective_orders(
+                            sym, old_gk, exchange_cfg=follower_ex, cancel_tp=True, cancel_sl=False
+                        )
+                    )
+            self._save_open_strategy_state()
+
+        # Post-cycle flat reconciliation & residual cleanup (REVERSE_GRID restart gate)
+        if tracker.needs_post_cycle_flat_reconcile():
+            if cur_mode != "LIVE":
+                tracker.mark_reconcile_verified_clean()
+            else:
+                if not hasattr(self, "_flat_reconcile_inflight"):
+                    self._flat_reconcile_inflight: set[str] = set()
+                    self._flat_reconcile_retry_until: Dict[str, float] = {}
+                now_rec_m = mono_ms()
+                if sym not in self._flat_reconcile_inflight and now_rec_m >= self._flat_reconcile_retry_until.get(sym, 0.0):
+                    self._flat_reconcile_inflight.add(sym)
+                    self._spawn_task(self._run_symbol_flat_reconcile(cfg, tracker, cur_mode))
+
         # Keep live trailing stop & solo/grid SL step-ups synchronized on active_grid_positions immediately after evaluate_tick
         if tracker.active_grid_mode in ("TREND_BREAKOUT", "REVERSE_OSCILLATING", "MEAN_REVERSION"):
             amend_slots: List[str] = []
@@ -2809,12 +2845,16 @@ class BidirectionalSniperEngine:
                 gk = f"{sym}:{slot_id}"
                 self._uncertain_grid_notional.pop(gk, None)
 
-                # Place real OKX Maker Post-Only TP limit order (Mean-Reversion) + Conditional SL algo (Trend / non-PO)
+                # Place real OKX Maker Post-Only TP limit order (slot-aware) + Conditional SL algo
                 sl_breached_on_place = False
                 if exec_mode == "LIVE" and not self.risk_config.kill_switch_active:
-                    slot_tp_px = float(lv.get("tp_price") or 0.0)
+                    slot_tp_px = (
+                        float(lv.get("tp_price") or 0.0)
+                        if tracker.should_place_maker_tp_for_slot(slot_id, cfg)
+                        else 0.0
+                    )
                     slot_sl_px = float(lv.get("sl_price") or 0.0)
-                    if (cfg.use_post_only_tp and slot_tp_px > 0) or slot_sl_px > 0:
+                    if (slot_tp_px > 0) or slot_sl_px > 0:
                         await self.executor.place_protective_orders(
                             cfg=cfg,
                             side=side,
@@ -2869,8 +2909,8 @@ class BidirectionalSniperEngine:
                                     user_id=self.user_id,
                                 )
 
-                    # If Livermore floating-profit protection raised earlier slots' SL, atomically amend live OKX SL algos!
-                    if tracker.uses_livermore_sl_amend() and prev_sl_map:
+                    # If Livermore or REVERSE_GRID group trailing raised earlier slots' SL, atomically amend live OKX SL algos!
+                    if (tracker.uses_livermore_sl_amend() or tracker.active_grid_mode == "REVERSE_OSCILLATING") and prev_sl_map:
                         for prev_sid, old_sl in prev_sl_map.items():
                             prev_lv = tracker.levels.get(prev_sid)
                             if not prev_lv or prev_lv.get("status") != "OPEN":
@@ -3092,6 +3132,51 @@ class BidirectionalSniperEngine:
         except Exception:
             pass
 
+    async def _run_symbol_flat_reconcile(
+        self,
+        cfg: SymbolStrategy,
+        tracker: LongShortGridTracker,
+        exec_mode: str,
+    ):
+        """
+        Post-cycle exchange flat reconciliation & residual cleanup for REVERSE_GRID:
+        confirms exchange has 0 positions and 0 pending orders before unlocking restart cooldown;
+        if any residual exists, cancels all orders, market-closes residual, and re-verifies zero.
+        """
+        sym = cfg.symbol
+        _, follower_ex = self.get_leader_And_follower_cfg()
+        try:
+            async with self._get_symbol_exec_lock(sym):
+                if not tracker.needs_post_cycle_flat_reconcile():
+                    return
+                res = await self.executor.reconcile_and_cleanup_symbol_flat(sym, follower_ex)
+                if res.get("is_flat"):
+                    tracker.mark_reconcile_verified_clean()
+                    self.exchange_live_positions.pop(f"{sym}:LONG", None)
+                    self.exchange_live_positions.pop(f"{sym}:SHORT", None)
+                    lvl = "WARN" if res.get("cleaned") else "INFO"
+                    self.append_log(
+                        lvl,
+                        sym,
+                        f"[多空震荡对账清零] {sym} {res.get('message', '交易所持仓与挂单均为 0')}，已解锁冷却重锚",
+                        mode=exec_mode,
+                    )
+                    self._save_open_strategy_state()
+                else:
+                    self._flat_reconcile_retry_until[sym] = mono_ms() + 15_000.0
+                    self.append_log(
+                        "WARN",
+                        sym,
+                        f"[多空震荡残仓复查] {sym} {res.get('message', '对账未清零')}，15秒后重试对账（未清零前暂停重锚）",
+                        mode=exec_mode,
+                    )
+        except Exception as e:
+            self._flat_reconcile_retry_until[sym] = mono_ms() + 15_000.0
+            self.append_log("WARN", sym, f"[多空震荡对账异常] {sym} {type(e).__name__}: {str(e)[:100]}", mode=exec_mode)
+        finally:
+            if hasattr(self, "_flat_reconcile_inflight"):
+                self._flat_reconcile_inflight.discard(sym)
+
     def _finalize_grid_slot_trade(
         self,
         cfg: SymbolStrategy,
@@ -3183,6 +3268,16 @@ class BidirectionalSniperEngine:
         tracker.mark_exited(slot_id, net_pnl, is_sl=("SL" in str(exit_reason)))
         self.active_grid_positions.pop(gk, None)
         self._uncertain_grid_notional.pop(gk, None)
+        if tracker.needs_post_cycle_flat_reconcile():
+            if exec_mode != "LIVE":
+                tracker.mark_reconcile_verified_clean()
+            else:
+                if not hasattr(self, "_flat_reconcile_inflight"):
+                    self._flat_reconcile_inflight: set[str] = set()
+                    self._flat_reconcile_retry_until: Dict[str, float] = {}
+                if sym not in self._flat_reconcile_inflight:
+                    self._flat_reconcile_inflight.add(sym)
+                    self._spawn_task(self._run_symbol_flat_reconcile(cfg, tracker, exec_mode))
         has_more_side = any(
             slv.get("side") == side and slv.get("status") in ("OPEN", "ENTERING", "EXITING")
             for slv in tracker.levels.values()
