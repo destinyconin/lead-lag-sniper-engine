@@ -485,12 +485,14 @@ class AdaptiveVcpGridStrategy(BaseGridStrategy):
         exits: List[dict] = []
         step_now = max(0.0001, float(cfg.grid_step_pct))
         trail_ratio = max(0.0005, float(cfg.trend_trailing_mult) * step_now)
-        half_lock_move = max(0.45 * step_now, round_trip_fee + 0.0020)
-        solo_lock_move = max(0.80 * step_now, round_trip_fee + 0.0035)
+        be_slip_buf = max(0.0016, step_now * 0.20)
+        sl_room_buf = max(0.0025, step_now * 0.30)
+        pyramid_profit_lock_move = max(0.45 * step_now, round_trip_fee + 0.0020)
+        solo_half_lock_move = max(0.65 * step_now, round_trip_fee + 0.0030)
+        solo_half_sl_dist = max(0.0045, 0.70 * step_now)
+        solo_lock_move = max(0.85 * step_now, round_trip_fee + be_slip_buf + sl_room_buf + 0.0015)
         profit_floor_trigger = max(0.55 * step_now, 0.0040)
         pyramid_clear_move = max(0.30 * step_now, round_trip_fee + 0.0010)
-        be_slip_buf = 0.0006
-        sl_room_buf = max(0.0025, step_now * 0.30)
         max_l1_sl_dist = min(
             float(cfg.grid_stop_loss_pct),
             max(float(cfg.trend_dead_zone_mult) * step_now * 1.30, step_now * 2.55, 0.012),
@@ -520,7 +522,7 @@ class AdaptiveVcpGridStrategy(BaseGridStrategy):
                 and self.long_peak_price >= max_entry_l * (1.0 + pyramid_clear_move)
             ):
                 profit_lock_l = round(vwap_be_l + 0.25 * (self.long_peak_price - vwap_be_l), prec)
-                if self.long_peak_price >= max_entry_l * (1.0 + half_lock_move):
+                if self.long_peak_price >= max_entry_l * (1.0 + pyramid_profit_lock_move):
                     profit_lock_l = max(profit_lock_l, round(max_entry_l * (1.0 + round_trip_fee * 0.5), prec))
                 long_trail_px = max(raw_trail_l, profit_lock_l)
             else:
@@ -535,8 +537,8 @@ class AdaptiveVcpGridStrategy(BaseGridStrategy):
                     target_sl_l = round(e_entry * max(0.05, 1.0 - max_l1_sl_dist), prec)
                     if self.long_peak_price >= e_entry * (1.0 + solo_lock_move):
                         target_sl_l = max(target_sl_l, round(e_entry * (1.0 + round_trip_fee + be_slip_buf), prec))
-                    elif self.long_peak_price >= e_entry * (1.0 + half_lock_move):
-                        target_sl_l = max(target_sl_l, round(e_entry * max(0.05, 1.0 - 0.50 * step_now), prec))
+                    elif self.long_peak_price >= e_entry * (1.0 + solo_half_lock_move):
+                        target_sl_l = max(target_sl_l, round(e_entry * max(0.05, 1.0 - solo_half_sl_dist), prec))
                     if cur_sl < target_sl_l - 1e-12 and bid >= target_sl_l * (1.0 + sl_room_buf):
                         lv["sl_price"] = target_sl_l
                         lv["sl_needs_amend"] = True
@@ -619,7 +621,7 @@ class AdaptiveVcpGridStrategy(BaseGridStrategy):
                 and self.short_trough_price <= min_entry_s * max(0.05, 1.0 - pyramid_clear_move)
             ):
                 profit_lock_s = round(vwap_be_s - 0.25 * (vwap_be_s - self.short_trough_price), prec)
-                if self.short_trough_price <= min_entry_s * max(0.05, 1.0 - half_lock_move):
+                if self.short_trough_price <= min_entry_s * max(0.05, 1.0 - pyramid_profit_lock_move):
                     profit_lock_s = min(
                         profit_lock_s,
                         round(min_entry_s * max(0.05, 1.0 - round_trip_fee * 0.5), prec),
@@ -640,8 +642,8 @@ class AdaptiveVcpGridStrategy(BaseGridStrategy):
                             target_sl_s,
                             round(e_entry * max(0.05, 1.0 - round_trip_fee - be_slip_buf), prec),
                         )
-                    elif self.short_trough_price <= e_entry * max(0.05, 1.0 - half_lock_move):
-                        target_sl_s = min(target_sl_s, round(e_entry * (1.0 + 0.50 * step_now), prec))
+                    elif self.short_trough_price <= e_entry * max(0.05, 1.0 - solo_half_lock_move):
+                        target_sl_s = min(target_sl_s, round(e_entry * (1.0 + solo_half_sl_dist), prec))
                     if (cur_sl <= 0 or cur_sl > target_sl_s + 1e-12) and ask <= target_sl_s * max(0.05, 1.0 - sl_room_buf):
                         lv["sl_price"] = target_sl_s
                         lv["sl_needs_amend"] = True
@@ -1049,7 +1051,7 @@ class AdaptiveVcpGridStrategy(BaseGridStrategy):
         prec = self._calc_prec(cfg)
         step = max(0.0001, float(cfg.grid_step_pct))
         sl_buf = max(0.0035, step * 0.55)
-        be_slip_buf = 0.0006
+        be_slip_buf = max(0.0016, step * 0.20)
         tick_unit = 10.0 ** (-prec)
         sl_pct = float(cfg.grid_stop_loss_pct)
 
@@ -1061,7 +1063,7 @@ class AdaptiveVcpGridStrategy(BaseGridStrategy):
                 safe_cap_l = min(round(entry_price * max(0.05, 1.0 - sl_buf), prec), round(entry_price - tick_unit, prec))
                 if lvl_idx <= 1:
                     raw_sl = round(max(self.center_price, entry_price * max(0.05, 1.0 - sl_pct)), prec)
-                    lv["sl_price"] = min(raw_sl, safe_cap_l) if raw_sl >= entry_price else raw_sl
+                    lv["sl_price"] = min(raw_sl, safe_cap_l)
                 else:
                     prev_lv = self.levels.get(f"L{lvl_idx - 1}")
                     prev_anchor = (
@@ -1088,7 +1090,7 @@ class AdaptiveVcpGridStrategy(BaseGridStrategy):
                 safe_floor_s = max(round(entry_price * (1.0 + sl_buf), prec), round(entry_price + tick_unit, prec))
                 if lvl_idx <= 1:
                     raw_sl = round(min(self.center_price, entry_price * (1.0 + sl_pct)), prec)
-                    lv["sl_price"] = max(raw_sl, safe_floor_s) if raw_sl <= entry_price else raw_sl
+                    lv["sl_price"] = max(raw_sl, safe_floor_s)
                 else:
                     prev_lv = self.levels.get(f"S{lvl_idx - 1}")
                     prev_anchor = (

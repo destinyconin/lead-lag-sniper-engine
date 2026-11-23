@@ -3350,10 +3350,10 @@ def test_trend_solo_profit_lock_pyramid_sl_buffer_and_post_sl_cooldown():
     trk.mark_entry_filled("S1", 98.80, 0.15, 1.0, 0.15, cfg, round_trip_fee=0.0010)
     assert trk.levels["S1"]["sl_price"] == 100.00  # Initial false-breakout SL at center
 
-    # Price drops to 97.85 (favorable move = (98.80 - 97.86)/98.80 = 0.95% >= 0.92%) -> S1 auto-locks breakeven SL!
+    # Price drops to 97.85 (favorable move = (98.80 - 97.86)/98.80 = 0.95% >= 0.85%*0.8%) -> S1 auto-locks breakeven SL!
     _, ex_hold = trk.evaluate_tick(97.84, 97.86, 97.85, cfg, is_net_mode=False, round_trip_fee=0.0010)
     assert ex_hold == []
-    expected_be_s1 = round(98.80 * (1.0 - 0.0010 - 0.0006), 2)  # 98.64 (covers 0.10% fee + 0.06% slippage!)
+    expected_be_s1 = round(98.80 * (1.0 - 0.0010 - 0.0016), 2)  # 98.54 (covers 0.10% fee + 0.16% real OKX SL slippage!)
     assert trk.levels["S1"]["sl_price"] == expected_be_s1
     assert trk.levels["S1"].get("sl_needs_amend") is True
 
@@ -3863,8 +3863,8 @@ def test_five_strategy_audit_payoff_asymmetry_fixes_and_idempotency():
 
     _, ex_half = trk.evaluate_tick(101.55, 101.57, 101.56, cfg, is_net_mode=True, round_trip_fee=0.0010)
     assert ex_half == []
-    # Half-risk step-up tightened L1 SL from 100.00 (-0.99%) to 101.00 * (1 - 0.004) = 100.60 (-0.40%)!
-    assert trk.levels["L1"]["sl_price"] == round(101.00 * (1.0 - 0.50 * 0.008), 2)
+    # Half-risk step-up tightened L1 SL from 100.00 (-0.99%) to 101.00 * (1 - 0.70*0.008) = 100.43 (-0.56%, preserving breathing room)!
+    assert trk.levels["L1"]["sl_price"] == round(101.00 * (1.0 - max(0.0045, 0.70 * 0.008)), 2)
     # Solo L1 trail stop stays at raw_trail (101.55 * (1 - 0.01) = 100.53), NOT choked at +0.34% (101.35)!
     assert trk.long_trail_stop_price == round(101.55 * (1.0 - 0.01), 2)
     _, ex_no_crumb = trk.evaluate_tick(101.30, 101.32, 101.31, cfg, is_net_mode=True, round_trip_fee=0.0010)
@@ -4721,6 +4721,455 @@ def test_isolated_grid_strategy_modules_and_zero_cross_impact():
     assert tr_only.get_cond_sl_exit_reason({"side": "LONG", "entry_price": 100.0, "sl_price": 98.0}) == "TREND_SL"
     tr_only.reset_runtime_state()
     assert tr_only.center_price == 0.0 and tr_only.levels == {} and tr_only._last_sig_params is None
+
+
+def test_audit_p0_p1_trading_and_execution_fixes(tmp_path):
+    """
+    Regression suite for all P0/P1 loss-causing bugs discovered during the full-system audit:
+    1) TREND_GRID & ADAPTIVE_GRID L1/S1 initial SL always enforces minimum sl_buf floor even when center is close to entry.
+    2) Upgraded be_slip_buf (>= 0.16%) and relaxed solo_half_lock_move prevent micro-noise whipsaw & fee-bleed BE stops.
+    3) Persisted slots restored via restore_state keep recovered=False so periodic sync never overwrites exact entry/contracts.
+    4) cancel_slot_protective_orders verifies/retries SL cancel even when tp_fully_filled=True.
+    5) execute_exit_with_retry refuses blind net_mode close-position when GET /account/positions fails (pos_ok=False).
+    6) sync_live_exchange_positions preserves vanished slot when reconcile_uncertain=True instead of wiping PnL.
+    7) _handle_okx_private_algo_event handles partial SL fill without wiping remaining contracts & escalates canceled child SL.
+    8) _amend_live_slot_sl old_triggered cancels live Maker TP and logs strategy-specific exit_reason (GRID_SL for REVERSE_GRID).
+    9) _run_grid_exits_batch deducts partial market-exit fills across multi-slot batches on UNCERTAIN & preserves live flags on exception.
+    10) _run_state_machine locks to EXIT_UNCERTAIN instead of IDLE when an exception interrupts an open LIVE LEAD_LAG position.
+    11) MathEngine._compute_depth_aware_qty outputs base-coin units regardless of cfg.contract_size.
+    """
+    import asyncio
+    from backend.database import AsyncDatabaseManager
+    from backend.executor import ExecutionAdapter, OrderResult
+    from backend.grid_engine import LongShortGridTracker
+    from backend.math_engine import SignalCandidate, SymbolMathState, mono_ms, wall_ms
+    from backend.models import GlobalRiskConfig, SniperState, SymbolStrategy
+    from backend.sniper_engine import BidirectionalSniperEngine
+
+    # 1) & 2) TREND_GRID & ADAPTIVE_GRID L1/S1 sl_buf floor + relaxed solo half-lock + upgraded be_slip_buf
+    for stype in ("TREND_GRID", "ADAPTIVE_GRID"):
+        cfg = SymbolStrategy(
+            symbol="NVDA/USDT:USDT",
+            strategy_type=stype,
+            grid_side_mode="LONG_SHORT",
+            grid_levels=3,
+            grid_step_pct=0.006,
+            grid_range_pct=0.035,
+            grid_stop_loss_pct=0.038,
+            order_usdt=15.0,
+            leverage=5,
+            price_precision=2,
+            qty_precision=2,
+            trend_dead_zone_mult=1.25,
+            trend_trailing_mult=1.25,
+            trend_use_bb_breakout=False,
+        )
+        trk = LongShortGridTracker("NVDA/USDT:USDT", strategy_type=stype)
+        # Force TREND_BREAKOUT for ADAPTIVE_GRID too
+        bbw_trend = {
+            "timeframe": "15m",
+            "bbw_pct": 1.2,
+            "bbw_percentile": 10.0,
+            "bb_upper": 101.0,
+            "bb_middle": 100.0,
+            "bb_lower": 99.0,
+            "trend_bias": "RANGE",
+        }
+        trk.sync_config(cfg, current_mid=133.00, bbw_info=bbw_trend)
+        # Suppose S1 fills with favorable slippage at 132.90 (only 0.075% from center=133.00, well inside sl_buf=0.35%!)
+        trk.mark_entry_filled("S1", 132.90, 0.10, 1.0, 0.10, cfg, round_trip_fee=0.0010)
+        min_safe_sl_s = round(132.90 * (1.0 + max(0.0035, 0.006 * 0.55)), 2)
+        assert trk.levels["S1"]["sl_price"] >= min_safe_sl_s, f"{stype} S1 SL bypassed sl_buf floor!"
+
+        # Tiny +0.32% favorable move (132.90 -> 132.47) MUST NOT slam solo S1 SL to -0.30% whipsaw!
+        orig_sl = trk.levels["S1"]["sl_price"]
+        trk.evaluate_tick(132.46, 132.47, 132.465, cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=bbw_trend)
+        assert trk.levels["S1"]["sl_price"] == orig_sl
+
+        # Meaningful +0.90% favorable move (132.90 -> 131.70) locks BE with >= 0.16% slippage buffer on top of 0.10% fee
+        trk.evaluate_tick(131.69, 131.70, 131.695, cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=bbw_trend)
+        expected_be = round(132.90 * (1.0 - 0.0010 - max(0.0016, 0.006 * 0.20)), 2)
+        assert trk.levels["S1"]["sl_price"] == expected_be
+
+        # Symmetric check on LONG L1 when entry fills close to center
+        trk_l = LongShortGridTracker("NVDA/USDT:USDT", strategy_type=stype)
+        trk_l.sync_config(cfg, current_mid=133.00, bbw_info=bbw_trend)
+        trk_l.mark_entry_filled("L1", 133.10, 0.10, 1.0, 0.10, cfg, round_trip_fee=0.0010)
+        max_safe_sl_l = round(133.10 * (1.0 - max(0.0035, 0.006 * 0.55)), 2)
+        assert trk_l.levels["L1"]["sl_price"] <= max_safe_sl_l, f"{stype} L1 SL bypassed sl_buf floor!"
+
+    # 3) restore_state preserves exact entry_price/contracts with recovered=False, restored_from_state=True
+    rev_cfg = SymbolStrategy(
+        symbol="SOL/USDT:USDT",
+        strategy_type="REVERSE_GRID",
+        grid_levels=3,
+        grid_step_pct=0.006,
+        grid_take_profit_pct=0.0065,
+        grid_range_pct=0.035,
+        grid_stop_loss_pct=0.038,
+        price_precision=2,
+        qty_precision=2,
+    )
+    trk_r = LongShortGridTracker("SOL/USDT:USDT", strategy_type="REVERSE_GRID")
+    trk_r.sync_config(rev_cfg, current_mid=100.0)
+    trk_r.mark_entry_filled("L1", 100.60, 1.0, 2.0, 0.5, rev_cfg, round_trip_fee=0.0007)
+    exported = trk_r.export_state()
+    trk_r2 = LongShortGridTracker("SOL/USDT:USDT", strategy_type="REVERSE_GRID")
+    trk_r2.restore_state(exported, rev_cfg)
+    assert trk_r2.levels["L1"]["recovered"] is True
+    assert trk_r2.levels["L1"]["restored_from_state"] is True
+    assert trk_r2.levels["L1"]["entry_price"] == 100.60
+    assert trk_r2.levels["L1"]["contracts"] == 2.0
+
+    # 11) SymbolMathState._compute_depth_aware_qty outputs base-coin qty even if contract_size != 1.0
+    ll_cfg = SymbolStrategy(
+        symbol="ETH/USDT:USDT",
+        strategy_type="LEAD_LAG",
+        order_usdt=200.0,
+        contract_size=10.0,
+        qty_precision=4,
+        price_precision=2,
+    )
+    assert SymbolMathState._compute_depth_aware_qty(ll_cfg, 2000.0, 5.0) == 0.1
+
+    async def _run_async_checks():
+        db = AsyncDatabaseManager(str(tmp_path / "audit_fixes.db"))
+        db.init_sync()
+        eng = BidirectionalSniperEngine(db=db, user_id=99, is_guest_preview=False)
+        eng.risk_config = GlobalRiskConfig(trading_mode="LIVE")
+        eng.exchanges["okx"] = {
+            "exchange_id": "okx",
+            "display_name": "OKX Swap",
+            "role": "follower",
+            "is_active": 1,
+            "auth_status": "VERIFIED",
+            "api_key": "k",
+            "_decrypted_secret": "s",
+            "_decrypted_passphrase": "p",
+            "taker_fee": 0.0005,
+            "maker_fee": 0.0002,
+        }
+
+        # 4) cancel_slot_protective_orders verifies & retries SL cancel even when tp_fully_filled=True
+        ex = ExecutionAdapter(lambda s: eng.math_states.get(s), lambda: eng.risk_config)
+        slot_k = "SOL/USDT:USDT:L1"
+        ex._active_maker_tp_orders[slot_k] = {
+            "symbol": "SOL/USDT:USDT",
+            "order_id": "tp-1",
+            "is_live": True,
+            "side": "LONG",
+            "contracts": 1.0,
+            "ct_val": 1.0,
+            "tp_price": 101.0,
+            "exchange_cfg": eng.exchanges["okx"],
+        }
+        ex._active_cond_sl_orders[slot_k] = {
+            "symbol": "SOL/USDT:USDT",
+            "order_id": "sl-1",
+            "is_live": True,
+            "side": "LONG",
+            "contracts": 1.0,
+            "ct_val": 1.0,
+            "sl_price": 98.0,
+            "exchange_cfg": eng.exchanges["okx"],
+        }
+        cancel_algo_calls = {"n": 0}
+
+        async def _fake_okx_req(client, creds, method, path, body=None):
+            if path == "/api/v5/trade/cancel-order":
+                return {"code": "1", "data": [{"sCode": "51400"}]}
+            if path.startswith("/api/v5/trade/order"):
+                return {"code": "0", "data": [{"state": "filled", "accFillSz": "1", "avgPx": "101.0", "fee": "-0.02"}]}
+            if path == "/api/v5/trade/cancel-algos":
+                cancel_algo_calls["n"] += 1
+                # First cancel fails transiently, retry succeeds!
+                if cancel_algo_calls["n"] == 1:
+                    return {"code": "50011", "data": []}
+                return {"code": "0", "data": [{"sCode": "0"}]}
+            return {"code": "0", "data": []}
+
+        async def _fake_q_ord(sym, oid, ex_cfg):
+            return {"ok": True, "state": "filled", "acc_fill_ct": 1.0, "avg_px": 101.0, "fee_usdt": 0.02}
+
+        async def _fake_q_algo(sym, aid, ex_cfg):
+            return {"ok": False, "state": ""}
+
+        ex._okx_request = _fake_okx_req
+        ex.query_order_final_status = _fake_q_ord
+        ex.query_algo_final_status = _fake_q_algo
+        c_res = await ex.cancel_slot_protective_orders(
+            "SOL/USDT:USDT", slot_k, exchange_cfg=eng.exchanges["okx"], cancel_tp=True, cancel_sl=True, expected_contracts=1.0
+        )
+        assert c_res["tp_fully_filled"] is True
+        assert cancel_algo_calls["n"] == 2
+        assert slot_k not in ex._active_cond_sl_orders
+
+        # 5) execute_exit_with_retry in net_mode MUST NOT fire blind close-position when pos query fails (pos_ok=False)
+        ex2 = ExecutionAdapter(lambda s: eng.math_states.get(s), lambda: eng.risk_config)
+        close_pos_called = {"called": False}
+
+        async def _fake_okx_req2(client, creds, method, path, body=None):
+            if path == "/api/v5/trade/close-position":
+                close_pos_called["called"] = True
+                return {"code": "0", "data": [{}]}
+            if path.startswith("/api/v5/account/positions"):
+                return {"code": "50011", "msg": "rate limit", "data": []}
+            if path == "/api/v5/trade/order":
+                return {"code": "50011", "msg": "rate limit", "data": []}
+            return {"code": "0", "data": []}
+
+        async def _fake_meta(client, creds):
+            return {"posMode": "net_mode", "acctLv": "2"}
+
+        ex2._okx_request = _fake_okx_req2
+        ex2.ensure_okx_account_meta = _fake_meta
+        out_exit = await ex2.execute_exit_with_retry(
+            cfg=rev_cfg,
+            side="LONG",
+            qty=1.0,
+            exit_reason="GRID_SL",
+            tp_price=100.0,
+            max_retries=1,
+            exchange_cfg=eng.exchanges["okx"],
+            contracts=1.0,
+            ct_val=1.0,
+            allow_close_position_fallback=True,
+        )
+        assert out_exit.status == "UNCERTAIN"
+        assert close_pos_called["called"] is False
+
+        # 6) sync_live_exchange_positions preserves vanished slot when reconcile_uncertain=True (and doesn't overwrite persisted slot)
+        eng.strategies["SOL/USDT:USDT"] = rev_cfg
+        eng.grid_trackers["SOL/USDT:USDT"] = trk_r2
+        eng.active_grid_positions["SOL/USDT:USDT:L1"] = {
+            "symbol": "SOL/USDT:USDT",
+            "strategy_type": "REVERSE_GRID",
+            "grid_slot_id": "L1",
+            "mode": "LIVE",
+            "side": "LONG",
+            "qty": 1.0,
+            "contracts": 2.0,
+            "ct_val": 0.5,
+            "entry_price": 100.60,
+            "opened_mono_ms": mono_ms() - 20_000.0,
+            "recovered": False,
+            "restored_from_state": True,
+        }
+
+        async def _fake_fetch_pos_live(_):
+            # Exchange transiently shows 4.0 ct at blended 101.20 -> persisted slot MUST NOT be overwritten!
+            return {
+                "ok": True,
+                "pos_mode": "net_mode",
+                "positions": [
+                    {
+                        "inst_id": "SOL-USDT-SWAP",
+                        "symbol": "SOL/USDT:USDT",
+                        "side": "LONG",
+                        "contracts": 4.0,
+                        "ct_val": 0.5,
+                        "qty": 2.0,
+                        "entry_price": 101.20,
+                        "mark_price": 101.00,
+                        "notional_usdt": 202.0,
+                        "margin_usdt": 40.4,
+                        "leverage": 5,
+                        "upl_usdt": -0.4,
+                        "mgn_mode": "cross",
+                    }
+                ],
+            }
+
+        async def _noop_poll():
+            return 0
+
+        eng.poll_grid_protective_orders = _noop_poll
+        eng.executor.fetch_live_positions = _fake_fetch_pos_live
+        await eng.sync_live_exchange_positions(trigger="periodic")
+        assert trk_r2.levels["L1"]["entry_price"] == 100.60
+        assert trk_r2.levels["L1"]["contracts"] == 2.0
+
+        # Now OKX shows vanished position, but cancel_slot_protective_orders returns reconcile_uncertain=True -> slot preserved!
+        async def _fake_fetch_empty(_):
+            return {"ok": True, "pos_mode": "net_mode", "positions": []}
+
+        async def _fake_cancel_uncertain(*args, **kwargs):
+            return {
+                "tp_fully_filled": False,
+                "sl_already_filled": False,
+                "reconcile_uncertain": True,
+                "tp_filled_ct": 0.0,
+                "tp_avg_px": 0.0,
+                "tp_order_id": "",
+                "tp_fee_usdt": 0.0,
+                "sl_avg_px": 0.0,
+                "sl_order_id": "",
+                "sl_fee_usdt": 0.0,
+            }
+
+        eng.executor.fetch_live_positions = _fake_fetch_empty
+        eng.executor.cancel_slot_protective_orders = _fake_cancel_uncertain
+        await eng.sync_live_exchange_positions(trigger="periodic")
+        assert trk_r2.levels["L1"]["status"] == "OPEN"
+        assert "SOL/USDT:USDT:L1" in eng.active_grid_positions
+
+        # 7) _handle_okx_private_algo_event partial SL fill shrinks contracts instead of closing full slot
+        trk_r2.levels["L1"]["cond_sl_live"] = True
+        trk_r2.levels["L1"]["cond_sl_algo_id"] = "algo-part-1"
+
+        async def _fake_cancel_ok(*args, **kwargs):
+            return {"tp_fully_filled": False, "sl_already_filled": False, "reconcile_uncertain": False}
+
+        async def _fake_query_algo_partial(sym, aid, ex_cfg):
+            return {"ok": True, "state": "partially_effective", "child_state": "canceled", "acc_fill_ct": 0.5, "avg_px": 97.0, "fee_usdt": 0.01}
+
+        eng.executor.cancel_slot_protective_orders = _fake_cancel_ok
+        eng.executor.query_algo_final_status = _fake_query_algo_partial
+        await eng._handle_okx_private_algo_event({"algoId": "algo-part-1", "state": "partially_effective", "instId": "SOL-USDT-SWAP"})
+        assert trk_r2.levels["L1"]["status"] == "OPEN"
+        assert trk_r2.levels["L1"]["contracts"] == 1.5
+
+        # 8) _amend_live_slot_sl old_triggered cancels live Maker TP and logs GRID_SL (not TREND_BE_SL!) for REVERSE_GRID
+        trk_r2.levels["L1"]["maker_tp_live"] = True
+        trk_r2.levels["L1"]["maker_tp_order_id"] = "tp-live-9"
+        cancel_tp_called = {"called": False}
+
+        async def _fake_cancel_tp_spy(sym, gk, **kwargs):
+            if kwargs.get("cancel_tp"):
+                cancel_tp_called["called"] = True
+            return {"tp_fully_filled": False, "sl_already_filled": False, "reconcile_uncertain": False}
+
+        async def _fake_upd_sl_triggered(**kwargs):
+            return {"status": "old_triggered", "fill_info": {"avg_px": 96.8, "ord_id": "sl-trig-9", "fee_usdt": 0.05}}
+
+        eng.executor.cancel_slot_protective_orders = _fake_cancel_tp_spy
+        eng.executor.update_slot_sl_order = _fake_upd_sl_triggered
+        recorded_trades = []
+        orig_rec_trade = eng.db.record_trade_async
+        eng.db.record_trade_async = lambda tr, user_id=0: recorded_trades.append(tr)
+        await eng._amend_live_slot_sl(rev_cfg, trk_r2, "L1", "LIVE")
+        assert cancel_tp_called["called"] is True
+        assert recorded_trades and recorded_trades[-1]["exit_reason"] == "GRID_SL_L1"
+        eng.db.record_trade_async = orig_rec_trade
+
+        # 9) _run_grid_exits_batch deducts partial exit contracts across multi-slot batch on UNCERTAIN
+        trk_b = LongShortGridTracker("BTC/USDT:USDT", strategy_type="TREND_GRID")
+        btc_cfg = SymbolStrategy(symbol="BTC/USDT:USDT", strategy_type="TREND_GRID", grid_levels=3, grid_step_pct=0.008, price_precision=1, qty_precision=3)
+        eng.strategies["BTC/USDT:USDT"] = btc_cfg
+        eng.grid_trackers["BTC/USDT:USDT"] = trk_b
+        trk_b.sync_config(btc_cfg, current_mid=100000.0)
+        trk_b.mark_entry_filled("L1", 101000.0, 0.02, 2.0, 0.01, btc_cfg, 0.001)
+        trk_b.mark_entry_filled("L2", 101800.0, 0.02, 2.0, 0.01, btc_cfg, 0.001)
+        trk_b.levels["L1"]["status"] = "EXITING"
+        trk_b.levels["L2"]["status"] = "EXITING"
+        eng.active_grid_positions["BTC/USDT:USDT:L1"] = {"symbol": "BTC/USDT:USDT", "contracts": 2.0, "qty": 0.02, "mode": "LIVE", "side": "LONG"}
+        eng.active_grid_positions["BTC/USDT:USDT:L2"] = {"symbol": "BTC/USDT:USDT", "contracts": 2.0, "qty": 0.02, "mode": "LIVE", "side": "LONG"}
+
+        async def _fake_cancel_clean(*args, **kwargs):
+            return {
+                "tp_fully_filled": False,
+                "sl_already_filled": False,
+                "reconcile_uncertain": False,
+                "tp_filled_ct": 0.0,
+                "tp_avg_px": 0.0,
+                "tp_order_id": "",
+                "tp_fee_usdt": 0.0,
+                "sl_avg_px": 0.0,
+                "sl_order_id": "",
+                "sl_fee_usdt": 0.0,
+            }
+
+        async def _fake_exit_partial_uncertain(**kwargs):
+            # Closed 2.5 out of 4.0 contracts across L1(2.0)+L2(2.0) before returning UNCERTAIN!
+            return OrderResult(
+                order_id="part-u-1",
+                status="UNCERTAIN",
+                filled_qty=0.025,
+                avg_price=102500.0,
+                latency_ms=10.0,
+                is_maker=False,
+                raw_msg="partial uncertain",
+                contracts=2.5,
+                ct_val=0.01,
+            )
+
+        eng.executor.cancel_slot_protective_orders = _fake_cancel_clean
+        eng.executor.execute_exit_with_retry = _fake_exit_partial_uncertain
+        await eng._run_grid_exits_batch(
+            btc_cfg,
+            trk_b,
+            [{**trk_b.levels["L1"], "exit_reason": "TREND_TRAIL_TP"}, {**trk_b.levels["L2"], "exit_reason": "TREND_TRAIL_TP"}],
+            "LIVE",
+        )
+        # L1 (2.0 ct) is completely closed & settled (IDLE); L2 shrunk from 2.0 ct to 1.5 ct (OPEN)!
+        assert trk_b.levels["L1"]["status"] == "IDLE"
+        assert trk_b.levels["L2"]["status"] == "OPEN"
+        assert trk_b.levels["L2"]["contracts"] == 1.5
+        assert eng.active_grid_positions["BTC/USDT:USDT:L2"]["contracts"] == 1.5
+
+        # 10) _run_state_machine locks to EXIT_UNCERTAIN if unexpected exception occurs while LIVE position is open
+        eng.strategies["ETH/USDT:USDT"] = ll_cfg
+        eng.math_states["ETH/USDT:USDT"] = SymbolMathState("ETH/USDT:USDT")
+        eng.book_events["ETH/USDT:USDT"] = asyncio.Event()
+        eng.symbol_states["ETH/USDT:USDT"] = SniperState.SIGNALED
+        sync_triggers = []
+
+        async def _spy_sync(trigger="manual"):
+            sync_triggers.append(trigger)
+            return {"ok": True, "synced_count": 0, "recovered_count": 0}
+
+        async def _fake_ll_entry(**kwargs):
+            return OrderResult(
+                order_id="ll-1",
+                status="FILLED",
+                filled_qty=0.1,
+                avg_price=2000.0,
+                latency_ms=5.0,
+                is_maker=False,
+                raw_msg="filled",
+                contracts=1.0,
+                ct_val=0.1,
+            )
+
+        async def _boom_protective(*args, **kwargs):
+            raise RuntimeError("simulated protective crash after fill")
+
+        eng.sync_live_exchange_positions = _spy_sync
+        eng.executor.place_entry_ioc = _fake_ll_entry
+        eng.executor.place_protective_orders = _boom_protective
+        sig = SignalCandidate(
+            symbol="ETH/USDT:USDT",
+            side="LONG",
+            signal_mono_ms=mono_ms(),
+            signal_wall_ms=wall_ms(),
+            leader_jump_pct=0.008,
+            micro_jump_pct=0.008,
+            z_score=4.0,
+            follower_lag_pct=0.0002,
+            proportional_basis=0.0,
+            calibrated_target_price=2016.0,
+            raw_spread_pct=0.007,
+            follower_spread_pct=0.0002,
+            expected_cost_pct=0.001,
+            expected_net_pct=0.006,
+            reservation_price=2001.0,
+            trigger_price=2000.0,
+            recommended_qty=0.1,
+            beta_used=0.9,
+            active_vol_usdt=10000.0,
+            leader_mid=2016.0,
+            follower_mid=2000.0,
+        )
+        try:
+            await eng._run_state_machine(ll_cfg, sig, "LIVE")
+        except RuntimeError:
+            pass
+        assert eng.symbol_states["ETH/USDT:USDT"] == SniperState.EXIT_UNCERTAIN
+        await asyncio.sleep(0.02)
+        assert "state_machine_error" in sync_triggers
+
+    asyncio.run(_run_async_checks())
+
 
 
 

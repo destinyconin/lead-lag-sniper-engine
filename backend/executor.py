@@ -2641,8 +2641,9 @@ class ExecutionAdapter:
 
                     if sl_canceled_ok:
                         self._active_cond_sl_orders.pop(slot_key, None)
-                    elif not res["tp_fully_filled"]:
-                        # Retry history check briefly to absorb OKX orders-algo-history eventual consistency lag!
+                    else:
+                        # Always verify/reconcile conditional SL status even if Maker TP already filled,
+                        # so a failed cancel-algos NEVER leaves an orphaned live SL algo on OKX!
                         sl_resolved = False
                         for h_try in range(2):
                             hist = await self.query_algo_final_status(symbol, sl_algo_id, eff_ex)
@@ -2661,9 +2662,27 @@ class ExecutionAdapter:
                                     self._active_cond_sl_orders.pop(slot_key, None)
                                     sl_resolved = True
                                     break
+                            # Retry cancel-algos once if SL wasn't found in history (likely still live/transient error)
                             if h_try == 0:
+                                try:
+                                    c_retry = await self._okx_request(
+                                        client,
+                                        creds,
+                                        "POST",
+                                        "/api/v5/trade/cancel-algos",
+                                        [{"algoId": sl_algo_id, "instId": inst_id}],
+                                    )
+                                    c_rdata = c_retry.get("data", [])
+                                    if str(c_retry.get("code", "")) == "0" and (
+                                        not c_rdata or str(c_rdata[0].get("sCode", "0")) == "0"
+                                    ):
+                                        self._active_cond_sl_orders.pop(slot_key, None)
+                                        sl_resolved = True
+                                        break
+                                except Exception:
+                                    pass
                                 await asyncio.sleep(0.20)
-                        if not sl_resolved:
+                        if not sl_resolved and not res["tp_fully_filled"]:
                             res["reconcile_uncertain"] = True
         except Exception:
             if (cancel_tp and slot_key in self._active_maker_tp_orders) or (
@@ -2988,9 +3007,12 @@ class ExecutionAdapter:
                         )
 
                     # 4. Final fallback: ONLY invoke full-contract `close-position` when explicitly allowed & still open!
+                    # In net_mode (no posSide isolation), require verified open_sz > 0 (pos_ok=True) so a failed
+                    # position query never triggers blind close-position against an unknown/opposite direction!
                     cp_code = ""
                     cp_msg = ""
-                    if allow_close_position_fallback and not ambiguous_in_flight:
+                    safe_for_close_pos = (pos_mode == "long_short_mode") or (pos_ok and open_sz > 0.0)
+                    if allow_close_position_fallback and not ambiguous_in_flight and safe_for_close_pos:
                         cp_payload: Dict[str, Any] = {"instId": inst_id, "mgnMode": eff_mgn, "autoCxl": True}
                         if pos_mode == "long_short_mode":
                             cp_payload["posSide"] = "long" if side == "LONG" else "short"

@@ -530,7 +530,8 @@ class SymbolMathState:
         """
         if price <= 0:
             return 0.0
-        target_raw_qty = cfg.order_usdt / (price * cfg.contract_size)
+        # Output base-coin quantity (consistent with MarketGateway top_book_qty and Executor ctVal conversion)
+        target_raw_qty = cfg.order_usdt / price
         if top_book_qty > 0:
             depth_cap_qty = top_book_qty * 0.85
             if depth_cap_qty < cfg.min_qty:

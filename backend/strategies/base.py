@@ -320,10 +320,15 @@ class BaseGridStrategy:
             }
         lv = self.levels[sid]
         lv["status"] = "OPEN"
-        lv["recovered"] = True
-        lv["entry_price"] = float(slot.get("entry_price") or 0.0)
+        restored_entry = float(slot.get("entry_price") or 0.0)
+        restored_contracts = float(slot.get("contracts") or 0.0)
+        lv["entry_price"] = restored_entry
         lv["filled_qty"] = float(slot.get("filled_qty") or 0.0)
-        lv["contracts"] = float(slot.get("contracts") or 0.0)
+        lv["contracts"] = restored_contracts
+        lv["recovered"] = True
+        # Mark exact persisted slots so periodic OKX sync preserves per-slot entry_price/contracts
+        # instead of overwriting them with OKX's blended position avgPx!
+        lv["restored_from_state"] = bool(restored_entry > 0.0 and restored_contracts > 0.0)
         lv["ct_val"] = float(slot.get("ct_val") or 1.0)
         lv["mgn_mode"] = str(slot.get("mgn_mode") or "cross")
         lv["tp_price"] = float(slot.get("tp_price") or 0.0)

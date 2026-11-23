@@ -545,14 +545,36 @@ class BidirectionalSniperEngine:
             gk = f"{sym}:{matched_sid}"
             if st_a in ("effective", "partially_effective"):
                 ast = await self.executor.query_algo_final_status(sym, algo_id, follower_ex)
+                slot_ct = float(lv.get("contracts") or 0.0)
+                child_st = str(ast.get("child_state") or "") if ast.get("ok") else ""
                 acc_ct = float(ast.get("acc_fill_ct") or 0.0) if ast.get("ok") else float(row.get("actualSz") or 0.0)
                 avg_px = float(ast.get("avg_px") or 0.0) if ast.get("ok") else float(row.get("actualPx") or row.get("slTriggerPx") or 0.0)
                 fee_u = float(ast.get("fee_usdt") or 0.0) if ast.get("ok") else 0.0
                 if acc_ct > 0:
-                    await self.executor.cancel_slot_protective_orders(
+                    if slot_ct > 0 and acc_ct < slot_ct * 0.99 and child_st in ("live", "partially_filled"):
+                        # Child market/limit order still filling on OKX; wait for final fill event or poll
+                        return
+                    c_pair = await self.executor.cancel_slot_protective_orders(
                         sym, gk, exchange_cfg=follower_ex, cancel_tp=True, cancel_sl=False
                     )
+                    if c_pair.get("tp_fully_filled"):
+                        self.append_log("CRITICAL", sym, f"[双边保护冲突告警] {sym} [{matched_sid}] 条件止损成交同时 Maker TP 亦已成交，立即触发持仓对账", mode="LIVE")
+                        self._spawn_task(self.sync_live_exchange_positions(trigger="dual_fill_conflict"))
                     self.executor._active_cond_sl_orders.pop(gk, None)
+                    if slot_ct > 0 and acc_ct < slot_ct * 0.99:
+                        # Partial SL fill: shrink remaining open contracts instead of wiping the whole slot!
+                        rem_ct = max(0.0, float(Decimal(str(slot_ct)) - Decimal(str(acc_ct))))
+                        ct_v = float(lv.get("ct_val") or 1.0)
+                        lv["contracts"] = rem_ct
+                        lv["filled_qty"] = rem_ct * ct_v
+                        lv["cond_sl_live"] = False
+                        lv["cond_sl_algo_id"] = ""
+                        if gk in self.active_grid_positions:
+                            self.active_grid_positions[gk]["contracts"] = rem_ct
+                            self.active_grid_positions[gk]["qty"] = rem_ct * ct_v
+                            self.active_grid_positions[gk]["cond_sl_live"] = False
+                        self._save_open_strategy_state()
+                        return
                     e_px = float(lv.get("entry_price") or 0.0)
                     sl_reason = tracker.get_cond_sl_exit_reason(lv)
                     self._finalize_grid_slot_trade(
@@ -568,6 +590,14 @@ class BidirectionalSniperEngine:
                         actual_exit_fee_usdt=fee_u,
                     )
                     self._save_open_strategy_state()
+                elif st_a == "effective" and child_st in ("canceled", "mmp_canceled"):
+                    # Triggered SL child order was canceled with 0 fill -> immediately escalate to emergency market exit!
+                    lv["cond_sl_live"] = False
+                    lv["cond_sl_algo_id"] = ""
+                    self.executor._active_cond_sl_orders.pop(gk, None)
+                    lv["status"] = "EXITING"
+                    escalate_item = {**lv, "exit_reason": "GRID_SL_FAILOVER", "target_price": float(lv.get("sl_price") or lv.get("entry_price") or 0.0)}
+                    self.append_log("CRITICAL", sym, f"[条件止损失败兜底] {sym} [{matched_sid}] OKX 条件止损子单被撤({child_st})，立即切入紧急市价平仓！", mode="LIVE")
             elif st_a in ("order_failed", "partially_failed"):
                 # Exchange conditional SL failed (e.g., availPos frozen): IMMEDIATELY escalate to emergency software close!
                 lv["cond_sl_live"] = False
@@ -655,7 +685,8 @@ class BidirectionalSniperEngine:
                             "opened_mono_ms": mono_ms(),
                             "unrealized_net_pct": 0.0,
                             "unrealized_usdt": 0.0,
-                            "recovered": True,
+                            "recovered": bool(lv.get("recovered", False)),
+                            "restored_from_state": bool(lv.get("restored_from_state", True)),
                             "managed_by_strategy": True,
                         }
                         if cur_mode == "LIVE" and (lv.get("maker_tp_live") or lv.get("cond_sl_live")):
@@ -929,6 +960,7 @@ class BidirectionalSniperEngine:
         ev = self.book_events.get(sym)
         exit_reason = ""
         keep_uncertain = False
+        closed_confirmed = False
 
         try:
             while sym in self.active_positions and self.active_positions[sym].get("recovered"):
@@ -979,6 +1011,7 @@ class BidirectionalSniperEngine:
                 keep_uncertain = True
                 self.symbol_states[sym] = SniperState.EXIT_UNCERTAIN
                 self.append_log("CRITICAL", sym, f"[恢复持仓平仓告警] {sym} {exit_res.raw_msg}", mode="LIVE")
+                self._spawn_task(self.sync_live_exchange_positions(trigger="exit_uncertain"))
                 return
             exit_avg = exit_res.avg_price
             gross_pnl = (exit_avg - entry_avg) * filled_qty if side == "LONG" else (entry_avg - exit_avg) * filled_qty
@@ -1023,6 +1056,7 @@ class BidirectionalSniperEngine:
             )
             self._accumulate_trade_into_stats(trade_record, is_historical=False, mode_override="LIVE")
             self.exchange_live_positions.pop(f"{sym}:{side}", None)
+            closed_confirmed = True
             self.append_log(
                 "EXIT_WIN" if net_pnl >= 0 else "EXIT_LOSS",
                 sym,
@@ -1032,9 +1066,13 @@ class BidirectionalSniperEngine:
         except asyncio.CancelledError:
             pass
         except Exception as e:
+            if not closed_confirmed and self.active_positions.get(sym) is pos_entry:
+                keep_uncertain = True
+                self.symbol_states[sym] = SniperState.EXIT_UNCERTAIN
+                self._spawn_task(self.sync_live_exchange_positions(trigger="recovered_monitor_error"))
             self.append_log("CRITICAL", sym, f"[接管持仓监控异常] {sym} {type(e).__name__}: {str(e)[:120]}", mode="LIVE")
         finally:
-            if not keep_uncertain and self.active_positions.get(sym) is pos_entry:
+            if closed_confirmed and not keep_uncertain and self.active_positions.get(sym) is pos_entry:
                 self.active_positions.pop(sym, None)
                 self.symbol_states[sym] = SniperState.IDLE
 
@@ -1063,7 +1101,6 @@ class BidirectionalSniperEngine:
                 return {"ok": False, "error": res.get("error", "OKX持仓同步失败")}
 
             self._last_exchange_pos_sync_mono = mono_ms()
-            self._uncertain_grid_notional.clear()
             live_pos_mode = str(res.get("pos_mode") or "")
             if live_pos_mode in ("long_short_mode", "net_mode") and follower_ex.get("auth_status") == "VERIFIED":
                 cur_msg = str(follower_ex.get("auth_message") or "")
@@ -1091,6 +1128,7 @@ class BidirectionalSniperEngine:
             live_rows = res.get("positions", [])
             next_ex_map: Dict[str, Dict[str, Any]] = {}
             recovered_syms: List[str] = []
+            breached_recovery_exits: List[tuple[SymbolStrategy, LongShortGridTracker, dict]] = []
             state_changed = False
 
             for lp in live_rows:
@@ -1161,6 +1199,7 @@ class BidirectionalSniperEngine:
                             lv = tracker.levels[slot_id]
                             gk = f"{sym}:{slot_id}"
                             # Protect recovered grid position on OKX immediately if not under kill switch!
+                            sl_breached_on_recover = False
                             if not self.risk_config.kill_switch_active:
                                 slot_tp_px = float(lv.get("tp_price") or 0.0)
                                 slot_sl_px = float(lv.get("sl_price") or 0.0)
@@ -1182,6 +1221,7 @@ class BidirectionalSniperEngine:
                                     lv["maker_tp_live"] = pstat["tp_is_live"]
                                     lv["cond_sl_algo_id"] = pstat["sl_order_id"]
                                     lv["cond_sl_live"] = pstat["sl_is_live"]
+                                    sl_breached_on_recover = bool(pstat.get("sl_breached", False))
                             self.active_grid_positions[gk] = {
                                 "symbol": sym,
                                 "strategy_type": cfg.strategy_type,
@@ -1210,6 +1250,17 @@ class BidirectionalSniperEngine:
                                 "recovered": True,
                                 "managed_by_strategy": True,
                             }
+                            if sl_breached_on_recover and lv.get("status") == "OPEN":
+                                lv["status"] = "EXITING"
+                                breached_recovery_exits.append(
+                                    (cfg, tracker, {**lv, "exit_reason": "GRID_SL_BREACHED", "target_price": mark_px or entry_px})
+                                )
+                                self.append_log(
+                                    "CRITICAL",
+                                    sym,
+                                    f"[恢复持仓止损击穿] {sym} [{slot_id}] 接管挂止损时价格已穿破止损位，立即转入市价紧急止损",
+                                    mode="LIVE",
+                                )
                             recovered_syms.append(f"{sym}[{slot_id}]")
                             state_changed = True
                         else:
@@ -1223,7 +1274,7 @@ class BidirectionalSniperEngine:
                                     if len(matching_slots) == 1:
                                         gpos["unrealized_usdt"] = upl_usdt
                                         gpos["notional_usdt"] = lp["notional_usdt"]
-                                        if lv.get("recovered") or float(lv.get("entry_price") or 0.0) <= 0:
+                                        if (lv.get("recovered") and not lv.get("restored_from_state")) or float(lv.get("entry_price") or 0.0) <= 0:
                                             gpos["contracts"] = lp["contracts"]
                                             gpos["qty"] = lp["qty"]
                                             gpos["entry_price"] = entry_px
@@ -1304,7 +1355,9 @@ class BidirectionalSniperEngine:
                     async with self._get_symbol_exec_lock(sym):
                         lv = tracker.levels.get(slot_id)
                         age_ms = now_m - float(gpos.get("opened_mono_ms") or 0.0)
-                        if lv and lv.get("status") == "OPEN" and (gpos.get("recovered") or age_ms > 8000.0):
+                        if lv and lv.get("status") == "OPEN" and (
+                            gpos.get("recovered") or gpos.get("restored_from_state") or age_ms > 8000.0
+                        ):
                             # Synchronously check protective orders BEFORE wiping so filled TP/SL books PnL & updates risk breakers!
                             c_info = await self.executor.cancel_slot_protective_orders(
                                 sym,
@@ -1328,6 +1381,7 @@ class BidirectionalSniperEngine:
                                     exec_mode="LIVE",
                                     actual_exit_fee_usdt=float(c_info.get("tp_fee_usdt") or 0.0),
                                 )
+                                state_changed = True
                             elif cfg and c_info.get("sl_already_filled"):
                                 avg_px = float(c_info.get("sl_avg_px") or lv.get("sl_price") or lv.get("entry_price") or 0.0)
                                 self._finalize_grid_slot_trade(
@@ -1336,16 +1390,25 @@ class BidirectionalSniperEngine:
                                     lv=dict(lv),
                                     exit_avg=avg_px,
                                     is_maker=False,
-                                    exit_reason="GRID_SL",
+                                    exit_reason=tracker.get_cond_sl_exit_reason(lv),
                                     order_id=c_info.get("sl_order_id") or "cond-sl",
                                     latency_ms=0.0,
                                     exec_mode="LIVE",
                                     actual_exit_fee_usdt=float(c_info.get("sl_fee_usdt") or 0.0),
                                 )
+                                state_changed = True
+                            elif c_info.get("reconcile_uncertain"):
+                                # Never wipe slot PnL or orphan live protective orders when OKX query failed transiently!
+                                self.append_log(
+                                    "WARN",
+                                    sym,
+                                    f"[持仓对账延后] {sym} [{slot_id}] 保护单终态查询未决，保留槽位待下轮对账重试",
+                                    mode="LIVE",
+                                )
                             else:
                                 tracker.clear_external_exit(slot_id)
                                 self.active_grid_positions.pop(gk, None)
-                            state_changed = True
+                                state_changed = True
 
             for sym, ap in list(self.active_positions.items()):
                 if ap.get("mode") == "LIVE" and (
@@ -1385,6 +1448,15 @@ class BidirectionalSniperEngine:
                         )
 
             self.exchange_live_positions = next_ex_map
+            # Prune uncertain grid notional ONLY for slots no longer actively ENTERING/EXITING
+            for uk in list(self._uncertain_grid_notional.keys()):
+                u_sym, _, u_sid = uk.partition(":")
+                u_trk = self.grid_trackers.get(u_sym)
+                u_lv = u_trk.levels.get(u_sid) if u_trk else None
+                if not u_lv or u_lv.get("status") not in ("ENTERING", "EXITING"):
+                    self._uncertain_grid_notional.pop(uk, None)
+            for br_cfg, br_trk, br_item in breached_recovery_exits:
+                self._spawn_task(self._run_grid_exit(br_cfg, br_trk, br_item, "LIVE"))
             if state_changed:
                 self._save_open_strategy_state()
             if recovered_syms:
@@ -2843,6 +2915,12 @@ class BidirectionalSniperEngine:
                                     fi = upd.get("fill_info") or {}
                                     prev_lv["cond_sl_algo_id"] = ""
                                     prev_lv["cond_sl_live"] = False
+                                    if prev_lv.get("maker_tp_live"):
+                                        await self.executor.cancel_slot_protective_orders(
+                                            sym, f"{sym}:{prev_sid}", exchange_cfg=follower_ex, cancel_tp=True, cancel_sl=False
+                                        )
+                                        prev_lv["maker_tp_order_id"] = ""
+                                        prev_lv["maker_tp_live"] = False
                                     avg_px = float(fi.get("avg_px") or old_sl or prev_lv.get("entry_price") or 0.0)
                                     self._finalize_grid_slot_trade(
                                         cfg=cfg,
@@ -2850,7 +2928,7 @@ class BidirectionalSniperEngine:
                                         lv=dict(prev_lv),
                                         exit_avg=avg_px,
                                         is_maker=False,
-                                        exit_reason="TREND_BE_SL",
+                                        exit_reason=tracker.get_cond_sl_exit_reason(prev_lv),
                                         order_id=str(fi.get("ord_id") or "cond-sl"),
                                         latency_ms=0.0,
                                         exec_mode=exec_mode,
@@ -2984,6 +3062,12 @@ class BidirectionalSniperEngine:
                     fi = upd.get("fill_info") or {}
                     lv["cond_sl_algo_id"] = ""
                     lv["cond_sl_live"] = False
+                    if lv.get("maker_tp_live"):
+                        await self.executor.cancel_slot_protective_orders(
+                            sym, f"{sym}:{slot_id}", exchange_cfg=follower_ex, cancel_tp=True, cancel_sl=False
+                        )
+                        lv["maker_tp_order_id"] = ""
+                        lv["maker_tp_live"] = False
                     avg_px = float(fi.get("avg_px") or new_sl or lv.get("entry_price") or 0.0)
                     self._finalize_grid_slot_trade(
                         cfg=cfg,
@@ -2991,7 +3075,7 @@ class BidirectionalSniperEngine:
                         lv=dict(lv),
                         exit_avg=avg_px,
                         is_maker=False,
-                        exit_reason="TREND_BE_SL",
+                        exit_reason=tracker.get_cond_sl_exit_reason(lv),
                         order_id=str(fi.get("ord_id") or "cond-sl"),
                         latency_ms=0.0,
                         exec_mode=exec_mode,
@@ -3294,28 +3378,63 @@ class BidirectionalSniperEngine:
                     mgn_mode=eff_mgn,
                 )
                 if exit_res.status == "UNCERTAIN" and exec_mode == "LIVE":
+                    # Sequentially deduct any partial market-exit fill across ALL remaining slots (single or multi-slot batch!)
+                    # so retry NEVER over-closes already-closed contracts!
+                    rem_partial_exit_ct = Decimal(str(max(0.0, float(exit_res.contracts or 0.0))))
+                    still_open_sids: List[str] = []
                     for it in remaining_items:
                         sid = it["slot_id"]
+                        gk = f"{sym}:{sid}"
                         lv_ref = tracker.levels.get(sid)
+                        slot_rem_dec = Decimal(str(max(0.0, float(it.get("_rem_contracts") or 0.0))))
+                        deducted_dec = min(slot_rem_dec, rem_partial_exit_ct) if slot_rem_dec > 0 and rem_partial_exit_ct > 0 else Decimal("0")
+                        rem_partial_exit_ct -= deducted_dec
+                        rem_ct_after = float(max(Decimal("0"), slot_rem_dec - deducted_dec))
                         if lv_ref:
-                            lv_ref["maker_tp_order_id"] = ""
-                            lv_ref["maker_tp_live"] = False
-                            lv_ref["maker_tp_touched_mono"] = 0.0
-                            lv_ref["cond_sl_algo_id"] = ""
-                            lv_ref["cond_sl_live"] = False
-                            rem_ct_after = float(it.get("_rem_contracts") or 0.0)
-                            # Deduct any partial market-exit fill on single-slot exit so retry won't over-close
-                            if len(remaining_items) == 1 and float(exit_res.contracts or 0.0) > 0 and rem_ct_after > 0:
-                                rem_ct_after = float(
-                                    max(Decimal("0"), Decimal(str(rem_ct_after)) - Decimal(str(exit_res.contracts)))
-                                )
-                            if rem_ct_after > 0 and (
-                                float(it.get("_partial_maker_ct") or 0.0) > 0 or float(exit_res.contracts or 0.0) > 0
-                            ):
-                                slot_cv = float(it.get("ct_val") or ct_val or 1.0)
-                                lv_ref["contracts"] = rem_ct_after
-                                lv_ref["filled_qty"] = rem_ct_after * slot_cv
+                            if gk not in self.executor._active_maker_tp_orders:
+                                lv_ref["maker_tp_order_id"] = ""
+                                lv_ref["maker_tp_live"] = False
+                                lv_ref["maker_tp_touched_mono"] = 0.0
+                            if gk not in self.executor._active_cond_sl_orders:
+                                lv_ref["cond_sl_algo_id"] = ""
+                                lv_ref["cond_sl_live"] = False
+                        if slot_rem_dec > 0 and rem_ct_after <= 0.0 and deducted_dec > 0:
+                            # This slot was completely closed by the partial fill before UNCERTAIN -> settle truthfully!
+                            p_ct = float(it.get("_partial_maker_ct") or 0.0)
+                            d_ct = float(deducted_dec)
+                            exit_avg_part = float(exit_res.avg_price or it.get("target_price") or it.get("entry_price") or 0.0)
+                            if p_ct > 0 and float(it.get("_partial_maker_px") or 0.0) > 0:
+                                blend_px = (p_ct * float(it["_partial_maker_px"]) + d_ct * exit_avg_part) / (p_ct + d_ct)
+                                m_frac = p_ct / (p_ct + d_ct)
+                            else:
+                                blend_px = exit_avg_part
+                                m_frac = 0.0
+                            self._finalize_grid_slot_trade(
+                                cfg=cfg,
+                                tracker=tracker,
+                                lv=it,
+                                exit_avg=blend_px,
+                                is_maker=bool(m_frac >= 0.99),
+                                exit_reason=str(it.get("exit_reason") or primary_reason),
+                                order_id=f"{exit_res.order_id}-part",
+                                latency_ms=exit_res.latency_ms,
+                                exec_mode=exec_mode,
+                                maker_fraction=m_frac,
+                                actual_exit_fee_usdt=float(it.get("_partial_maker_fee") or 0.0),
+                            )
+                            any_settled = True
+                            continue
+                        if lv_ref and rem_ct_after > 0 and (
+                            float(it.get("_partial_maker_ct") or 0.0) > 0 or deducted_dec > 0
+                        ):
+                            slot_cv = float(it.get("ct_val") or ct_val or 1.0)
+                            lv_ref["contracts"] = rem_ct_after
+                            lv_ref["filled_qty"] = rem_ct_after * slot_cv
+                            if gk in self.active_grid_positions:
+                                self.active_grid_positions[gk]["contracts"] = rem_ct_after
+                                self.active_grid_positions[gk]["qty"] = rem_ct_after * slot_cv
                         tracker.revert_exit_failed(sid, backoff_ms=5000.0)
+                        still_open_sids.append(sid)
                     if not self.is_guest_preview:
                         self.db.record_risk_event_async(
                             "CRITICAL", "GRID_EXIT_UNCERTAIN", sym, exit_res.raw_msg, user_id=self.user_id
@@ -3323,11 +3442,11 @@ class BidirectionalSniperEngine:
                     self.append_log(
                         "CRITICAL",
                         sym,
-                        f"[网格平仓告警] {sym} [{','.join(sorted(it['slot_id'] for it in remaining_items))}] {exit_res.raw_msg}（5秒后重试并已触发对账）",
+                        f"[网格平仓告警] {sym} [{','.join(sorted(still_open_sids or [it['slot_id'] for it in remaining_items]))}] {exit_res.raw_msg}（5秒后重试并已触发对账）",
                         mode=exec_mode,
                     )
                     self._spawn_task(self.sync_live_exchange_positions(trigger="exit_uncertain"))
-                    if any_settled:
+                    if any_settled or float(exit_res.contracts or 0.0) > 0:
                         self._save_open_strategy_state()
                     return
 
@@ -3371,10 +3490,16 @@ class BidirectionalSniperEngine:
             revert_list = remaining_items if remaining_items is not None else exit_items
             for it in revert_list:
                 sid = it["slot_id"]
+                gk = f"{sym}:{sid}"
                 lv_ref = tracker.levels.get(sid)
                 if lv_ref and lv_ref.get("status") == "EXITING":
-                    lv_ref["maker_tp_live"] = False
-                    lv_ref["cond_sl_live"] = False
+                    # Only clear protective flags if executor actually removed them; never orphan live OKX orders!
+                    if gk not in self.executor._active_maker_tp_orders:
+                        lv_ref["maker_tp_live"] = False
+                        lv_ref["maker_tp_order_id"] = ""
+                    if gk not in self.executor._active_cond_sl_orders:
+                        lv_ref["cond_sl_live"] = False
+                        lv_ref["cond_sl_algo_id"] = ""
                 tracker.revert_exit_failed(sid, backoff_ms=5000.0)
             self.append_log("WARN", sym, f"[网格平仓异常] {sym} {type(e).__name__}: {str(e)[:120]}", mode=exec_mode)
 
@@ -3415,6 +3540,7 @@ class BidirectionalSniperEngine:
         maker_fee = float(follower_ex.get("maker_fee", 0.0002))
         mode_Stats = self.stats_by_mode[exec_mode]
         keep_locked = False
+        position_opened_and_unclosed = False
         pos_record: Optional[Dict[str, Any]] = None
 
         try:
@@ -3501,6 +3627,7 @@ class BidirectionalSniperEngine:
                 mode_Stats["ioc_filled_count"] += 1
                 _get_or_init_symbol_stat(mode_Stats, sym)["filled"] += 1
                 self.symbol_states[sym] = SniperState.HOLDING
+                position_opened_and_unclosed = True
                 filled_qty = entry_res.filled_qty
                 entry_contracts = entry_res.contracts
                 entry_ct_val = entry_res.ct_val
@@ -3621,6 +3748,7 @@ class BidirectionalSniperEngine:
 
                     if self.active_positions.get(sym) is not pos_record:
                         # Closed externally (e.g., manual_close_position) -> abort exit cleanly without clobbering new trades
+                        position_opened_and_unclosed = False
                         return
 
                     if self.risk_config.kill_switch_active:
@@ -3709,6 +3837,7 @@ class BidirectionalSniperEngine:
 
             async with self._get_symbol_exec_lock(sym):
                 if self.active_positions.get(sym) is not pos_record:
+                    position_opened_and_unclosed = False
                     return
                 self.symbol_states[sym] = SniperState.EXITING
                 exit_res = await self.executor.execute_exit_with_retry(
@@ -3741,8 +3870,10 @@ class BidirectionalSniperEngine:
                     )
                     self.db.record_risk_event_async("CRITICAL", "EXIT_UNCERTAIN", sym, exit_res.raw_msg, user_id=self.user_id)
                 self.append_log("CRITICAL", sym, f"[实盘平仓告警] {sym} {exit_res.raw_msg}（已锁定等待持仓核验）", mode=exec_mode)
+                self._spawn_task(self.sync_live_exchange_positions(trigger="exit_uncertain"))
                 return
 
+            position_opened_and_unclosed = False
             self.symbol_states[sym] = SniperState.CLOSED
             exit_avg = exit_res.avg_price
             notional_entry = entry_avg * filled_qty
@@ -3812,6 +3943,17 @@ class BidirectionalSniperEngine:
             )
 
         finally:
+            if position_opened_and_unclosed and exec_mode == "LIVE" and not keep_locked:
+                # Never unlock to IDLE or pop active_positions if an exception interrupted an open LIVE position!
+                keep_locked = True
+                self.symbol_states[sym] = SniperState.EXIT_UNCERTAIN
+                self.append_log(
+                    "CRITICAL",
+                    sym,
+                    f"[状态机异常保护] {sym} 实盘持仓在途期间发生异常，已锁定合约并立即触发交易所持仓对账",
+                    mode=exec_mode,
+                )
+                self._spawn_task(self.sync_live_exchange_positions(trigger="state_machine_error"))
             if not keep_locked:
                 if pos_record is None or self.active_positions.get(sym) is pos_record:
                     self.active_positions.pop(sym, None)
