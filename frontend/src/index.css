@@ -13,54 +13,54 @@
 
 :root,
 [data-theme="light"] {
-  /* Porcelain Soft-Neumorphism Palette (Sculpted Matte Ceramic) */
-  --bg-page: #e7ebf0;
-  --bg-page-gradient: radial-gradient(ellipse 90% 60% at 18% 0%, #f2f5f9 0%, #e7ebf0 55%, #dfe5ec 100%);
-  --bg-header: rgba(231, 235, 240, 0.84);
-  --bg-card: #ecf0f5;
-  --bg-card-grad: linear-gradient(145deg, #f3f6fa, #e3e8ef);
-  --bg-subtle: #e5eaf0;
-  --bg-well-grad: linear-gradient(145deg, #dfe4eb, #eef2f7);
-  --bg-btn-soft-grad: linear-gradient(145deg, #f4f7fb, #e1e6ed);
-  --bg-btn-soft-pressed: linear-gradient(145deg, #dfe4eb, #edf1f6);
-  --bg-icon-box: linear-gradient(145deg, #f3f6fa, #e0e5ec);
-  --bg-input: #e5eaf0;
-  --bg-hover: #edf1f6;
+  /* Milky White Soft-Neumorphism Palette (Warm Creamy Porcelain / 乳白骨瓷) */
+  --bg-page: #f5f2ec;
+  --bg-page-gradient: radial-gradient(ellipse 92% 62% at 18% 0%, #fbf9f5 0%, #f5f2ec 56%, #eee9e0 100%);
+  --bg-header: rgba(246, 243, 237, 0.88);
+  --bg-card: #f8f6f1;
+  --bg-card-grad: linear-gradient(145deg, #fdfcf9, #f0ebe2);
+  --bg-subtle: #f1ede6;
+  --bg-well-grad: linear-gradient(145deg, #ebe6dd, #f8f6f0);
+  --bg-btn-soft-grad: linear-gradient(145deg, #fefdfb, #eee9e0);
+  --bg-btn-soft-pressed: linear-gradient(145deg, #eae5dc, #f7f4ee);
+  --bg-icon-box: linear-gradient(145deg, #fdfcf9, #eee8df);
+  --bg-input: #f2eee7;
+  --bg-hover: #faf7f2;
 
-  --border-primary: rgba(255, 255, 255, 0.72);
-  --border-strong: rgba(163, 177, 198, 0.34);
-  --border-hover: rgba(255, 255, 255, 0.95);
-  --border-header: rgba(163, 177, 198, 0.30);
-  --ring-focus: rgba(30, 41, 59, 0.16);
+  --border-primary: rgba(255, 255, 255, 0.86);
+  --border-strong: rgba(176, 164, 146, 0.30);
+  --border-hover: rgba(255, 255, 255, 0.98);
+  --border-header: rgba(176, 164, 146, 0.24);
+  --ring-focus: rgba(45, 41, 37, 0.14);
 
-  /* Refined Graphite Ink for DouyinSans on Porcelain Canvas */
-  --text-primary: #1c2433;
-  --text-secondary: #48566b;
-  --text-muted: #78869a;
+  /* Refined Warm Charcoal Ink for DouyinSans on Milky White Canvas */
+  --text-primary: #221f1c;
+  --text-secondary: #575148;
+  --text-muted: #8a8277;
 
-  /* Sculpted Satin Obsidian Primary Action */
-  --btn-primary-bg: linear-gradient(145deg, #263042, #121824);
-  --btn-primary-hover: linear-gradient(145deg, #2f3b52, #182030);
-  --btn-primary-pressed: linear-gradient(145deg, #101520, #1f2838);
-  --btn-primary-text: #f8fafc;
+  /* Sculpted Satin Espresso-Obsidian Primary Action */
+  --btn-primary-bg: linear-gradient(145deg, #2d2925, #181614);
+  --btn-primary-hover: linear-gradient(145deg, #3a352f, #211e1b);
+  --btn-primary-pressed: linear-gradient(145deg, #161412, #282420);
+  --btn-primary-text: #fdfbf7;
 
-  --chart-grid: rgba(163, 177, 198, 0.28);
-  --chart-axis: #78869a;
+  --chart-grid: rgba(176, 164, 146, 0.24);
+  --chart-axis: #8a8277;
   --chart-leader: #d97706;
   --chart-follower: #0284c7;
 
-  /* Dual Opposing Soft-Neumorphism Elevation Shadows */
-  --neu-raise-sm: -3px -3px 7px rgba(255, 255, 255, 0.92), 3px 3px 8px rgba(163, 177, 198, 0.50), inset 1px 1px 0 rgba(255, 255, 255, 0.80);
-  --neu-raise-md: -6px -6px 14px rgba(255, 255, 255, 0.90), 7px 7px 16px rgba(163, 177, 198, 0.48), inset 1px 1px 1px rgba(255, 255, 255, 0.85);
-  --neu-raise-lg: -8px -8px 20px rgba(255, 255, 255, 0.96), 10px 10px 22px rgba(154, 169, 191, 0.54), inset 1px 1px 1px rgba(255, 255, 255, 0.92);
-  --neu-inset-sm: inset 3px 3px 6px rgba(163, 177, 198, 0.56), inset -3px -3px 6px rgba(255, 255, 255, 0.92);
-  --neu-inset-md: inset 4px 4px 9px rgba(163, 177, 198, 0.54), inset -4px -4px 9px rgba(255, 255, 255, 0.94);
+  /* Dual Opposing Warm Soft-Neumorphism Elevation Shadows */
+  --neu-raise-sm: -3px -3px 7px rgba(255, 255, 255, 0.96), 3px 3px 8px rgba(176, 164, 146, 0.36), inset 1px 1px 0 rgba(255, 255, 255, 0.92);
+  --neu-raise-md: -6px -6px 14px rgba(255, 255, 255, 0.96), 7px 7px 16px rgba(176, 164, 146, 0.34), inset 1px 1px 1px rgba(255, 255, 255, 0.94);
+  --neu-raise-lg: -8px -8px 20px rgba(255, 255, 255, 0.98), 10px 10px 22px rgba(168, 156, 138, 0.40), inset 1px 1px 1px rgba(255, 255, 255, 0.98);
+  --neu-inset-sm: inset 3px 3px 6px rgba(176, 164, 146, 0.42), inset -3px -3px 6px rgba(255, 255, 255, 0.96);
+  --neu-inset-md: inset 4px 4px 9px rgba(176, 164, 146, 0.40), inset -4px -4px 9px rgba(255, 255, 255, 0.98);
 
   --shadow-card: var(--neu-raise-md);
   --shadow-card-hover: var(--neu-raise-lg);
   --shadow-card-active: var(--neu-inset-sm);
-  --shadow-btn-hover: -4px -4px 10px rgba(255, 255, 255, 0.92), 6px 8px 16px rgba(15, 23, 42, 0.24);
-  --shadow-header: 0 8px 28px -10px rgba(148, 163, 184, 0.36), inset 0 -1px 0 rgba(255, 255, 255, 0.72);
+  --shadow-btn-hover: -4px -4px 10px rgba(255, 255, 255, 0.96), 6px 8px 16px rgba(45, 41, 37, 0.22);
+  --shadow-header: 0 8px 26px -10px rgba(168, 156, 138, 0.28), inset 0 -1px 0 rgba(255, 255, 255, 0.85);
 }
 
 [data-theme="dark"] {
@@ -358,9 +358,9 @@ button.surface-subtle:not(:disabled):active,
     color: var(--btn-primary-text);
     border: 1px solid rgba(255, 255, 255, 0.14);
     box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.20),
-      -3px -3px 7px rgba(255, 255, 255, 0.65),
-      4px 5px 12px rgba(15, 23, 42, 0.22);
+      inset 0 1px 0 rgba(255, 255, 255, 0.18),
+      -3px -3px 7px rgba(255, 255, 255, 0.84),
+      4px 5px 12px rgba(45, 41, 37, 0.22);
     border-radius: 9999px;
     font-weight: 600;
     letter-spacing: 0.025em;
