@@ -2737,96 +2737,448 @@ export default function App() {
 
             {/* Monitored Contracts Grid (Mobile: horizontal snap carousel; Tablet/Desktop: responsive grid) */}
             <div className="flex overflow-x-auto snap-x snap-mandatory gap-3 pb-1 no-scrollbar sm:overflow-visible sm:pb-0 sm:grid sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 sm:gap-4 lg:gap-5">
-              {strategies.map((s) => {
-                const t = snapshot.telemetry?.[s.symbol] || {};
-                const isSelected = s.symbol === selectedSymbol;
-                const stateKey = t.state || 'IDLE';
-                const rawPrec = s.price_precision ?? 4;
-                const prec = t.follower_mid && t.follower_mid < 0.0005 ? Math.max(8, rawPrec) : rawPrec;
-                const pushGapMs = t.follower_age_ms ?? 15;
-                const isStale = pushGapMs > (s.max_book_staleness_ms || 600);
-                const maxJumpPct = t.max_jump_seen_pct ?? 0;
-                const targetJumpPct = (s.min_jump_pct ?? 0.006) * 100;
-                const jumpProgress = Math.min(100, Math.round((maxJumpPct / Math.max(0.01, targetJumpPct)) * 100));
+              {(() => {
+                // Pre-aggregate live unrealized PnL per symbol from active_positions in O(N)
+                const symUplMap = {};
+                for (const p of snapshot.active_positions || []) {
+                  const psym = p.symbol;
+                  if (!psym) continue;
+                  const u =
+                    p.unrealized_usdt !== null && p.unrealized_usdt !== undefined && Number.isFinite(Number(p.unrealized_usdt))
+                      ? Number(p.unrealized_usdt)
+                      : Number(p.notional_usdt || 0) * Number(p.unrealized_net_pct || 0);
+                  if (!symUplMap[psym]) symUplMap[psym] = { upl: 0, count: 0 };
+                  symUplMap[psym].upl += u;
+                  symUplMap[psym].count += 1;
+                }
 
-                return (
-                  <div
-                    key={s.symbol}
-                    onClick={() => setSelectedSymbol(s.symbol)}
-                    className={`w-[80vw] max-w-[295px] shrink-0 snap-start sm:w-auto sm:max-w-none surface-card interactive-card p-4 sm:p-5 lg:p-6 ${
-                      isSelected
-                        ? 'ring-2 ring-[#0f1419] dark:ring-sky-400 shadow-[0_10px_28px_-8px_rgba(15,23,42,0.16)] dark:shadow-[0_12px_32px_-8px_rgba(56,189,248,0.22)]'
-                        : ''
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-2 mb-3 sm:mb-3.5">
-                      <div className="flex items-center gap-1.5 min-w-0">
-                        <span className="font-mono font-bold text-sm sm:text-base text-main truncate">
-                          {s.symbol.replace(':USDT', '')}
-                        </span>
+                return strategies.map((s) => {
+                  const st = s.strategy_type || 'LEAD_LAG';
+                  const t = snapshot.telemetry?.[s.symbol] || {};
+                  const grid = t.grid || null;
+                  const levels = Array.isArray(grid?.levels) ? grid.levels : [];
+                  const isSelected = s.symbol === selectedSymbol;
+                  const stateKey = t.state || 'IDLE';
+                  const rawPrec = s.price_precision ?? 4;
+                  const midPx = Number(t.follower_mid || t.leader_mid || grid?.center_price || 0);
+                  const prec = midPx > 0 && midPx < 0.0005 ? Math.max(8, rawPrec) : rawPrec;
+                  const fmtPx = (v) => (Number(v) > 0 ? Number(v).toFixed(prec) : '--');
+                  const pushGapMs = Math.round(Number(t.follower_age_ms ?? 15));
+                  const isStale = pushGapMs > (s.max_book_staleness_ms || 600);
+                  const symUpl = symUplMap[s.symbol] || { upl: 0, count: 0 };
+
+                  // Shared grid metrics (zero overhead for LEAD_LAG)
+                  const openSlots = levels.filter((lv) => lv.status === 'OPEN');
+                  const openLong = Number(grid?.open_long_count ?? openSlots.filter((lv) => lv.side === 'LONG').length);
+                  const openShort = Number(grid?.open_short_count ?? openSlots.filter((lv) => lv.side === 'SHORT').length);
+                  const openTotal = openLong + openShort;
+                  const centerPx = Number(grid?.center_price || 0);
+                  const devPct = centerPx > 0 && midPx > 0 ? ((midPx - centerPx) / centerPx) * 100 : 0;
+                  const makerTpCnt = openSlots.filter((lv) => lv.maker_tp_live).length;
+                  const condSlCnt = openSlots.filter((lv) => lv.cond_sl_live).length;
+                  const cycles = Number(grid?.completed_cycles || 0);
+                  const gridNetPnl = Number(grid?.grid_net_pnl || 0);
+                  const stepPctVal = (s.grid_step_pct ?? 0.006) * 100;
+                  const tpPctVal = (s.grid_take_profit_pct ?? 0.0065) * 100;
+                  const slPctVal = (s.grid_stop_loss_pct ?? 0.03) * 100;
+                  const rangePctVal = (s.grid_range_pct ?? 0.035) * 100;
+
+                  // Status pill tailored per strategy
+                  let statusText = !s.is_running ? '已暂停' : STATE_LABEL_MAP[stateKey] || stateKey;
+                  let statusCls = !s.is_running
+                    ? 'bg-slate-500/15 text-dim'
+                    : stateKey === 'IDLE' || stateKey === 'GRID_WATCH'
+                    ? 'surface-subtle text-dim'
+                    : stateKey === 'HOLDING' || stateKey === 'GRID_HOLDING'
+                    ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                    : stateKey === 'EXIT_UNCERTAIN'
+                    ? 'bg-rose-500/15 text-rose-600 dark:text-rose-400 animate-pulse'
+                    : 'bg-amber-500/15 text-amber-600 dark:text-amber-400';
+
+                  let hasBeLocked = false;
+                  if (st === 'TREND_GRID' && openTotal > 0 && s.is_running) {
+                    hasBeLocked = openSlots.some((lv) => {
+                      const ep = Number(lv.entry_price || 0);
+                      const sl = Number(lv.sl_price || 0);
+                      return ep > 0 && sl > 0 && (lv.side === 'LONG' ? sl >= ep : sl <= ep);
+                    });
+                    statusText = hasBeLocked ? '保本锁利中' : openTotal >= 2 ? `顺势${openTotal}层` : '顺势持仓中';
+                    statusCls = hasBeLocked
+                      ? 'bg-sky-500/15 text-sky-600 dark:text-sky-400'
+                      : 'bg-violet-500/15 text-violet-600 dark:text-violet-400';
+                  } else if (st === 'ADAPTIVE_GRID' && s.is_running) {
+                    const isAdpTrend = grid?.active_grid_mode === 'TREND_BREAKOUT';
+                    statusText = openTotal > 0 ? (isAdpTrend ? '双模·顺势持仓' : '双模·震荡持仓') : isAdpTrend ? '双模·顺势待机' : '双模·震荡巡航';
+                    statusCls =
+                      openTotal > 0
+                        ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                        : isAdpTrend
+                        ? 'bg-violet-500/15 text-violet-600 dark:text-violet-400'
+                        : 'surface-subtle text-dim';
+                  }
+
+                  // Strategy-specific card body & footer
+                  const renderStrategyBody = () => {
+                    if (st === 'LEAD_LAG') {
+                      const maxJumpPct = t.max_jump_seen_pct ?? 0;
+                      const targetJumpPct = (s.min_jump_pct ?? 0.006) * 100;
+                      const jumpProgress = Math.min(100, Math.round((maxJumpPct / Math.max(0.01, targetJumpPct)) * 100));
+                      return (
+                        <>
+                          <div className="grid grid-cols-2 gap-2 sm:gap-2.5 text-xs font-mono">
+                            <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
+                              <div className="text-[11px] text-dim font-sans">主所 (Binance)</div>
+                              <div className="text-main font-bold text-xs sm:text-sm mt-1 truncate">
+                                {t.leader_mid ? Number(t.leader_mid).toFixed(prec) : '--'}
+                              </div>
+                            </div>
+                            <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
+                              <div className="text-[11px] text-dim font-sans">从所 (OKX)</div>
+                              <div className="text-main font-bold text-xs sm:text-sm mt-1 truncate">
+                                {t.follower_mid ? Number(t.follower_mid).toFixed(prec) : '--'}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="mt-3 sm:mt-3.5 pt-2.5 sm:pt-3 border-t border-line space-y-1.5">
+                            <div className="flex items-center justify-between text-[11px] font-mono text-dim">
+                              <span>基差 {t.basis_bps ?? 0}bp</span>
+                              <span>
+                                峰值 {maxJumpPct.toFixed(2)}%/{targetJumpPct.toFixed(2)}%
+                              </span>
+                              <span className={isStale ? 'text-rose-500 font-bold' : 'text-emerald-500 font-semibold'}>
+                                {pushGapMs}ms
+                              </span>
+                            </div>
+                            <div className="w-full h-1.5 rounded-full surface-subtle overflow-hidden">
+                              <div
+                                className={`h-full transition-all duration-300 ${
+                                  jumpProgress >= 100
+                                    ? 'bg-emerald-500'
+                                    : jumpProgress >= 50
+                                    ? 'bg-amber-500'
+                                    : 'bg-[#0f1419] dark:bg-sky-400'
+                                }`}
+                                style={{ width: `${Math.max(5, jumpProgress)}%` }}
+                              />
+                            </div>
+                          </div>
+                        </>
+                      );
+                    }
+
+                    if (st === 'TREND_GRID') {
+                      const l1 = levels.find((lv) => lv.slot_id === 'L1');
+                      const s1 = levels.find((lv) => lv.slot_id === 'S1');
+                      const dzMult = s.trend_dead_zone_mult ?? 1.25;
+                      const trailMult = s.trend_trailing_mult ?? 1.15;
+                      const effDzPct = Math.max(0.1, dzMult * stepPctVal);
+                      const trailPx =
+                        openLong > 0
+                          ? Number(grid?.long_trail_stop_price || 0)
+                          : openShort > 0
+                          ? Number(grid?.short_trail_stop_price || 0)
+                          : 0;
+                      const activeSlPx = openSlots.length > 0 ? Number(openSlots[0].sl_price || 0) : 0;
+                      const breakoutProg =
+                        openTotal > 0
+                          ? Math.min(100, Math.round((openTotal / Math.max(1, s.grid_levels || 5)) * 100))
+                          : Math.min(100, Math.round((Math.abs(devPct) / effDzPct) * 100));
+
+                      return (
+                        <>
+                          <div className="grid grid-cols-2 gap-2 sm:gap-2.5 text-xs font-mono">
+                            <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
+                              <div className="flex items-center justify-between gap-1 text-[10px] sm:text-[11px] text-dim font-sans">
+                                <span className="truncate">最新价</span>
+                                {centerPx > 0 && (
+                                  <span
+                                    className={`font-mono shrink-0 ${
+                                      devPct >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-500'
+                                    }`}
+                                  >
+                                    {devPct >= 0 ? '+' : ''}
+                                    {devPct.toFixed(2)}%
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-main font-bold text-xs sm:text-sm mt-1 truncate">{fmtPx(midPx)}</div>
+                              <div className="text-[10px] text-dim truncate mt-0.5">中枢 {fmtPx(centerPx)}</div>
+                            </div>
+
+                            {openTotal > 0 ? (
+                              <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
+                                <div className="flex items-center justify-between gap-1 text-[10px] sm:text-[11px] text-dim font-sans">
+                                  <span className="truncate">在途 {openLong > 0 ? `多${openLong}层` : `空${openShort}层`}</span>
+                                  <span
+                                    className={`font-mono font-bold shrink-0 ${
+                                      symUpl.upl >= 0 ? 'text-emerald-500' : 'text-rose-500'
+                                    }`}
+                                  >
+                                    {formatUsdtSigned(symUpl.upl)}
+                                  </span>
+                                </div>
+                                <div className="text-main font-bold text-xs sm:text-sm mt-1 truncate">
+                                  {trailPx > 0 ? fmtPx(trailPx) : fmtPx(activeSlPx)}
+                                </div>
+                                <div className="text-[10px] text-dim truncate mt-0.5">
+                                  {trailPx > 0 ? `追踪止盈 · 止损 ${fmtPx(activeSlPx)}` : `条件止损 (${condSlCnt}笔)`}
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
+                                <div className="text-[10px] sm:text-[11px] text-dim font-sans truncate">突破触发位</div>
+                                <div className="text-emerald-600 dark:text-emerald-400 font-bold text-[11px] sm:text-xs mt-1 truncate">
+                                  ↑ {fmtPx(l1?.trigger_price)}
+                                </div>
+                                <div className="text-rose-500 font-bold text-[11px] sm:text-xs mt-0.5 truncate">
+                                  ↓ {fmtPx(s1?.trigger_price)}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="mt-3 sm:mt-3.5 pt-2.5 sm:pt-3 border-t border-line space-y-1.5">
+                            <div className="flex items-center justify-between gap-1 text-[10px] sm:text-[11px] font-mono text-dim">
+                              <span className="truncate">
+                                死区 {dzMult}x · 追踪 {trailMult}x
+                              </span>
+                              <span className="truncate">
+                                {openTotal > 0 ? `层数 ${openTotal}/${s.grid_levels || 5}` : `硬损 ${slPctVal.toFixed(1)}%`}
+                              </span>
+                              <span className={isStale ? 'text-rose-500 font-bold shrink-0' : 'text-emerald-500 font-semibold shrink-0'}>
+                                {pushGapMs}ms
+                              </span>
+                            </div>
+                            <div className="w-full h-1.5 rounded-full surface-subtle overflow-hidden">
+                              <div
+                                className={`h-full transition-all duration-300 ${
+                                  hasBeLocked
+                                    ? 'bg-emerald-500'
+                                    : openTotal > 0
+                                    ? 'bg-violet-500'
+                                    : breakoutProg >= 80
+                                    ? 'bg-amber-500'
+                                    : 'bg-violet-500/75'
+                                }`}
+                                style={{ width: `${Math.max(5, breakoutProg)}%` }}
+                              />
+                            </div>
+                          </div>
+                        </>
+                      );
+                    }
+
+                    if (st === 'ADAPTIVE_GRID') {
+                      const isAdpTrend = grid?.active_grid_mode === 'TREND_BREAKOUT';
+                      const bbwPct = grid?.bbw_pct != null ? Number(grid.bbw_pct) : null;
+                      const bbwRank = grid?.bbw_percentile != null ? Math.round(Number(grid.bbw_percentile)) : null;
+                      const sqThresh = Number(s.bbw_squeeze_percentile ?? 20);
+                      const barPct = bbwRank != null ? Math.min(100, Math.max(4, bbwRank)) : 10;
+
+                      return (
+                        <>
+                          <div className="grid grid-cols-2 gap-2 sm:gap-2.5 text-xs font-mono">
+                            <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
+                              <div className="flex items-center justify-between gap-1 text-[10px] sm:text-[11px] text-dim font-sans">
+                                <span className="truncate">最新价</span>
+                                <span
+                                  className={`font-sans font-bold text-[10px] shrink-0 ${
+                                    isAdpTrend ? 'text-violet-600 dark:text-violet-400' : 'text-sky-600 dark:text-sky-400'
+                                  }`}
+                                >
+                                  {isAdpTrend ? '顺势' : '震荡'}
+                                </span>
+                              </div>
+                              <div className="text-main font-bold text-xs sm:text-sm mt-1 truncate">{fmtPx(midPx)}</div>
+                              <div className="text-[10px] text-dim truncate mt-0.5">中枢 {fmtPx(centerPx)}</div>
+                            </div>
+
+                            <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
+                              <div className="flex items-center justify-between gap-1 text-[10px] sm:text-[11px] text-dim font-sans">
+                                <span className="truncate">{openTotal > 0 ? `多${openLong} · 空${openShort}` : `BBW (${s.bbw_timeframe || '15m'})`}</span>
+                                {openTotal > 0 && (
+                                  <span
+                                    className={`font-mono font-bold shrink-0 ${
+                                      symUpl.upl >= 0 ? 'text-emerald-500' : 'text-rose-500'
+                                    }`}
+                                  >
+                                    {formatUsdtSigned(symUpl.upl)}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-main font-bold text-xs sm:text-sm mt-1 truncate">
+                                {bbwPct != null ? `${bbwPct.toFixed(2)}%` : '--'}
+                                {bbwRank != null ? ` · P${bbwRank}` : ''}
+                              </div>
+                              <div className="text-[10px] text-dim truncate mt-0.5">
+                                {grid?.vcp_contraction ? 'VCP 挤压突破预警' : `护单 ${makerTpCnt + condSlCnt} · ${cycles}轮`}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="mt-3 sm:mt-3.5 pt-2.5 sm:pt-3 border-t border-line space-y-1.5">
+                            <div className="flex items-center justify-between gap-1 text-[10px] sm:text-[11px] font-mono text-dim">
+                              <span className="truncate">挤压阈 ≤P{sqThresh}</span>
+                              <span className="truncate">
+                                步长 {stepPctVal.toFixed(2)}% · 损 {slPctVal.toFixed(1)}%
+                              </span>
+                              <span className={isStale ? 'text-rose-500 font-bold shrink-0' : 'text-emerald-500 font-semibold shrink-0'}>
+                                {pushGapMs}ms
+                              </span>
+                            </div>
+                            <div className="w-full h-1.5 rounded-full surface-subtle overflow-hidden">
+                              <div
+                                className={`h-full transition-all duration-300 ${
+                                  bbwRank != null && bbwRank <= sqThresh ? 'bg-amber-500' : 'bg-sky-500'
+                                }`}
+                                style={{ width: `${barPct}%` }}
+                              />
+                            </div>
+                          </div>
+                        </>
+                      );
+                    }
+
+                    // LONG_SHORT_GRID (传统震荡) & REVERSE_GRID (多空震荡)
+                    const isRev = st === 'REVERSE_GRID';
+                    const idleLevels = levels.filter((lv) => lv.status === 'IDLE');
+                    const armedCount = isRev ? idleLevels.filter((lv) => lv.armed !== false).length : idleLevels.length;
+                    const effRange = Math.max(0.1, rangePctVal);
+                    // Map deviation [-range, +range] onto [0%, 100%] centered at 50%
+                    const posPct = Math.max(2, Math.min(98, 50 + (devPct / effRange) * 50));
+                    const nearEdge = Math.abs(devPct) >= effRange * 0.8;
+
+                    return (
+                      <>
+                        <div className="grid grid-cols-2 gap-2 sm:gap-2.5 text-xs font-mono">
+                          <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
+                            <div className="flex items-center justify-between gap-1 text-[10px] sm:text-[11px] text-dim font-sans">
+                              <span className="truncate">最新价</span>
+                              {centerPx > 0 && (
+                                <span
+                                  className={`font-mono shrink-0 ${
+                                    devPct >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-500'
+                                  }`}
+                                >
+                                  {devPct >= 0 ? '+' : ''}
+                                  {devPct.toFixed(2)}%
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-main font-bold text-xs sm:text-sm mt-1 truncate">{fmtPx(midPx)}</div>
+                            <div className="text-[10px] text-dim truncate mt-0.5">中枢 {fmtPx(centerPx)}</div>
+                          </div>
+
+                          <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
+                            <div className="flex items-center justify-between gap-1 text-[10px] sm:text-[11px] text-dim font-sans">
+                              <span className="truncate">{openTotal > 0 ? '在途槽位' : '就绪档位'}</span>
+                              {openTotal > 0 ? (
+                                <span
+                                  className={`font-mono font-bold shrink-0 ${
+                                    symUpl.upl >= 0 ? 'text-emerald-500' : 'text-rose-500'
+                                  }`}
+                                >
+                                  {formatUsdtSigned(symUpl.upl)}
+                                </span>
+                              ) : (
+                                <span className="font-mono text-dim shrink-0">{s.grid_levels || 5}层/侧</span>
+                              )}
+                            </div>
+                            <div className="text-main font-bold text-xs sm:text-sm mt-1 truncate">
+                              {openTotal > 0 ? (
+                                <span>
+                                  <span className="text-emerald-600 dark:text-emerald-400">多{openLong}</span>
+                                  <span className="text-dim mx-1">/</span>
+                                  <span className="text-rose-500">空{openShort}</span>
+                                </span>
+                              ) : (
+                                `${armedCount}/${levels.length || (s.grid_levels || 5) * 2} 档`
+                              )}
+                            </div>
+                            <div className="text-[10px] text-dim truncate mt-0.5">
+                              {makerTpCnt > 0
+                                ? `Maker挂单 ${makerTpCnt} · ${cycles}轮`
+                                : `步长 ${stepPctVal.toFixed(2)}% · ${cycles}轮`}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="mt-3 sm:mt-3.5 pt-2.5 sm:pt-3 border-t border-line space-y-1.5">
+                          <div className="flex items-center justify-between gap-1 text-[10px] sm:text-[11px] font-mono text-dim">
+                            <span className="truncate">
+                              盈 {tpPctVal.toFixed(2)}% · 损 {slPctVal.toFixed(1)}%
+                            </span>
+                            <span
+                              className={`truncate ${
+                                gridNetPnl > 0
+                                  ? 'text-emerald-600 dark:text-emerald-400 font-semibold'
+                                  : gridNetPnl < 0
+                                  ? 'text-rose-500 font-semibold'
+                                  : ''
+                              }`}
+                            >
+                              {cycles > 0 ? `${cycles}轮 ${formatUsdtSigned(gridNetPnl)}` : `区间 ±${rangePctVal.toFixed(1)}%`}
+                            </span>
+                            <span className={isStale ? 'text-rose-500 font-bold shrink-0' : 'text-emerald-500 font-semibold shrink-0'}>
+                              {pushGapMs}ms
+                            </span>
+                          </div>
+                          {/* Center-Anchored Grid Range Gauge */}
+                          <div className="relative w-full h-1.5 rounded-full surface-subtle overflow-hidden">
+                            <div className="absolute left-1/2 top-0 bottom-0 w-px bg-[var(--text-muted)] opacity-45 z-10" />
+                            <div
+                              className={`absolute top-0 bottom-0 rounded-full transition-all duration-300 ${
+                                nearEdge
+                                  ? 'bg-amber-500'
+                                  : isRev
+                                  ? 'bg-teal-500'
+                                  : 'bg-sky-500'
+                              }`}
+                              style={
+                                posPct >= 50
+                                  ? { left: '50%', width: `${Math.max(4, posPct - 50)}%` }
+                                  : { left: `${posPct}%`, width: `${Math.max(4, 50 - posPct)}%` }
+                              }
+                            />
+                          </div>
+                        </div>
+                      </>
+                    );
+                  };
+
+                  return (
+                    <div
+                      key={s.symbol}
+                      onClick={() => setSelectedSymbol(s.symbol)}
+                      className={`w-[80vw] max-w-[295px] shrink-0 snap-start sm:w-auto sm:max-w-none surface-card interactive-card p-4 sm:p-5 lg:p-5 ${
+                        isSelected
+                          ? 'ring-2 ring-[#0f1419] dark:ring-sky-400 shadow-[0_10px_28px_-8px_rgba(15,23,42,0.16)] dark:shadow-[0_12px_32px_-8px_rgba(56,189,248,0.22)]'
+                          : ''
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 mb-3">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="font-mono font-bold text-sm sm:text-base text-main truncate">
+                            {s.symbol.replace(':USDT', '')}
+                          </span>
+                          <span
+                            className={`text-[10px] px-2 py-0.5 rounded-full font-bold shrink-0 ${strategyBadgeClass(st)}`}
+                          >
+                            {STRATEGY_LABEL_MAP[st] || st}
+                          </span>
+                        </div>
                         <span
-                          className={`text-[10px] px-2 py-0.5 rounded-full font-bold shrink-0 ${strategyBadgeClass(
-                            s.strategy_type || 'LEAD_LAG'
-                          )}`}
+                          className={`px-2 sm:px-2.5 py-0.5 rounded-full text-[10px] sm:text-[11px] font-semibold shrink-0 ${statusCls}`}
                         >
-                          {STRATEGY_LABEL_MAP[s.strategy_type || 'LEAD_LAG'] || s.strategy_type}
+                          {statusText}
                         </span>
                       </div>
-                      <span
-                        className={`px-2 sm:px-2.5 py-0.5 rounded-full text-[10px] sm:text-[11px] font-semibold shrink-0 ${
-                          stateKey === 'IDLE' || stateKey === 'GRID_WATCH'
-                            ? 'surface-subtle text-dim'
-                            : stateKey === 'HOLDING' || stateKey === 'GRID_HOLDING'
-                            ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-                            : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
-                        }`}
-                      >
-                        {STATE_LABEL_MAP[stateKey] || stateKey}
-                      </span>
-                    </div>
 
-                    <div className="grid grid-cols-2 gap-2 sm:gap-2.5 text-xs font-mono">
-                      <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
-                        <div className="text-[11px] text-dim font-sans">主所 (Binance)</div>
-                        <div className="text-main font-bold text-xs sm:text-sm mt-1 truncate">
-                          {t.leader_mid ? Number(t.leader_mid).toFixed(prec) : '--'}
-                        </div>
-                      </div>
-                      <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
-                        <div className="text-[11px] text-dim font-sans">从所 (OKX)</div>
-                        <div className="text-main font-bold text-xs sm:text-sm mt-1 truncate">
-                          {t.follower_mid ? Number(t.follower_mid).toFixed(prec) : '--'}
-                        </div>
-                      </div>
+                      {renderStrategyBody()}
                     </div>
-
-                    {/* Visual Pulse Progress Bar */}
-                    <div className="mt-3 sm:mt-3.5 pt-2.5 sm:pt-3 border-t border-line space-y-1.5">
-                      <div className="flex items-center justify-between text-[11px] font-mono text-dim">
-                        <span>基差 {t.basis_bps ?? 0}bp</span>
-                        <span>
-                          峰值 {maxJumpPct.toFixed(2)}%/{targetJumpPct.toFixed(2)}%
-                        </span>
-                        <span className={isStale ? 'text-rose-500 font-bold' : 'text-emerald-500 font-semibold'}>
-                          {pushGapMs}ms
-                        </span>
-                      </div>
-                      <div className="w-full h-1.5 rounded-full surface-subtle overflow-hidden">
-                        <div
-                          className={`h-full transition-all duration-300 ${
-                            jumpProgress >= 100
-                              ? 'bg-emerald-500'
-                              : jumpProgress >= 50
-                              ? 'bg-amber-500'
-                              : 'bg-[#0f1419] dark:bg-sky-400'
-                          }`}
-                          style={{ width: `${Math.max(5, jumpProgress)}%` }}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
+                  );
+                });
+              })()}
             </div>
 
             {/* Adaptive Multi-Strategy Millisecond Position State Machine */}
