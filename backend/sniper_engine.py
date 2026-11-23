@@ -1789,6 +1789,10 @@ class BidirectionalSniperEngine:
                         issues.append(
                             f"顺势死区超出重锚区间 ({dz_span*100:.2f}% > {new_cfg.grid_range_pct*100:.1f}%)"
                         )
+                    elif new_cfg.trend_dead_zone_mult > 2.0 + 1e-6 or dz_span > max(0.018, new_cfg.grid_step_pct * 2.2) + 1e-6:
+                        issues.append(
+                            f"顺势首格死区偏宽 ({new_cfg.trend_dead_zone_mult:g}x={dz_span*100:.2f}%)，低波行情易难触发，建议 1.0x~1.5x"
+                        )
                     if new_cfg.trend_pyramid_decay and int(new_cfg.grid_levels) > 1:
                         w_list = calc_pyramid_weights(int(new_cfg.grid_levels), True)
                         thinnest_leg_usdt = round(float(new_cfg.order_usdt) * int(new_cfg.grid_levels) * min(w_list), 2)
@@ -1967,6 +1971,7 @@ class BidirectionalSniperEngine:
                     "grid_range_pct": new_cfg.grid_range_pct,
                     "grid_stop_loss_pct": new_cfg.grid_stop_loss_pct,
                     "sl_roe_pct": round(new_cfg.grid_stop_loss_pct * max(1, int(new_cfg.leverage)) * 100.0, 1),
+                    "trend_dead_zone_mult": new_cfg.trend_dead_zone_mult,
                     "trend_trailing_mult": new_cfg.trend_trailing_mult,
                     "use_post_only_tp": bool(new_cfg.use_post_only_tp),
                     "sl_trigger_px_type": str(new_cfg.sl_trigger_px_type or "mark"),
@@ -2120,8 +2125,8 @@ class BidirectionalSniperEngine:
                     trk.clear_external_exit(sid)
                 trk.levels.clear()
                 trk.center_price = 0.0
-                trk._config_sig = None
-                trk._user_config_sig = None
+                trk._last_sig_params = None
+                trk._last_user_sig_params = None
 
         if new_mode == "LIVE":
             if self._owns_gateway:

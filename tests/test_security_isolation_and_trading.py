@@ -2545,7 +2545,8 @@ def test_ema_trend_filter_breakout_switch_and_okx_long_short_mode():
     assert bull_bbw["ema_gap_pct"] > 0.22
     assert bull_bbw["breakout_expansion"] == "UP_BREAKOUT"
 
-    # 3. MEAN_REVERSION pauses counter-trend LONG dip-buys in BEAR trend (no catching falling knives)
+    # 3. ADAPTIVE_GRID MEAN_REVERSION pauses counter-trend LONG dip-buys in BEAR trend (no catching falling knives),
+    #    while manual LONG_SHORT_GRID runs bidirectionally unrestricted by lagging EMA trend_bias.
     mr_cfg = SymbolStrategy(
         symbol="ETH/USDT:USDT",
         strategy_type="LONG_SHORT_GRID",
@@ -2560,7 +2561,7 @@ def test_ema_trend_filter_breakout_switch_and_okx_long_short_mode():
         price_precision=2,
         qty_precision=3,
     )
-    mr_tracker = LongShortGridTracker("ETH/USDT:USDT")
+    adp_mr_cfg = mr_cfg.model_copy(update={"strategy_type": "ADAPTIVE_GRID"})
     bear_info = {
         "timeframe": "15m",
         "bbw_pct": 2.4,
@@ -2574,13 +2575,23 @@ def test_ema_trend_filter_breakout_switch_and_okx_long_short_mode():
         "trend_bias": "BEAR",
         "breakout_expansion": "NONE",
     }
-    mr_tracker.sync_config(mr_cfg, current_mid=100.0, bbw_info=bear_info)
-    # Dip to 99.30 (below L1=99.40) -> MUST NOT open counter-trend LONG in BEAR market!
-    en_dip, _ = mr_tracker.evaluate_tick(99.25, 99.30, 99.28, mr_cfg, is_net_mode=False, bbw_info=bear_info)
+    adp_mr_tracker = LongShortGridTracker("ETH/USDT:USDT")
+    adp_mr_tracker.sync_config(adp_mr_cfg, current_mid=100.0, bbw_info=bear_info)
+    assert adp_mr_tracker.active_grid_mode == "MEAN_REVERSION"
+    # ADAPTIVE_GRID dip to 99.30 (below L1=99.40) -> MUST NOT open counter-trend LONG in BEAR market!
+    en_dip, _ = adp_mr_tracker.evaluate_tick(99.25, 99.30, 99.28, adp_mr_cfg, is_net_mode=False, bbw_info=bear_info)
     assert en_dip == []
     # Bounce to 100.70 (above S1=100.60) -> MUST allow trend-aligned SHORT!
-    en_short, _ = mr_tracker.evaluate_tick(100.68, 100.72, 100.70, mr_cfg, is_net_mode=False, bbw_info=bear_info)
+    en_short, _ = adp_mr_tracker.evaluate_tick(100.68, 100.72, 100.70, adp_mr_cfg, is_net_mode=False, bbw_info=bear_info)
     assert [e["slot_id"] for e in en_short] == ["S1"]
+
+    # Manual LONG_SHORT_GRID under the same BEAR bias triggers BOTH LONG dips and SHORT rallies freely!
+    mr_tracker = LongShortGridTracker("ETH/USDT:USDT")
+    mr_tracker.sync_config(mr_cfg, current_mid=100.0, bbw_info=bear_info)
+    en_mr_dip, _ = mr_tracker.evaluate_tick(99.25, 99.30, 99.28, mr_cfg, is_net_mode=False, bbw_info=bear_info)
+    assert [e["slot_id"] for e in en_mr_dip] == ["L1"]
+    en_mr_short, _ = mr_tracker.evaluate_tick(100.68, 100.72, 100.70, mr_cfg, is_net_mode=False, bbw_info=bear_info)
+    assert [e["slot_id"] for e in en_mr_short] == ["S1"]
 
     # 4. In RANGE market under OKX long_short_mode (is_net_mode=False), BOTH LONG and SHORT can hold simultaneously!
     range_info = {**bear_info, "ema_gap_pct": 0.05, "trend_bias": "RANGE"}
@@ -4357,6 +4368,213 @@ def test_hourly_crypto_vs_traditional_market_sentiment_comparison():
     assert res["summary"]["correlation_24h"] is not None
     assert sentiment_regime_label(res["summary"]["crypto_score"]) in ("贪婪", "极度贪婪")
     assert sentiment_regime_label(res["summary"]["trad_score"]) in ("恐慌", "极度恐慌")
+
+
+def test_long_short_grid_and_trend_grid_trigger_fixes():
+    """
+    Verifies root-cause fixes for LONG_SHORT_GRID (传统震荡网格) & TREND_GRID (顺势突破网格) trigger starvation:
+    1) LONG_SHORT_GRID operates bidirectionally unrestricted by lagging EMA BULL/BEAR bias, uses symmetric
+       anti-stacking spacing (allows inner L1 re-entry while deeper L2 is open), and guards concurrent ENTERING.
+    2) TREND_GRID operates bidirectionally unrestricted by lagging EMA BULL/BEAR bias (e.g. SNDK breakdown under BULL EMA).
+    3) TREND_GRID with trend_use_bb_breakout=True adaptively converges wide dead-zone (e.g. 3.0x on low-vol BTC/TRX)
+       to live Bollinger Band Width while respecting the >= step anti-chop floor and leaving trend_use_bb_breakout=False untouched.
+    4) TREND_GRID open lower leg re-anchors stranded L2..Ln / S2..Sn pyramid triggers to prev_entry +/- step
+       across fill/recovery/restore (e.g. SPCX scenario), and persists needs_post_trend_recenter.
+    5) validate_and_batch_update_symbols flags overly wide trend_dead_zone_mult on TREND_GRID and supports batch updating it.
+    """
+    from backend.grid_engine import LongShortGridTracker
+    from backend.models import BatchSymbolUpdateRequest, SymbolStrategy
+    from backend.sniper_engine import BidirectionalSniperEngine
+
+    # 1) LONG_SHORT_GRID: bidirectional under BULL/BEAR + symmetric inner re-entry + concurrent ENTERING guard
+    ls_cfg = SymbolStrategy(
+        symbol="OP/USDT:USDT",
+        strategy_type="LONG_SHORT_GRID",
+        grid_side_mode="LONG_SHORT",
+        grid_levels=3,
+        grid_step_pct=0.006,
+        grid_take_profit_pct=0.0065,
+        grid_range_pct=0.03,
+        grid_stop_loss_pct=0.04,
+        order_usdt=20.0,
+        leverage=5,
+        price_precision=2,
+        qty_precision=2,
+    )
+    bull_info = {
+        "timeframe": "15m",
+        "bbw_pct": 2.0,
+        "bbw_percentile": 45.0,
+        "bb_upper": 101.0,
+        "bb_middle": 100.0,
+        "bb_lower": 99.0,
+        "ema_fast": 101.2,
+        "ema_slow": 99.8,
+        "ema_gap_pct": 1.40,
+        "trend_bias": "BULL",
+        "breakout_expansion": "NONE",
+    }
+    bear_info = {**bull_info, "ema_fast": 98.8, "ema_slow": 100.2, "ema_gap_pct": -1.40, "trend_bias": "BEAR"}
+
+    ls_trk = LongShortGridTracker("OP/USDT:USDT")
+    ls_trk.sync_config(ls_cfg, current_mid=100.0, bbw_info=bull_info)
+    # Rally under BULL bias MUST trigger SHORT S1 (previously blocked by BULL EMA!)
+    en_s1, _ = ls_trk.evaluate_tick(100.62, 100.64, 100.63, ls_cfg, is_net_mode=False, bbw_info=bull_info)
+    assert [e["slot_id"] for e in en_s1] == ["S1"]
+    ls_trk.mark_entry_filled("S1", 100.62, 0.2, 0.2, 1.0, ls_cfg, 0.0007)
+
+    # Deeper L2 opens at 98.80 while L1 (99.40) is IDLE
+    ls_trk.levels["L2"]["status"] = "OPEN"
+    ls_trk.levels["L2"]["entry_price"] = 98.80
+    ls_trk.levels["L2"]["tp_price"] = 99.44
+    ls_trk.levels["L2"]["sl_price"] = 96.00
+    ls_trk.levels["L2"]["filled_qty"] = 0.2
+    # Near L2 entry (98.90 is only 0.10% away < 0.55 * 0.6% = 0.33%) -> anti-stacking blocks duplicate entry
+    en_near, _ = ls_trk.evaluate_tick(98.88, 98.90, 98.89, ls_cfg, is_net_mode=False, bbw_info=bear_info)
+    assert en_near == []
+    # Rebound to L1=99.38 (0.59% away from L2=98.80 >= 0.33%) -> symmetric spacing allows inner L1 re-entry!
+    en_inner_l1, _ = ls_trk.evaluate_tick(99.36, 99.38, 99.37, ls_cfg, is_net_mode=False, bbw_info=bear_info)
+    assert [e["slot_id"] for e in en_inner_l1] == ["L1"]
+    # While L1 is ENTERING, another deep dip to L3 (98.20) MUST wait (concurrent ENTERING guard)
+    en_conc, _ = ls_trk.evaluate_tick(98.16, 98.18, 98.17, ls_cfg, is_net_mode=False, bbw_info=bear_info)
+    assert en_conc == []
+
+    # 2) TREND_GRID: bidirectional unrestricted by lagging EMA (SNDK breakdown under BULL EMA)
+    sndk_cfg = SymbolStrategy(
+        symbol="SNDK/USDT:USDT",
+        strategy_type="TREND_GRID",
+        grid_side_mode="LONG_SHORT",
+        grid_levels=3,
+        grid_step_pct=0.008,
+        grid_range_pct=0.04,
+        grid_stop_loss_pct=0.04,
+        trend_dead_zone_mult=1.2,
+        trend_trailing_mult=1.5,
+        trend_use_bb_breakout=False,
+        order_usdt=20.0,
+        leverage=5,
+        price_precision=2,
+        qty_precision=2,
+    )
+    sndk_trk = LongShortGridTracker("SNDK/USDT:USDT")
+    sndk_trk.sync_config(sndk_cfg, current_mid=100.0, bbw_info=bull_info)
+    assert sndk_trk.levels["S1"]["trigger_price"] == 99.04
+    assert sndk_trk.levels["L1"]["trigger_price"] == 100.96
+    # Breakdown under strong BULL EMA bias MUST fire SHORT S1!
+    en_ts1, _ = sndk_trk.evaluate_tick(99.00, 99.02, 99.01, sndk_cfg, is_net_mode=False, bbw_info=bull_info)
+    assert [e["slot_id"] for e in en_ts1] == ["S1"]
+    # And breakout up under strong BEAR EMA bias MUST fire LONG L1!
+    sndk_trk2 = LongShortGridTracker("SNDK/USDT:USDT")
+    sndk_trk2.sync_config(sndk_cfg, current_mid=100.0, bbw_info=bear_info)
+    en_tl1, _ = sndk_trk2.evaluate_tick(100.98, 101.00, 100.99, sndk_cfg, is_net_mode=False, bbw_info=bear_info)
+    assert [e["slot_id"] for e in en_tl1] == ["L1"]
+
+    # 3) TREND_GRID Bollinger-adaptive dead-zone convergence (BTC 1.2% BBW & TRX 0.2% BBW with dz=3.0)
+    btc_cfg = sndk_cfg.model_copy(
+        update={
+            "symbol": "BTC/USDT:USDT",
+            "trend_dead_zone_mult": 3.0,  # fixed dz_ratio = 2.40%
+            "trend_use_bb_breakout": True,
+        }
+    )
+    tight_btc_bb = {
+        "timeframe": "15m",
+        "bbw_pct": 1.2,
+        "bbw_percentile": 40.0,
+        "bb_upper": 100.60,
+        "bb_middle": 100.0,
+        "bb_lower": 99.40,
+        "trend_bias": "RANGE",
+        "breakout_expansion": "NONE",
+    }
+    btc_trk = LongShortGridTracker("BTC/USDT:USDT")
+    btc_trk.sync_config(btc_cfg, current_mid=100.0, bbw_info=tight_btc_bb)
+    # eff_dz_ratio = min(0.024, max(0.008, 0.012 * 0.75)) = 0.009 -> L1=100.90, S1=99.10 (NOT 102.40 / 97.60!)
+    assert btc_trk.levels["L1"]["trigger_price"] == 100.90
+    assert btc_trk.levels["S1"]["trigger_price"] == 99.10
+    en_btc, _ = btc_trk.evaluate_tick(100.93, 100.95, 100.94, btc_cfg, is_net_mode=False, bbw_info=tight_btc_bb)
+    assert [e["slot_id"] for e in en_btc] == ["L1"]
+
+    # Ultra-tight BBW (0.2%, TRX scenario) hits the >= step (0.80%) anti-chop floor
+    trx_bb = {**tight_btc_bb, "bbw_pct": 0.2, "bb_upper": 100.10, "bb_lower": 99.90}
+    trx_trk = LongShortGridTracker("TRX/USDT:USDT")
+    trx_trk.sync_config(btc_cfg, current_mid=100.0, bbw_info=trx_bb)
+    assert trx_trk.levels["L1"]["trigger_price"] == 100.80
+    assert trx_trk.levels["S1"]["trigger_price"] == 99.20
+
+    # With trend_use_bb_breakout=False, wide fixed dz=3.0 (2.40%) is preserved verbatim
+    fixed_dz_cfg = btc_cfg.model_copy(update={"trend_use_bb_breakout": False})
+    fixed_trk = LongShortGridTracker("BTC/USDT:USDT")
+    fixed_trk.sync_config(fixed_dz_cfg, current_mid=100.0, bbw_info=tight_btc_bb)
+    assert fixed_trk.levels["L1"]["trigger_price"] == 102.40
+    assert fixed_trk.levels["S1"]["trigger_price"] == 97.60
+
+    # 4) TREND_GRID pyramid L2..Ln re-anchoring to open L1 + needs_post_trend_recenter state persistence (SPCX scenario)
+    spcx_cfg = sndk_cfg.model_copy(
+        update={
+            "symbol": "SPCX/USDT:USDT",
+            "trend_dead_zone_mult": 2.5,
+            "trend_use_bb_breakout": False,
+        }
+    )
+    spcx_trk = LongShortGridTracker("SPCX/USDT:USDT")
+    spcx_trk.sync_config(spcx_cfg, current_mid=130.0)
+    # Initially L1=132.60, L2=133.64 (+2.8% above center). Recover an open L1 filled at 130.95 -> L2 MUST re-anchor to 130.95*1.008 = 132.00!
+    rec_sid = spcx_trk.recover_open_position("LONG", 130.95, 0.5, 0.5, 1.0, spcx_cfg, 0.001)
+    assert rec_sid == "L1"
+    assert spcx_trk.levels["L2"]["trigger_price"] == round(130.95 * 1.008, 2)
+    assert spcx_trk.levels["L3"]["trigger_price"] == round(130.95 * 1.016, 2)
+    en_l2, _ = spcx_trk.evaluate_tick(132.01, 132.03, 132.02, spcx_cfg, is_net_mode=False)
+    assert [e["slot_id"] for e in en_l2] == ["L2"]
+
+    # export_state / restore_state round-trips needs_post_trend_recenter AND re-anchors L2 away from stale 133.64!
+    spcx_trk.levels["L2"]["status"] = "IDLE"
+    spcx_trk._needs_post_trend_recenter = True
+    exported = spcx_trk.export_state()
+    assert exported["needs_post_trend_recenter"] is True
+    spcx_restored = LongShortGridTracker("SPCX/USDT:USDT")
+    spcx_restored.restore_state(exported, spcx_cfg)
+    assert spcx_restored._needs_post_trend_recenter is True
+    assert spcx_restored.levels["L2"]["trigger_price"] == round(130.95 * 1.008, 2)
+    # Even if an old state left a stranded L2 trigger at 135.50, evaluate_tick anchors against L1 entry + step!
+    spcx_restored.levels["L2"]["trigger_price"] = 135.50
+    en_l2_res, _ = spcx_restored.evaluate_tick(132.01, 132.03, 132.02, spcx_cfg, is_net_mode=False)
+    assert [e["slot_id"] for e in en_l2_res] == ["L2"]
+
+    # 5) validate_and_batch_update_symbols flags wide trend_dead_zone_mult on TREND_GRID & applies updates
+    with tempfile.TemporaryDirectory() as tmpdir:
+        adb = AsyncDatabaseManager(db_path=os.path.join(tmpdir, "dz_audit.db"))
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(97)
+        wide_tr = SymbolStrategy(
+            symbol="BTC/USDT:USDT",
+            strategy_type="TREND_GRID",
+            grid_levels=3,
+            grid_step_pct=0.008,
+            grid_range_pct=0.04,
+            grid_stop_loss_pct=0.04,
+            trend_dead_zone_mult=3.0,
+            trend_trailing_mult=1.5,
+            order_usdt=25.0,
+            leverage=5,
+            price_precision=1,
+            qty_precision=3,
+        )
+        adb.upsert_symbol_sync(wide_tr, user_id=97)
+        eng = BidirectionalSniperEngine(adb, user_id=97)
+        eng._register_symbol_internal(wide_tr)
+
+        v_res = eng.validate_and_batch_update_symbols(BatchSymbolUpdateRequest(action="validate"))
+        assert v_res["ok"] is True
+        assert v_res["items"][0]["trend_dead_zone_mult"] == 3.0
+        assert any("顺势首格死区偏宽" in msg for msg in v_res["items"][0]["issues"])
+
+        a_res = eng.validate_and_batch_update_symbols(
+            BatchSymbolUpdateRequest(action="apply", trend_dead_zone_mult=1.2)
+        )
+        assert a_res["ok"] is True
+        assert eng.strategies["BTC/USDT:USDT"].trend_dead_zone_mult == 1.2
+
 
 
 

@@ -226,6 +226,11 @@ const buildGridPreviewAndDiagnostics = (cfg, okxMinNotional = 0, followerMid = 0
       severity: 'warn',
       msg: `顺势死区 (${(dzMult * step * 100).toFixed(2)}%) 超出区间 (±${(rng * 100).toFixed(2)}%)`,
     });
+  } else if (isTrendLike && (dzMult > 2.0 + 1e-6 || dzMult * step > Math.max(0.018, step * 2.2) + 1e-6)) {
+    alerts.push({
+      severity: 'warn',
+      msg: `顺势死区 (${dzMult}x = ${(dzMult * step * 100).toFixed(2)}%) 偏宽，低波行情易难触发（建议 1.0x~1.5x；开启布林带确认后引擎会自动按 BBW 收敛首格）`,
+    });
   }
   if (slRoePct > 35) {
     alerts.push({
@@ -523,6 +528,7 @@ export default function App() {
     grid_take_profit_pct_str: '0.65',
     grid_range_pct_str: '',
     grid_stop_loss_pct_str: '',
+    trend_dead_zone_mult_str: '',
     trend_trailing_mult_str: '',
     use_post_only_tp_mode: 'keep',
     sl_trigger_px_type_mode: 'keep',
@@ -1457,6 +1463,10 @@ export default function App() {
         payload.grid_stop_loss_pct = Number((slPct / 100).toFixed(6));
       }
       if (!isOscOnlyBatch) {
+        const dzMult = Number(batchForm.trend_dead_zone_mult_str);
+        if (batchForm.trend_dead_zone_mult_str !== '' && Number.isFinite(dzMult) && dzMult >= 0.5) {
+          payload.trend_dead_zone_mult = Number(dzMult.toFixed(3));
+        }
         const trailMult = Number(batchForm.trend_trailing_mult_str);
         if (batchForm.trend_trailing_mult_str !== '' && Number.isFinite(trailMult) && trailMult >= 0.3) {
           payload.trend_trailing_mult = Number(trailMult.toFixed(3));
@@ -3170,19 +3180,34 @@ export default function App() {
                         />
                       </div>
                       {showBatchTrendTrail && (
-                        <div>
-                          <label className="block text-[11px] font-semibold text-dim mb-1">顺势追踪倍率 (x)</label>
-                          <input
-                            type="number"
-                            step="0.1"
-                            min="0.3"
-                            max="10"
-                            placeholder="留空不改 (如 1.25)"
-                            value={batchForm.trend_trailing_mult_str}
-                            onChange={(e) => setBatchForm((prev) => ({ ...prev, trend_trailing_mult_str: e.target.value }))}
-                            className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
-                          />
-                        </div>
+                        <>
+                          <div>
+                            <label className="block text-[11px] font-semibold text-dim mb-1">顺势死区倍率 (x)</label>
+                            <input
+                              type="number"
+                              step="0.25"
+                              min="0.5"
+                              max="10"
+                              placeholder="留空不改 (建议 1.25)"
+                              value={batchForm.trend_dead_zone_mult_str}
+                              onChange={(e) => setBatchForm((prev) => ({ ...prev, trend_dead_zone_mult_str: e.target.value }))}
+                              className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-semibold text-dim mb-1">顺势追踪倍率 (x)</label>
+                            <input
+                              type="number"
+                              step="0.1"
+                              min="0.3"
+                              max="10"
+                              placeholder="留空不改 (如 1.25)"
+                              value={batchForm.trend_trailing_mult_str}
+                              onChange={(e) => setBatchForm((prev) => ({ ...prev, trend_trailing_mult_str: e.target.value }))}
+                              className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                            />
+                          </div>
+                        </>
                       )}
                       {showBatchMakerPo && (
                         <div>
@@ -4028,23 +4053,6 @@ export default function App() {
                             </div>
                           </div>
 
-                          {isLongShortGrid && (
-                            <div>
-                              <label className="font-bold text-main block mb-2">EMA 趋势防逆势过滤周期</label>
-                              <select
-                                value={currentStrategy.bbw_timeframe || '15m'}
-                                onChange={(e) => updateCurrentStrategyField({ bbw_timeframe: e.target.value })}
-                                className="w-full rounded-xl surface-subtle px-3 py-2.5 text-xs font-semibold text-main outline-none"
-                              >
-                                <option value="15m">15 分钟 (15m · 灵敏识别单边)</option>
-                                <option value="1H">1 小时 (1H · 稳健趋势过滤)</option>
-                              </select>
-                              <div className="text-[10px] text-dim mt-1 leading-snug">
-                                强单边行情下自动暂停逆势方向挂网，防止单边接飞刀
-                              </div>
-                            </div>
-                          )}
-
                           <div>
                             <label className="font-bold text-main block mb-2">OKX 条件止损触发价类型</label>
                             <select
@@ -4247,7 +4255,7 @@ export default function App() {
 
                               <div>
                                 <label className="font-bold text-main block mb-1.5">
-                                  {isTrendGrid ? '布林带突破与 EMA 趋势周期' : 'VCP / BBW 检测 K 线周期'}
+                                  {isTrendGrid ? '布林带突破检测 K 线周期' : 'VCP / BBW 检测 K 线周期'}
                                 </label>
                                 <select
                                   value={currentStrategy.bbw_timeframe || '15m'}
@@ -4300,9 +4308,9 @@ export default function App() {
                               </label>
                               <label className="surface-card p-3.5 rounded-xl flex items-center justify-between gap-3 cursor-pointer">
                                 <div>
-                                  <div className="text-xs font-bold text-main">首格结合布林带上/下轨外侧确认</div>
+                                  <div className="text-xs font-bold text-main">首格结合布林带上/下轨自适应确认</div>
                                   <div className="text-[11px] text-dim mt-0.5">
-                                    同时突破缓冲死区与 {currentStrategy.bbw_timeframe || '15m'} 布林带轨道才触发首格，过滤假突破
+                                    结合 {currentStrategy.bbw_timeframe || '15m'} 布林带宽度自适应收敛过宽死区并对齐上/下轨突破位，避免低波行情长期难触发
                                   </div>
                                 </div>
                                 <input
@@ -4388,6 +4396,10 @@ export default function App() {
                                       className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
                                         isReverseOscActive
                                           ? 'bg-teal-500/15 text-teal-700 dark:text-teal-300'
+                                          : isLongShortGrid
+                                          ? 'bg-sky-500/15 text-sky-700 dark:text-sky-300'
+                                          : isTrendGrid
+                                          ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300'
                                           : gSnap.trend_bias === 'BULL'
                                           ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
                                           : gSnap.trend_bias === 'BEAR'
@@ -4397,6 +4409,10 @@ export default function App() {
                                     >
                                       {isReverseOscActive
                                         ? '多空双向网格套利 · 涨破多/跌破空均生效'
+                                        : isLongShortGrid
+                                        ? '传统震荡双向网格 · 跌破接多/涨破开空均生效'
+                                        : isTrendGrid
+                                        ? '顺势突破双向追单 · 涨破追多/跌破追空均生效'
                                         : gSnap.trend_bias === 'BULL'
                                         ? '多头趋势 · 顺多禁逆空'
                                         : gSnap.trend_bias === 'BEAR'

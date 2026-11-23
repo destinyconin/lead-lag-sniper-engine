@@ -152,9 +152,9 @@ class LongShortGridTracker:
 
     def _resolve_target_mode(self, cfg: SymbolStrategy, bbw_info: Optional[dict] = None) -> Tuple[str, str]:
         if cfg.strategy_type == "TREND_GRID":
-            return "TREND_BREAKOUT", "手动指定顺势突破网格"
+            return "TREND_BREAKOUT", "手动指定顺势突破网格（涨破追多 / 跌破追空 · BB波动率自适应死区）"
         if cfg.strategy_type == "LONG_SHORT_GRID":
-            return "MEAN_REVERSION", "手动指定传统震荡网格"
+            return "MEAN_REVERSION", "手动指定传统震荡网格（跌破接多 / 涨破开空 · 双向网格套利）"
         if cfg.strategy_type == "REVERSE_GRID":
             return "REVERSE_OSCILLATING", "手动指定多空震荡网格（跌破开空 / 涨破开多）"
 
@@ -250,23 +250,31 @@ class LongShortGridTracker:
             bb_upper = float(info.get("bb_upper") or 0.0) if (cfg.trend_use_bb_breakout and info) else 0.0
             bb_lower = float(info.get("bb_lower") or 0.0) if (cfg.trend_use_bb_breakout and info) else 0.0
             bb_pct_rank = float(info.get("bbw_percentile", 0.0)) if info else 0.0
+            eff_dz_ratio = dz_ratio
+            if cfg.trend_use_bb_breakout and bb_upper > bb_lower > 0:
+                bb_mid_ref = float(info.get("bb_middle") or ((bb_upper + bb_lower) * 0.5) or self.center_price)
+                live_bbw = (bb_upper - bb_lower) / max(1e-12, bb_mid_ref)
+                if live_bbw > 0:
+                    # Adapt wide fixed dead-zone (e.g., 2.5x~3x on low-volatility coins) to live Bollinger Band Width
+                    # so genuine BB breakouts still trigger while keeping a >= min(dz_ratio, step) anti-chop floor.
+                    eff_dz_ratio = min(dz_ratio, max(min(dz_ratio, step), live_bbw * 0.75))
             # Cap ONLY L1/S1 distance from center:
-            # - During extreme VCP squeeze (bbw_percentile <= 25%), allow BB alignment up to max(1.6*dz, 2.2%).
-            # - During normal volatility bands (25% < bbw_percentile <= 55%), cap at 1.25*dz to prevent
+            # - During extreme VCP squeeze (bbw_percentile <= 25%), allow BB alignment up to max(1.6*eff_dz, 2.2%).
+            # - During normal volatility bands (25% < bbw_percentile <= 55%), cap at 1.25*eff_dz to prevent
             #   over-wide L1/S1 entries with -2.0%~-3.0% false-breakout stop distance back to center.
-            # - During blown-out high-volatility expansion (bbw_percentile > 55%), cap tightly at 1.15*dz.
+            # - During blown-out high-volatility expansion (bbw_percentile > 55%), cap tightly at 1.15*eff_dz.
             if bb_pct_rank > 55.0:
-                bb_cap = dz_ratio * 1.15
-                max_first_span = max(dz_ratio * 1.15, step * 1.25)
+                bb_cap = eff_dz_ratio * 1.15
+                max_first_span = max(eff_dz_ratio * 1.15, step * 1.25)
             elif bb_pct_rank > 25.0:
-                bb_cap = dz_ratio * 1.25
-                max_first_span = max(dz_ratio * 1.25, step * 1.35)
+                bb_cap = eff_dz_ratio * 1.25
+                max_first_span = max(eff_dz_ratio * 1.25, step * 1.35)
             else:
-                bb_cap = max(dz_ratio * 1.6, 0.022)
-                max_first_span = max(dz_ratio * 1.5, min(rng, bb_cap), step * 2.0)
+                bb_cap = max(eff_dz_ratio * 1.6, 0.022)
+                max_first_span = max(eff_dz_ratio * 1.5, min(rng, bb_cap), step * 2.0)
 
             if cfg.grid_side_mode in ("LONG_SHORT", "LONG_ONLY"):
-                base_l1 = self.center_price * (1.0 + dz_ratio)
+                base_l1 = self.center_price * (1.0 + eff_dz_ratio)
                 if bb_upper > self.center_price:
                     base_l1 = min(self.center_price * (1.0 + max_first_span), max(base_l1, bb_upper))
                 long_triggers: List[float] = [
@@ -310,7 +318,7 @@ class LongShortGridTracker:
                     }
 
             if cfg.grid_side_mode in ("LONG_SHORT", "SHORT_ONLY"):
-                base_s1 = self.center_price * max(0.05, 1.0 - dz_ratio)
+                base_s1 = self.center_price * max(0.05, 1.0 - eff_dz_ratio)
                 if 0.0 < bb_lower < self.center_price:
                     base_s1 = max(self.center_price * max(0.05, 1.0 - max_first_span), min(base_s1, bb_lower))
                 short_triggers: List[float] = [
@@ -978,18 +986,20 @@ class LongShortGridTracker:
         if not allow_entries or now_m < self._post_sl_cooldown_until_mono:
             return [], exits
 
-        # 3. Check IDLE slots for new grid entries (with 15m/1H EMA trend direction filter!)
+        # 3. Check IDLE slots for new grid entries (EMA trend filter applies ONLY to ADAPTIVE_GRID;
+        #    manual LONG_SHORT_GRID, REVERSE_GRID & TREND_GRID operate bidirectionally unrestricted by lagging EMA!)
         has_long_active = self._has_active_slots("LONG")
         has_short_active = self._has_active_slots("SHORT")
         step = max(0.0001, float(cfg.grid_step_pct))
         trend_bias = self._resolve_effective_trend_bias(valid_bbw)
+        use_ema_filter = cfg.strategy_type == "ADAPTIVE_GRID"
 
         if self.active_grid_mode == "TREND_BREAKOUT":
             if exits or any(lv.get("status") == "EXITING" and lv.get("exiting_is_sl") for lv in self.levels.values()):
                 return [], exits
             # Strictly monotonic breakout pyramid: only enter `max_active_idx + 1` (never re-open L1 under an open L2!)
-            allow_trend_long = (cfg.grid_side_mode in ("LONG_SHORT", "LONG_ONLY")) and (trend_bias != "BEAR")
-            allow_trend_short = (cfg.grid_side_mode in ("LONG_SHORT", "SHORT_ONLY")) and (trend_bias != "BULL")
+            allow_trend_long = (cfg.grid_side_mode in ("LONG_SHORT", "LONG_ONLY")) and (not use_ema_filter or trend_bias != "BEAR")
+            allow_trend_short = (cfg.grid_side_mode in ("LONG_SHORT", "SHORT_ONLY")) and (not use_ema_filter or trend_bias != "BULL")
             if allow_trend_long:
                 max_active_l = max(
                     (int(lv.get("level_idx") or 0) for lv in self.levels.values() if lv["side"] == "LONG" and lv["status"] in ("ENTERING", "OPEN", "EXITING")),
@@ -1019,7 +1029,9 @@ class LongShortGridTracker:
                             break
                         prev_entry = float(prev_lv.get("entry_price") or 0.0)
                         if prev_entry > 0:
-                            min_req_px = max(min_req_px, round(prev_entry * (1.0 + step * 0.90), prec))
+                            # Anchor add-on trigger to prev_entry + step so dz/BB changes or recovery never strand L2..Ln far above L1!
+                            step_anchor_l = round(prev_entry * (1.0 + step), prec)
+                            min_req_px = max(min(min_req_px, step_anchor_l), round(prev_entry * (1.0 + step * 0.90), prec))
                     if ask >= min_req_px:
                         lv["status"] = "ENTERING"
                         has_long_active = True
@@ -1056,7 +1068,8 @@ class LongShortGridTracker:
                             break
                         prev_entry = float(prev_lv.get("entry_price") or 0.0)
                         if prev_entry > 0:
-                            max_req_px = min(max_req_px, round(prev_entry * max(0.05, 1.0 - step * 0.90), prec))
+                            step_anchor_s = round(prev_entry * max(0.05, 1.0 - step), prec)
+                            max_req_px = min(max(max_req_px, step_anchor_s), round(prev_entry * max(0.05, 1.0 - step * 0.90), prec))
                     if bid <= max_req_px:
                         lv["status"] = "ENTERING"
                         has_short_active = True
@@ -1159,15 +1172,20 @@ class LongShortGridTracker:
                     res_px = round(bid * max(0.05, 1.0 - cfg.slippage_pct), prec)
                     entries.append({**chosen, "reservation_price": res_px, "trigger_exec_price": bid})
         else:
-            # Traditional Mean-Reversion entries: max 1 entry per side per tick, enforce spacing vs open siblings, respect post-SL cooldown
+            # Traditional Mean-Reversion entries (跌破接多 / 涨破开空):
+            # - Max 1 entry per side per tick, guard against concurrent ENTERING slots, respect post-SL cooldown
+            # - Manual LONG_SHORT_GRID runs bidirectionally unrestricted by lagging EMA trend_bias (ADAPTIVE_GRID retains EMA guard)
+            # - Symmetric anti-stacking spacing (0.55 * step) allows inner levels to re-enter cleanly after partial TP / recovery
             if (
                 now_m < self._post_sl_cooldown_until_mono
                 or any("SL" in str(e.get("exit_reason") or "") for e in exits)
                 or any(lv.get("status") == "EXITING" and lv.get("exiting_is_sl") for lv in self.levels.values())
             ):
                 return [], exits
-            sl_guard_long = self.center_price * max(0.05, 1.0 - float(cfg.grid_stop_loss_pct) * 0.90)
-            sl_guard_short = self.center_price * (1.0 + float(cfg.grid_stop_loss_pct) * 0.90)
+            sl_guard_long = self.center_price * max(0.05, 1.0 - float(cfg.grid_stop_loss_pct) * 0.95)
+            sl_guard_short = self.center_price * (1.0 + float(cfg.grid_stop_loss_pct) * 0.95)
+            has_entering_long = any(lv["side"] == "LONG" and lv["status"] == "ENTERING" for lv in self.levels.values())
+            has_entering_short = any(lv["side"] == "SHORT" and lv["status"] == "ENTERING" for lv in self.levels.values())
             open_long_entries = [
                 float(lv.get("entry_price") or 0.0)
                 for lv in self.levels.values()
@@ -1178,44 +1196,63 @@ class LongShortGridTracker:
                 for lv in self.levels.values()
                 if lv["side"] == "SHORT" and lv["status"] == "OPEN" and float(lv.get("entry_price") or 0.0) > 0
             ]
-            entered_sides: set[str] = set()
 
-            for slot_id, lv in self.levels.items():
-                if len(entries) >= 2:
-                    break
-                if lv["status"] != "IDLE" or lv["side"] in entered_sides:
-                    continue
-                if lv["side"] == "LONG" and (cfg.grid_side_mode == "SHORT_ONLY" or trend_bias == "BEAR"):
-                    continue
-                if lv["side"] == "SHORT" and (cfg.grid_side_mode == "LONG_ONLY" or trend_bias == "BULL"):
-                    continue
-                cooldown_until = max(
-                    float(lv.get("cooldown_until_mono") or 0.0),
-                    (float(lv.get("last_closed_mono") or 0.0) + 1200.0) if float(lv.get("last_closed_mono") or 0.0) > 0 else 0.0,
-                )
-                if now_m < cooldown_until:
-                    continue
+            allow_mr_long = (cfg.grid_side_mode in ("LONG_SHORT", "LONG_ONLY")) and (not use_ema_filter or trend_bias != "BEAR")
+            allow_mr_short = (cfg.grid_side_mode in ("LONG_SHORT", "SHORT_ONLY")) and (not use_ema_filter or trend_bias != "BULL")
 
-                if lv["side"] == "LONG":
-                    if is_net_mode and has_short_active:
+            if (
+                not has_entering_long
+                and allow_mr_long
+                and not (is_net_mode and has_short_active)
+                and mid >= sl_guard_long
+            ):
+                long_cands = []
+                for lv in self.levels.values():
+                    if lv["side"] != "LONG" or lv["status"] != "IDLE":
                         continue
-                    spacing_cap = min(open_long_entries) * (1.0 - step * 0.85) if open_long_entries else float("inf")
-                    if ask <= lv["trigger_price"] and ask <= spacing_cap and mid >= sl_guard_long:
-                        lv["status"] = "ENTERING"
-                        has_long_active = True
-                        entered_sides.add("LONG")
-                        res_px = round(ask * (1.0 + cfg.slippage_pct), prec)
-                        entries.append({**lv, "reservation_price": res_px, "trigger_exec_price": ask})
-                else:
-                    if is_net_mode and has_long_active:
+                    cooldown_until = max(
+                        float(lv.get("cooldown_until_mono") or 0.0),
+                        (float(lv.get("last_closed_mono") or 0.0) + 1200.0)
+                        if float(lv.get("last_closed_mono") or 0.0) > 0
+                        else 0.0,
+                    )
+                    if now_m < cooldown_until:
                         continue
-                    spacing_floor = max(open_short_entries) * (1.0 + step * 0.85) if open_short_entries else 0.0
-                    if bid >= lv["trigger_price"] and bid >= spacing_floor and mid <= sl_guard_short:
-                        lv["status"] = "ENTERING"
-                        has_short_active = True
-                        entered_sides.add("SHORT")
-                        res_px = round(bid * max(0.05, 1.0 - cfg.slippage_pct), prec)
-                        entries.append({**lv, "reservation_price": res_px, "trigger_exec_price": bid})
+                    if ask <= float(lv["trigger_price"]):
+                        long_cands.append(lv)
+                if long_cands and all(abs(ask - ep) / ep >= step * 0.55 for ep in open_long_entries):
+                    chosen = min(long_cands, key=lambda x: (float(x["trigger_price"]), -int(x["level_idx"])))
+                    chosen["status"] = "ENTERING"
+                    has_long_active = True
+                    res_px = round(ask * (1.0 + cfg.slippage_pct), prec)
+                    entries.append({**chosen, "reservation_price": res_px, "trigger_exec_price": ask})
+
+            if (
+                not has_entering_short
+                and allow_mr_short
+                and not (is_net_mode and has_long_active)
+                and mid <= sl_guard_short
+            ):
+                short_cands = []
+                for lv in self.levels.values():
+                    if lv["side"] != "SHORT" or lv["status"] != "IDLE":
+                        continue
+                    cooldown_until = max(
+                        float(lv.get("cooldown_until_mono") or 0.0),
+                        (float(lv.get("last_closed_mono") or 0.0) + 1200.0)
+                        if float(lv.get("last_closed_mono") or 0.0) > 0
+                        else 0.0,
+                    )
+                    if now_m < cooldown_until:
+                        continue
+                    if bid >= float(lv["trigger_price"]):
+                        short_cands.append(lv)
+                if short_cands and all(abs(bid - ep) / ep >= step * 0.55 for ep in open_short_entries):
+                    chosen = max(short_cands, key=lambda x: (float(x["trigger_price"]), int(x["level_idx"])))
+                    chosen["status"] = "ENTERING"
+                    has_short_active = True
+                    res_px = round(bid * max(0.05, 1.0 - cfg.slippage_pct), prec)
+                    entries.append({**chosen, "reservation_price": res_px, "trigger_exec_price": bid})
 
         return entries, exits
 
@@ -1340,6 +1377,65 @@ class LongShortGridTracker:
                     entry_price * max(0.05, 1.0 - float(cfg.grid_take_profit_pct) - round_trip_fee), prec
                 )
                 lv["sl_price"] = round(self.center_price * (1.0 + sl_pct), prec)
+        if self.active_grid_mode == "TREND_BREAKOUT":
+            self._sync_trend_pyramid_triggers(cfg)
+
+    def _sync_trend_pyramid_triggers(self, cfg: SymbolStrategy):
+        """
+        Re-anchors IDLE higher pyramid levels (L(k+1)..Ln / S(k+1)..Sn) relative to the highest OPEN
+        base/pyramid leg's actual entry_price whenever a stale dead-zone/BB rebuild or position recovery
+        would otherwise strand them further than `step` away.
+        """
+        if self.active_grid_mode != "TREND_BREAKOUT":
+            return
+        prec = self._calc_prec(cfg)
+        step = max(0.0001, float(cfg.grid_step_pct))
+
+        open_longs = [
+            lv for lv in self.levels.values()
+            if lv["side"] == "LONG" and lv["status"] == "OPEN" and float(lv.get("entry_price") or 0.0) > 0
+        ]
+        if open_longs:
+            top_l = max(open_longs, key=lambda x: int(x.get("level_idx") or 0))
+            top_idx = int(top_l.get("level_idx") or 1)
+            anchor = float(top_l["entry_price"])
+            prev_px = anchor
+            for lv in sorted(
+                (x for x in self.levels.values() if x["side"] == "LONG" and int(x.get("level_idx") or 0) > top_idx),
+                key=lambda x: int(x.get("level_idx") or 0),
+            ):
+                if lv["status"] != "IDLE":
+                    prev_px = float(lv.get("entry_price") or lv.get("trigger_price") or prev_px)
+                    continue
+                delta = int(lv.get("level_idx") or top_idx + 1) - top_idx
+                exp_trig = round(anchor * (1.0 + delta * step), prec)
+                if float(lv.get("trigger_price") or 0.0) > exp_trig:
+                    lv["trigger_price"] = exp_trig
+                    lv["sl_price"] = round(prev_px, prec)
+                prev_px = float(lv["trigger_price"])
+
+        open_shorts = [
+            lv for lv in self.levels.values()
+            if lv["side"] == "SHORT" and lv["status"] == "OPEN" and float(lv.get("entry_price") or 0.0) > 0
+        ]
+        if open_shorts:
+            top_s = max(open_shorts, key=lambda x: int(x.get("level_idx") or 0))
+            top_idx = int(top_s.get("level_idx") or 1)
+            anchor = float(top_s["entry_price"])
+            prev_px = anchor
+            for lv in sorted(
+                (x for x in self.levels.values() if x["side"] == "SHORT" and int(x.get("level_idx") or 0) > top_idx),
+                key=lambda x: int(x.get("level_idx") or 0),
+            ):
+                if lv["status"] != "IDLE":
+                    prev_px = float(lv.get("entry_price") or lv.get("trigger_price") or prev_px)
+                    continue
+                delta = int(lv.get("level_idx") or top_idx + 1) - top_idx
+                exp_trig = round(anchor * max(0.05, 1.0 - delta * step), prec)
+                if float(lv.get("trigger_price") or 0.0) < exp_trig:
+                    lv["trigger_price"] = exp_trig
+                    lv["sl_price"] = round(prev_px, prec)
+                prev_px = float(lv["trigger_price"])
 
     def recover_open_position(
         self,
@@ -1443,6 +1539,7 @@ class LongShortGridTracker:
                     entry_price if self.short_trough_price <= 0 else min(self.short_trough_price, entry_price)
                 )
                 lv["sl_price"] = round(entry_price * (1.0 + sl_pct), prec)
+            self._sync_trend_pyramid_triggers(cfg)
         else:
             if self.active_grid_mode == "REVERSE_OSCILLATING":
                 lv["armed"] = False
@@ -1499,6 +1596,7 @@ class LongShortGridTracker:
             "completed_cycles": int(self.completed_cycles or 0),
             "total_net_pnl": float(self.total_net_pnl or 0.0),
             "last_bbw_info": dict(self.last_bbw_info) if isinstance(self.last_bbw_info, dict) else None,
+            "needs_post_trend_recenter": bool(self._needs_post_trend_recenter),
             "open_slots": open_slots,
             "disarmed_slots": disarmed_slots,
         }
@@ -1531,6 +1629,7 @@ class LongShortGridTracker:
         self.total_net_pnl = float(data.get("total_net_pnl") or self.total_net_pnl)
         self.long_peak_price = float(data.get("long_peak_price") or 0.0)
         self.short_trough_price = float(data.get("short_trough_price") or 0.0)
+        self._needs_post_trend_recenter = bool(data.get("needs_post_trend_recenter", False))
         prec = self._calc_prec(cfg)
 
         for slot in data.get("open_slots") or []:
@@ -1596,6 +1695,8 @@ class LongShortGridTracker:
             lv["cond_sl_algo_id"] = sl_id if lv["cond_sl_live"] else ""
             lv["cond_sl_touched_mono"] = 0.0
             lv["opened_mono_ms"] = mono_ms()
+        if self.active_grid_mode == "TREND_BREAKOUT":
+            self._sync_trend_pyramid_triggers(cfg)
 
     def mark_entry_missed(self, slot_id: str, backoff_ms: float = 1200.0):
         lv = self.levels.get(slot_id)
