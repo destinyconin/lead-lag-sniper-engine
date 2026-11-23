@@ -4576,6 +4576,154 @@ def test_long_short_grid_and_trend_grid_trigger_fixes():
         assert eng.strategies["BTC/USDT:USDT"].trend_dead_zone_mult == 1.2
 
 
+def test_isolated_grid_strategy_modules_and_zero_cross_impact():
+    """
+    Verifies that every grid strategy is implemented in its own isolated class/module with
+    zero cross-strategy state or trading-logic interference:
+    1) Each strategy_type routes to its dedicated module & class (no cross-subclass coupling).
+    2) REVERSE_GRID (多空震荡网格) arbitrage is 100% insulated from BBW, EMA, and trend_dead_zone_mult updates.
+    3) Runtime strategy switching never swaps mid-position and cleanly swaps with zero state leakage once flat.
+    4) Polymorphic strategy hooks (maker TP, Livermore SL, log tags, SL exit reason, reset_runtime_state) work per strategy.
+    """
+    from backend.grid_engine import (
+        AdaptiveVcpGridStrategy,
+        BaseGridStrategy,
+        LongShortGridTracker,
+        MeanReversionGridStrategy,
+        ReverseOscillatingGridStrategy,
+        TrendBreakoutGridStrategy,
+    )
+    from backend.models import SymbolStrategy
+
+    # 1) Distinct isolated modules & classes (zero subclass coupling between concrete strategies)
+    concrete = [
+        MeanReversionGridStrategy,
+        ReverseOscillatingGridStrategy,
+        TrendBreakoutGridStrategy,
+        AdaptiveVcpGridStrategy,
+    ]
+    assert len({cls.__module__ for cls in concrete}) == 4
+    for cls in concrete:
+        assert issubclass(cls, BaseGridStrategy)
+        for other in concrete:
+            if cls is not other:
+                assert not issubclass(cls, other)
+
+    base_kwargs = dict(
+        symbol="SOL/USDT:USDT",
+        grid_side_mode="LONG_SHORT",
+        grid_levels=3,
+        grid_step_pct=0.006,
+        grid_take_profit_pct=0.0065,
+        grid_range_pct=0.03,
+        grid_stop_loss_pct=0.04,
+        order_usdt=20.0,
+        leverage=5,
+        price_precision=2,
+        qty_precision=2,
+    )
+    mr_cfg = SymbolStrategy(strategy_type="LONG_SHORT_GRID", **base_kwargs)
+    rev_cfg = SymbolStrategy(strategy_type="REVERSE_GRID", **base_kwargs)
+    tr_cfg = SymbolStrategy(strategy_type="TREND_GRID", trend_dead_zone_mult=1.5, **base_kwargs)
+    adp_cfg = SymbolStrategy(strategy_type="ADAPTIVE_GRID", trend_dead_zone_mult=1.5, **base_kwargs)
+
+    # Verify router dispatches each strategy_type to its exact isolated implementation
+    for cfg_i, expected_cls in (
+        (mr_cfg, MeanReversionGridStrategy),
+        (rev_cfg, ReverseOscillatingGridStrategy),
+        (tr_cfg, TrendBreakoutGridStrategy),
+        (adp_cfg, AdaptiveVcpGridStrategy),
+    ):
+        t_i = LongShortGridTracker("SOL/USDT:USDT")
+        t_i.sync_config(cfg_i, current_mid=100.0)
+        assert type(t_i.strategy) is expected_cls
+
+    # 2) REVERSE_GRID arbitrage completely insulated from trend/BBW/EMA changes
+    rev_trk = LongShortGridTracker("SOL/USDT:USDT", strategy_type="REVERSE_GRID")
+    rev_trk.sync_config(rev_cfg, current_mid=100.0)
+    assert type(rev_trk.strategy) is ReverseOscillatingGridStrategy
+    assert rev_trk.levels["L1"]["trigger_price"] == 100.60
+    assert rev_trk.levels["S1"]["trigger_price"] == 99.40
+
+    # Mutating unrelated trend_dead_zone_mult or feeding extreme BULL/BEAR BBW must NOT rebuild REVERSE_GRID or alter armed state!
+    rev_trk.levels["L1"]["armed"] = False
+    rev_cfg_trend_tweaked = rev_cfg.model_copy(update={"trend_dead_zone_mult": 5.0, "bbw_squeeze_percentile": 5.0})
+    extreme_bbw = {
+        "timeframe": "15m",
+        "bbw_pct": 0.4,
+        "bbw_percentile": 3.0,
+        "bb_upper": 100.2,
+        "bb_middle": 100.0,
+        "bb_lower": 99.8,
+        "trend_bias": "BULL",
+        "breakout_expansion": "UP_BREAKOUT",
+    }
+    rev_trk.sync_config(rev_cfg_trend_tweaked, current_mid=100.0, bbw_info=extreme_bbw)
+    assert rev_trk.levels["L1"]["armed"] is False  # NOT wiped by unrelated trend/BBW change!
+    assert rev_trk.last_bbw_info is None
+
+    # Full REVERSE_GRID arbitrage cycle under opposing BULL EMA: breakdown S1 -> TP -> shallow bounce re-arm -> S1 again!
+    en_s1, _ = rev_trk.evaluate_tick(99.38, 99.39, 99.385, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=extreme_bbw)
+    assert [e["slot_id"] for e in en_s1] == ["S1"]
+    rev_trk.mark_entry_filled("S1", 99.38, 0.2, 0.2, 1.0, rev_cfg, 0.0007)
+    en_at_tp, ex_tp = rev_trk.evaluate_tick(98.60, 98.62, 98.61, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=extreme_bbw)
+    for e_sub in en_at_tp:
+        rev_trk.mark_entry_missed(e_sub["slot_id"])
+    assert [e["slot_id"] for e in ex_tp] == ["S1"] and ex_tp[0]["exit_reason"] == "GRID_TP"
+    rev_trk.mark_exited("S1", 0.12, is_sl=False)
+    rev_trk.levels["S1"]["cooldown_until_mono"] = 0.0
+    rev_trk.levels["S1"]["last_closed_mono"] = 0.0
+    # Re-arm on shallow bounce above S1 (99.40 * 1.0004 = 99.44) and fire again
+    rev_trk.evaluate_tick(99.43, 99.45, 99.44, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=extreme_bbw)
+    assert rev_trk.levels["S1"]["armed"] is True
+    en_s1_2, _ = rev_trk.evaluate_tick(99.38, 99.39, 99.385, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=extreme_bbw)
+    assert [e["slot_id"] for e in en_s1_2] == ["S1"]
+
+    # 3) Live strategy switching: never swaps mid-position, cleanly swaps with zero state bleed once flat
+    sw_trk = LongShortGridTracker("SOL/USDT:USDT", strategy_type="TREND_GRID")
+    sw_trk.sync_config(tr_cfg, current_mid=100.0)
+    en_tl1, _ = sw_trk.evaluate_tick(101.0, 101.02, 101.01, tr_cfg, is_net_mode=False)
+    assert [e["slot_id"] for e in en_tl1] == ["L1"]
+    sw_trk.mark_entry_filled("L1", 101.02, 0.3, 0.3, 1.0, tr_cfg, 0.001)
+    assert sw_trk.long_peak_price == 101.02
+
+    # Attempt switch to REVERSE_GRID while L1 is OPEN -> MUST keep TrendBreakoutGridStrategy managing open L1!
+    sw_trk.sync_config(rev_cfg, current_mid=101.5)
+    assert type(sw_trk.strategy) is TrendBreakoutGridStrategy
+    assert sw_trk.levels["L1"]["status"] == "OPEN"
+
+    # Close L1 -> flat -> next sync_config swaps cleanly to ReverseOscillatingGridStrategy with zero trend state bleed!
+    sw_trk.mark_exited("L1", 1.25, is_sl=False)
+    assert sw_trk._needs_post_trend_recenter is True
+    sw_trk.sync_config(rev_cfg, current_mid=150.0)
+    assert type(sw_trk.strategy) is ReverseOscillatingGridStrategy
+    assert sw_trk.active_grid_mode == "REVERSE_OSCILLATING"
+    assert sw_trk.center_price == 150.0
+    assert sw_trk.long_peak_price == 0.0
+    assert sw_trk._needs_post_trend_recenter is False
+    assert sw_trk.completed_cycles == 1
+    assert sw_trk.total_net_pnl == 1.25
+    assert sw_trk.levels["L1"]["trigger_price"] > 150.0
+    assert sw_trk.levels["S1"]["trigger_price"] < 150.0
+
+    # 4) Polymorphic hooks & clean reset_runtime_state
+    assert rev_trk.supports_maker_tp(rev_cfg) is True
+    assert rev_trk.uses_livermore_sl_amend() is False
+    assert rev_trk.get_entry_log_tags("LONG") == ("多空震荡开仓", "涨破开多")
+    assert rev_trk.get_exit_log_tag() == "多空震荡平仓"
+    assert rev_trk.get_mode_display_name() == "多空震荡"
+
+    tr_only = LongShortGridTracker("SOL/USDT:USDT", strategy_type="TREND_GRID")
+    tr_only.sync_config(tr_cfg, current_mid=100.0)
+    assert tr_only.supports_maker_tp(tr_cfg) is False
+    assert tr_only.uses_livermore_sl_amend() is True
+    assert tr_only.get_cond_sl_exit_reason({"side": "LONG", "entry_price": 100.0, "sl_price": 100.2}) == "TREND_BE_SL"
+    assert tr_only.get_cond_sl_exit_reason({"side": "LONG", "entry_price": 100.0, "sl_price": 98.0}) == "TREND_SL"
+    tr_only.reset_runtime_state()
+    assert tr_only.center_price == 0.0 and tr_only.levels == {} and tr_only._last_sig_params is None
+
+
+
 
 
 

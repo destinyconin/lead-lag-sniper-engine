@@ -554,13 +554,7 @@ class BidirectionalSniperEngine:
                     )
                     self.executor._active_cond_sl_orders.pop(gk, None)
                     e_px = float(lv.get("entry_price") or 0.0)
-                    side = lv["side"]
-                    if tracker.active_grid_mode == "TREND_BREAKOUT":
-                        sl_px = float(lv.get("sl_price") or 0.0)
-                        is_be = (side == "LONG" and sl_px >= e_px) or (side == "SHORT" and sl_px <= e_px)
-                        sl_reason = "TREND_BE_SL" if is_be else "TREND_SL"
-                    else:
-                        sl_reason = "GRID_SL"
+                    sl_reason = tracker.get_cond_sl_exit_reason(lv)
                     self._finalize_grid_slot_trade(
                         cfg=cfg,
                         tracker=tracker,
@@ -859,13 +853,7 @@ class BidirectionalSniperEngine:
                                     self.active_grid_positions[gk]["cond_sl_live"] = False
                                 state_changed = True
                                 continue
-                            e_px = float(lv.get("entry_price") or 0.0)
-                            if tracker.active_grid_mode == "TREND_BREAKOUT":
-                                sl_px = float(lv.get("sl_price") or 0.0)
-                                is_be = (side == "LONG" and sl_px >= e_px) or (side == "SHORT" and sl_px <= e_px)
-                                sl_reason = "TREND_BE_SL" if is_be else "TREND_SL"
-                            else:
-                                sl_reason = "GRID_SL"
+                            sl_reason = tracker.get_cond_sl_exit_reason(lv)
                             self._finalize_grid_slot_trade(
                                 cfg=cfg,
                                 tracker=tracker,
@@ -1148,7 +1136,7 @@ class BidirectionalSniperEngine:
                     if is_grid_strategy(cfg.strategy_type):
                         tracker = self.grid_trackers.get(sym)
                         if tracker is None:
-                            tracker = LongShortGridTracker(sym)
+                            tracker = LongShortGridTracker(sym, strategy_type=cfg.strategy_type)
                             self.grid_trackers[sym] = tracker
                             bbw_inf = self.gateway.get_volatility_regime(sym, cfg.bbw_timeframe)
                             tracker.sync_config(cfg, current_mid=mark_px or entry_px, bbw_info=bbw_inf)
@@ -1567,7 +1555,7 @@ class BidirectionalSniperEngine:
         self.symbol_rolling_pnls.setdefault(("LIVE", sym), deque(maxlen=100))
         tracker = self.grid_trackers.get(sym)
         if tracker is None:
-            tracker = LongShortGridTracker(sym)
+            tracker = LongShortGridTracker(sym, strategy_type=cfg.strategy_type)
             self.grid_trackers[sym] = tracker
         f_mid = 0.0
         ms = self.math_states.get(sym)
@@ -2121,12 +2109,7 @@ class BidirectionalSniperEngine:
                 self.active_grid_positions.pop(gk, None)
             self._uncertain_grid_notional.clear()
             for sym, trk in list(self.grid_trackers.items()):
-                for sid in list(trk.levels.keys()):
-                    trk.clear_external_exit(sid)
-                trk.levels.clear()
-                trk.center_price = 0.0
-                trk._last_sig_params = None
-                trk._last_user_sig_params = None
+                trk.reset_runtime_state()
 
         if new_mode == "LIVE":
             if self._owns_gateway:
@@ -2308,7 +2291,7 @@ class BidirectionalSniperEngine:
 
         tracker = self.grid_trackers.get(sym)
         if not tracker:
-            tracker = LongShortGridTracker(sym)
+            tracker = LongShortGridTracker(sym, strategy_type=cfg.strategy_type)
             self.grid_trackers[sym] = tracker
         mid = (bid + ask) * 0.5
         bbw_info = self.gateway.get_volatility_regime(sym, cfg.bbw_timeframe)
@@ -2687,17 +2670,8 @@ class BidirectionalSniperEngine:
                 )
 
                 if not is_structural_block:
-                    mode_tag = "顺势突破开仓" if is_trend_mode else ("多空震荡开仓" if is_reverse_osc else "多空网格开仓")
-                    side_action = (
-                        ("涨破开多" if side == "LONG" else "跌破开空")
-                        if is_reverse_osc
-                        else (
-                            ("突破做多" if side == "LONG" else "跌破做空")
-                            if is_trend_mode
-                            else ("做多网格" if side == "LONG" else "做空网格")
-                        )
-                    )
-                    w_note = f" ({slot_weight_pct:g}%权重)" if (is_trend_mode and slot_weight_pct > 0) else ""
+                    mode_tag, side_action = tracker.get_entry_log_tags(side)
+                    w_note = f" ({slot_weight_pct:g}%权重)" if (tracker.uses_livermore_sl_amend() and slot_weight_pct > 0) else ""
                     self.append_log(
                         "SIGNAL",
                         sym,
@@ -2824,7 +2798,7 @@ class BidirectionalSniperEngine:
                                 )
 
                     # If Livermore floating-profit protection raised earlier slots' SL, atomically amend live OKX SL algos!
-                    if is_trend_mode and prev_sl_map:
+                    if tracker.uses_livermore_sl_amend() and prev_sl_map:
                         for prev_sid, old_sl in prev_sl_map.items():
                             prev_lv = tracker.levels.get(prev_sid)
                             if not prev_lv or prev_lv.get("status") != "OPEN":
@@ -2932,27 +2906,12 @@ class BidirectionalSniperEngine:
                 if lv.get("cond_sl_live"):
                     prot_notes.append(f"OKX条件止损({cfg.sl_trigger_px_type})已挂")
                 prot_suffix = f" | {' / '.join(prot_notes)}" if prot_notes else ""
-                if is_trend_mode:
-                    self.append_log(
-                        "FILL",
-                        sym,
-                        f"[顺势突破成交] {sym} [{slot_id}] {side} 均价: {entry_res.avg_price:.{cfg.price_precision}f} | 数量: {entry_res.filled_qty} | 假突破/保本止损: {lv.get('sl_price', 0):.{cfg.price_precision}f} | 追踪止盈: 回撤 {cfg.trend_trailing_mult * cfg.grid_step_pct * 100:.2f}%{prot_suffix}",
-                        mode=exec_mode,
-                    )
-                elif is_reverse_osc:
-                    self.append_log(
-                        "FILL",
-                        sym,
-                        f"[多空震荡成交] {sym} [{slot_id}] {side} 均价: {entry_res.avg_price:.{cfg.price_precision}f} | 数量: {entry_res.filled_qty} | 止盈目标: {lv.get('tp_price', 0):.{cfg.price_precision}f} | 止损: {lv.get('sl_price', 0):.{cfg.price_precision}f}{prot_suffix}",
-                        mode=exec_mode,
-                    )
-                else:
-                    self.append_log(
-                        "FILL",
-                        sym,
-                        f"[多空网格成交] {sym} [{slot_id}] {side} 均价: {entry_res.avg_price:.{cfg.price_precision}f} | 数量: {entry_res.filled_qty} | 止盈目标: {lv.get('tp_price', 0):.{cfg.price_precision}f}{prot_suffix}",
-                        mode=exec_mode,
-                    )
+                self.append_log(
+                    "FILL",
+                    sym,
+                    tracker.format_fill_log(cfg, slot_id, side, entry_res.avg_price, entry_res.filled_qty, lv, prot_suffix),
+                    mode=exec_mode,
+                )
 
                 # If SL was already breached at placement time or Kill Switch fired while IOC was in flight -> exit immediately!
                 if sl_breached_on_place and lv.get("status") == "OPEN":
@@ -3147,7 +3106,7 @@ class BidirectionalSniperEngine:
         if not has_more_side:
             self.exchange_live_positions.pop(f"{sym}:{side}", None)
         mode_str = "Maker被动挂单" if is_maker else "Taker吃单"
-        exit_tag = "多空震荡平仓" if tracker.active_grid_mode == "REVERSE_OSCILLATING" else "多空网格平仓"
+        exit_tag = tracker.get_exit_log_tag()
         self.append_log(
             "EXIT_WIN" if net_pnl >= 0 else "EXIT_LOSS",
             sym,
@@ -4039,11 +3998,7 @@ class BidirectionalSniperEngine:
         regime_msg = tracker.consume_regime_log()
         if regime_msg:
             self.append_log("INFO", symbol, regime_msg)
-        mode_cn = (
-            "顺势突破"
-            if tracker.active_grid_mode == "TREND_BREAKOUT"
-            else ("多空震荡" if tracker.active_grid_mode == "REVERSE_OSCILLATING" else "传统震荡")
-        )
+        mode_cn = tracker.get_mode_display_name()
         self.append_log("INFO", symbol, f"[网格重锚] {symbol} ({mode_cn}) 网格中枢已更新至 {f_mid:.{cfg.price_precision}f}")
         self._save_open_strategy_state()
         return True, f"{symbol} 网格({mode_cn})已以 {f_mid:.{cfg.price_precision}f} 重锚"
