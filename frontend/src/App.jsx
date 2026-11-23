@@ -37,16 +37,222 @@ import MarketSentimentChart from './components/MarketSentimentChart';
 import EquityChart from './components/EquityChart';
 import { AuthModal, MembershipCenterView, AdminSystemView } from './components/UserMembershipViews';
 
-const STATE_PIPELINE = [
-  { key: 'IDLE', step: '1', label: '空闲监控', desc: '监听价差脉冲' },
-  { key: 'SIGNALED', step: '2', label: '信号锁定', desc: '同步互斥加锁' },
-  { key: 'SUBMITTED', step: '3', label: '保留价报单', desc: '发射限价IOC' },
-  { key: 'RECONCILE', step: '4', label: '回报对账', desc: '私有流核验' },
-  { key: 'HOLDING', step: '5', label: '持仓监控', desc: '事件驱动巡检' },
-  { key: 'EXITING', step: '6', label: '平仓执行', desc: '撤单与重试' },
-  { key: 'CLOSED', step: '7', label: '盈亏核算', desc: '异步队列落库' },
-  { key: 'COOLDOWN', step: '8', label: '防抖冷却', desc: '抑制尾随重入' },
-];
+const STRATEGY_STATE_PIPELINES = {
+  LEAD_LAG: [
+    { key: 'IDLE', step: '1', label: '空闲监控', desc: '监听价差脉冲' },
+    { key: 'SIGNALED', step: '2', label: '信号锁定', desc: '同步互斥加锁' },
+    { key: 'SUBMITTED', step: '3', label: '保留价报单', desc: '发射限价IOC' },
+    { key: 'RECONCILE', step: '4', label: '回报对账', desc: '私有流核验' },
+    { key: 'HOLDING', step: '5', label: '持仓监控', desc: '事件驱动巡检' },
+    { key: 'EXITING', step: '6', label: '平仓执行', desc: '撤单与重试' },
+    { key: 'CLOSED', step: '7', label: '盈亏核算', desc: '异步队列落库' },
+    { key: 'COOLDOWN', step: '8', label: '防抖冷却', desc: '抑制尾随重入' },
+  ],
+  LONG_SHORT_GRID: [
+    { key: 'ANCHOR', step: '1', label: '中枢铺网', desc: '建立双向档位' },
+    { key: 'WATCH', step: '2', label: '双向巡航', desc: '跌破接多·涨破开空' },
+    { key: 'ENTERING', step: '3', label: '限价建仓', desc: 'IOC吃单成交' },
+    { key: 'HOLDING', step: '4', label: '挂单守护', desc: 'Maker止盈·破网止损' },
+    { key: 'EXITING', step: '5', label: '平仓结算', desc: '止盈或硬止损' },
+    { key: 'RECENTER', step: '6', label: '套利闭环', desc: '空仓漂移重锚' },
+  ],
+  REVERSE_GRID: [
+    { key: 'ANCHOR', step: '1', label: '中枢布网', desc: '上多下空双向档' },
+    { key: 'WATCH', step: '2', label: '多空巡航', desc: '涨破开多·跌破开空' },
+    { key: 'ENTERING', step: '3', label: '突破建仓', desc: 'IOC滑点保护' },
+    { key: 'HOLDING', step: '4', label: '挂单守护', desc: 'Maker止盈·单格止损' },
+    { key: 'EXITING', step: '5', label: '平仓结算', desc: '止盈或单格止损' },
+    { key: 'REARM', step: '6', label: '撤防复装', desc: '回踩滞回重装' },
+  ],
+  TREND_GRID: [
+    { key: 'DEADZONE', step: '1', label: '死区观察', desc: '过滤震荡噪音' },
+    { key: 'BREAKOUT', step: '2', label: '首格突破', desc: 'L1·S1顺势开仓' },
+    { key: 'PYRAMID', step: '3', label: '金字塔加仓', desc: 'L2..Ln递减顺加' },
+    { key: 'PROTECT', step: '4', label: '保本锁利', desc: '条件止损上移' },
+    { key: 'TRAILING', step: '5', label: '追踪收割', desc: '回撤批量止盈' },
+    { key: 'COOLDOWN', step: '6', label: '空仓重锚', desc: '冷却后重建中枢' },
+  ],
+  ADAPTIVE_GRID: [
+    { key: 'REGIME', step: '1', label: 'BBW感知', desc: '波动率周期判别' },
+    { key: 'MODE_LOCK', step: '2', label: '模式锁定', desc: '震荡↔顺势切换' },
+    { key: 'ENTERING', step: '3', label: '触发建仓', desc: '按当前模式入场' },
+    { key: 'HOLDING', step: '4', label: '持仓守护', desc: '止盈·保本·止损' },
+    { key: 'EXITING', step: '5', label: '平仓结算', desc: '网格或追踪平仓' },
+    { key: 'RECENTER', step: '6', label: '空仓重锚', desc: '释放锁并重评估' },
+  ],
+};
+
+function resolveStrategyStateMachine(cfg, tel) {
+  const st = cfg?.strategy_type || tel?.strategy_type || 'LEAD_LAG';
+  const pipeline = STRATEGY_STATE_PIPELINES[st] || STRATEGY_STATE_PIPELINES.LEAD_LAG;
+  const rawState = tel?.state || 'IDLE';
+  const grid = tel?.grid || null;
+  const levels = Array.isArray(grid?.levels) ? grid.levels : [];
+  const precRaw = cfg?.price_precision ?? 4;
+  const refPx = Number(tel?.follower_mid || grid?.center_price || 0);
+  const prec = refPx > 0 && refPx < 0.0005 ? Math.max(8, precRaw) : precRaw;
+  const fmtPx = (v) => (Number(v) > 0 ? Number(v).toFixed(prec) : '--');
+  const fmtSigned = (v) => {
+    const n = Number(v || 0);
+    return `${n >= 0 ? '+' : '-'}$${Math.abs(n).toFixed(2)}`;
+  };
+
+  if (st === 'LEAD_LAG') {
+    const isUncertain = rawState === 'EXIT_UNCERTAIN';
+    const activeKey = isUncertain ? 'EXITING' : rawState;
+    const activeIdx = Math.max(0, pipeline.findIndex((p) => p.key === activeKey));
+    const pushGapMs = Math.round(Number(tel?.follower_age_ms ?? 0));
+    const jumpPct = Number(tel?.instant_jump_pct ?? 0);
+    const targetPct = (cfg?.min_jump_pct ?? 0.006) * 100;
+    return {
+      strategyType: st,
+      pipeline,
+      activeKey,
+      activeIdx,
+      isUncertain,
+      gridColsClass: 'grid-cols-2 sm:grid-cols-4 lg:grid-cols-8',
+      subtitle: `净利 ≥ ${((cfg?.take_profit_pct ?? 0.0025) * 100).toFixed(2)}% · 窗口 ${cfg?.window_ms ?? 150}ms · 脉冲阈值 ${targetPct.toFixed(2)}%`,
+      metrics: [
+        { label: '对数基差', value: `${Number(tel?.basis_bps ?? 0).toFixed(1)} bp`, tone: 'main' },
+        {
+          label: '瞬时脉冲 / 阈值',
+          value: `${jumpPct.toFixed(2)}% / ${targetPct.toFixed(2)}%`,
+          tone: Math.abs(jumpPct) >= targetPct ? 'emerald' : 'main',
+        },
+        { label: '动态收敛 β', value: `${Number(tel?.estimated_beta ?? cfg?.beta_coeff ?? 0.88).toFixed(2)}`, tone: 'main' },
+        {
+          label: '盘口推送延迟',
+          value: `${pushGapMs} ms`,
+          tone: pushGapMs > (cfg?.max_book_staleness_ms || 600) ? 'rose' : 'emerald',
+        },
+      ],
+    };
+  }
+
+  const openSlots = levels.filter((lv) => lv.status === 'OPEN');
+  const enteringSlots = levels.filter((lv) => lv.status === 'ENTERING');
+  const exitingSlots = levels.filter((lv) => lv.status === 'EXITING');
+  const openLong = Number(grid?.open_long_count ?? openSlots.filter((lv) => lv.side === 'LONG').length);
+  const openShort = Number(grid?.open_short_count ?? openSlots.filter((lv) => lv.side === 'SHORT').length);
+  const makerTpCount = openSlots.filter((lv) => lv.maker_tp_live).length;
+  const condSlCount = openSlots.filter((lv) => lv.cond_sl_live).length;
+  const centerPx = Number(grid?.center_price || 0);
+  const cycles = Number(grid?.completed_cycles || 0);
+  const gridNetPnl = Number(grid?.grid_net_pnl || 0);
+  const stepPct = ((cfg?.grid_step_pct ?? 0.006) * 100).toFixed(2);
+  const tpPct = ((cfg?.grid_take_profit_pct ?? 0.0065) * 100).toFixed(2);
+  const slPct = ((cfg?.grid_stop_loss_pct ?? 0.03) * 100).toFixed(2);
+  const rngPct = ((cfg?.grid_range_pct ?? 0.035) * 100).toFixed(1);
+
+  let activeKey = pipeline[0].key;
+  let subtitle = '';
+  let metrics = [];
+
+  if (st === 'LONG_SHORT_GRID') {
+    if (exitingSlots.length > 0) activeKey = 'EXITING';
+    else if (enteringSlots.length > 0) activeKey = 'ENTERING';
+    else if (openLong + openShort > 0) activeKey = 'HOLDING';
+    else if (centerPx > 0 && levels.length > 0) activeKey = 'WATCH';
+    else activeKey = 'ANCHOR';
+
+    subtitle = `传统震荡 · 步长 ${stepPct}% · 止盈 ${tpPct}% · 区间 ±${rngPct}% · 止损 ${slPct}%`;
+    metrics = [
+      { label: '网格中枢价', value: fmtPx(centerPx), tone: 'main' },
+      { label: '活跃槽位 (多/空)', value: `${openLong} 多 / ${openShort} 空`, tone: openLong + openShort > 0 ? 'emerald' : 'main' },
+      { label: '交易所保护单', value: `Maker止盈 ${makerTpCount} · 条件止损 ${condSlCount}`, tone: makerTpCount + condSlCount > 0 ? 'sky' : 'dim' },
+      { label: `套利闭环 (${cycles}轮)`, value: fmtSigned(gridNetPnl), tone: gridNetPnl >= 0 ? 'emerald' : 'rose' },
+    ];
+  } else if (st === 'REVERSE_GRID') {
+    const idleLevels = levels.filter((lv) => lv.status === 'IDLE');
+    const armedCount = idleLevels.filter((lv) => lv.armed !== false).length;
+    const disarmedCount = idleLevels.length - armedCount;
+
+    if (exitingSlots.length > 0) activeKey = 'EXITING';
+    else if (enteringSlots.length > 0) activeKey = 'ENTERING';
+    else if (openLong + openShort > 0) activeKey = 'HOLDING';
+    else if (centerPx > 0 && disarmedCount > 0) activeKey = 'REARM';
+    else if (centerPx > 0 && levels.length > 0) activeKey = 'WATCH';
+    else activeKey = 'ANCHOR';
+
+    subtitle = `多空震荡 · 步长 ${stepPct}% · 止盈 ${tpPct}% · 单格止损 ${slPct}% · ${cfg?.use_post_only_tp !== false ? 'Maker止盈' : 'Taker止盈'}`;
+    metrics = [
+      { label: '网格中枢价', value: fmtPx(centerPx), tone: 'main' },
+      { label: '活跃槽位 (多/空)', value: `${openLong} 多 / ${openShort} 空`, tone: openLong + openShort > 0 ? 'emerald' : 'main' },
+      {
+        label: '挂单 / 档位就绪',
+        value: `TP挂单 ${makerTpCount} · 就绪 ${armedCount}/${idleLevels.length}`,
+        tone: makerTpCount > 0 ? 'sky' : 'main',
+      },
+      { label: `套利闭环 (${cycles}轮)`, value: fmtSigned(gridNetPnl), tone: gridNetPnl >= 0 ? 'emerald' : 'rose' },
+    ];
+  } else if (st === 'TREND_GRID') {
+    const hasBeProtected = openSlots.some((lv) => {
+      const ep = Number(lv.entry_price || 0);
+      const sl = Number(lv.sl_price || 0);
+      if (ep <= 0 || sl <= 0) return false;
+      return lv.side === 'LONG' ? sl >= ep : sl <= ep;
+    });
+    const activeTotal = openLong + openShort;
+    if (exitingSlots.length > 0) activeKey = 'TRAILING';
+    else if (enteringSlots.length > 0) activeKey = activeTotal >= 1 ? 'PYRAMID' : 'BREAKOUT';
+    else if (activeTotal > 0) {
+      if (hasBeProtected) activeKey = 'PROTECT';
+      else if (activeTotal >= 2) activeKey = 'PYRAMID';
+      else activeKey = 'BREAKOUT';
+    } else if (centerPx > 0) activeKey = 'DEADZONE';
+    else activeKey = 'COOLDOWN';
+
+    const trailPx = openLong > 0 ? Number(grid?.long_trail_stop_price || 0) : openShort > 0 ? Number(grid?.short_trail_stop_price || 0) : 0;
+    const peakOrTrough = openLong > 0 ? Number(grid?.long_peak_price || 0) : openShort > 0 ? Number(grid?.short_trough_price || 0) : 0;
+    subtitle = `顺势突破 · 步长 ${stepPct}% · 死区 ${cfg?.trend_dead_zone_mult ?? 1.25}x · 追踪 ${cfg?.trend_trailing_mult ?? 1.15}x · 首格止损 ${slPct}%`;
+    metrics = [
+      { label: '突破中枢价', value: fmtPx(centerPx), tone: 'main' },
+      { label: '金字塔在途层数', value: `${openLong} 多 / ${openShort} 空`, tone: activeTotal > 0 ? 'violet' : 'main' },
+      {
+        label: openShort > 0 ? '谷值 / 追踪止盈价' : '峰值 / 追踪止盈价',
+        value: trailPx > 0 ? `${fmtPx(peakOrTrough)} / ${fmtPx(trailPx)}` : `条件止损 ${condSlCount} 笔`,
+        tone: hasBeProtected ? 'emerald' : 'sky',
+      },
+      { label: `趋势收割 (${cycles}轮)`, value: fmtSigned(gridNetPnl), tone: gridNetPnl >= 0 ? 'emerald' : 'rose' },
+    ];
+  } else {
+    // ADAPTIVE_GRID (VCP Dual-Mode)
+    const activeMode = grid?.active_grid_mode || 'MEAN_REVERSION';
+    const modeLabel = activeMode === 'TREND_BREAKOUT' ? '顺势突破' : '传统震荡';
+    const bbwPct = grid?.bbw_pct != null ? `${Number(grid.bbw_pct).toFixed(2)}%` : '--';
+    const bbwRank = grid?.bbw_percentile != null ? `P${Math.round(Number(grid.bbw_percentile))}` : '--';
+
+    if (exitingSlots.length > 0) activeKey = 'EXITING';
+    else if (enteringSlots.length > 0) activeKey = 'ENTERING';
+    else if (openLong + openShort > 0) activeKey = 'HOLDING';
+    else if (grid?.bbw_pct != null) activeKey = 'MODE_LOCK';
+    else activeKey = 'REGIME';
+
+    subtitle = `VCP双模式 · 当前【${modeLabel}】 · BBW ${bbwPct} (${bbwRank}) · 周期 ${cfg?.bbw_timeframe || '15m'}`;
+    metrics = [
+      {
+        label: '当前激活模式',
+        value: `${modeLabel}${grid?.vcp_contraction ? ' · VCP挤压' : ''}`,
+        tone: activeMode === 'TREND_BREAKOUT' ? 'violet' : 'sky',
+      },
+      { label: 'BBW 波动率 / 分位', value: `${bbwPct} (${bbwRank})`, tone: 'main' },
+      { label: '活跃槽位 / 保护单', value: `${openLong}多 ${openShort}空 · 护单 ${makerTpCount + condSlCount}`, tone: openLong + openShort > 0 ? 'emerald' : 'main' },
+      { label: `双模闭环 (${cycles}轮)`, value: fmtSigned(gridNetPnl), tone: gridNetPnl >= 0 ? 'emerald' : 'rose' },
+    ];
+  }
+
+  const activeIdx = Math.max(0, pipeline.findIndex((p) => p.key === activeKey));
+  return {
+    strategyType: st,
+    pipeline,
+    activeKey,
+    activeIdx,
+    isUncertain: rawState === 'EXIT_UNCERTAIN',
+    gridColsClass: 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-6',
+    subtitle,
+    metrics,
+  };
+}
 
 const STATE_LABEL_MAP = {
   IDLE: '空闲监控',
@@ -1992,327 +2198,346 @@ export default function App() {
 
       {/* ==================== TOP HEADER ==================== */}
       <header
-        className="sticky top-0 z-30 backdrop-blur-md border-b border-line px-3 sm:px-5 lg:px-6 py-2.5 sm:py-3"
+        className="sticky top-0 z-30 backdrop-blur-xl border-b border-line shadow-[0_2px_16px_-6px_rgba(15,23,42,0.08)] dark:shadow-[0_4px_24px_-6px_rgba(0,0,0,0.45)]"
         style={{ backgroundColor: 'var(--bg-header)' }}
       >
-        <div className="max-w-[1520px] mx-auto flex flex-col lg:flex-row lg:items-center lg:justify-between gap-2.5 sm:gap-3">
-          {/* Left: Brand Identity + Pill Mode Switcher */}
-          <div className="flex flex-wrap items-center justify-between sm:justify-start gap-2.5 sm:gap-4 min-w-0">
-            <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
-              <div className="icon-box w-9 h-9 sm:w-10 sm:h-10">
-                <svg className="w-4 h-4 sm:w-5 sm:h-5 text-main" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+        {/* Tier 1: Brand Identity | Execution Command Dock | Utility & Account Dock */}
+        <div className="max-w-[1520px] mx-auto px-3 sm:px-5 lg:px-6 pt-2.5 sm:pt-3 pb-2.5 flex flex-wrap lg:flex-nowrap items-center justify-between gap-2.5 sm:gap-3">
+          {/* Left: Brand Identity + Live Cloud Badge */}
+          <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+            <button
+              type="button"
+              onClick={() => setActiveTab('radar')}
+              className="group flex items-center gap-2.5 sm:gap-3 min-w-0 text-left rounded-2xl pr-1.5 py-0.5 hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+              title="返回矩阵观察"
+            >
+              <div className="icon-box w-9 h-9 sm:w-10 sm:h-10 border border-line shadow-sm group-hover:border-sky-500/40 group-hover:scale-105">
+                <svg className="w-4 h-4 sm:w-5 sm:h-5 text-main" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1">
                   <path d="M2 12h4l3-8 4 16 3-8h6" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
               </div>
               <div className="min-w-0">
-                <h1 className="font-bold text-sm sm:text-base tracking-tight text-main leading-tight truncate">
-                  跨所价差脉冲高频狙击系统
-                </h1>
-                <p className="text-[11px] text-dim hidden sm:block mt-0.5 truncate">
-                  比例对数基差 · 保留价限价抢单 · 被动挂单止盈 · 八阶段同步锁状态机
-                </p>
-              </div>
-            </div>
-
-            {/* Pill Mode Indicator: Logged-in users ONLY see Live Mode (No Simulator shown) */}
-            <div className="flex flex-wrap items-center rounded-full surface-subtle p-1 text-[11px] sm:text-xs max-w-full">
-              {currentUser ? (
-                <div
-                  className="px-3 sm:px-4 py-1 sm:py-1.5 rounded-full font-semibold bg-[#0f1419] text-white shadow-sm flex flex-wrap items-center gap-1.5 sm:gap-2"
-                  title="配置保存后，即使关闭网页或退出浏览器，服务器仍将7×24小时按您的设置持续运行"
-                >
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-                  <span>实盘交易系统</span>
-                  <span className="hidden sm:inline-block text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-mono">
-                    云端24h托管
-                  </span>
-                  {!currentUser.can_use_live && (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/25 text-amber-400 font-bold">
-                      需VIP激活交易
+                <div className="flex items-center gap-2">
+                  <h1 className="font-bold text-sm sm:text-[17px] tracking-tight text-main leading-tight truncate">
+                    无聊的交易系统
+                  </h1>
+                  {currentUser ? (
+                    <span
+                      className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] sm:text-[11px] font-semibold bg-[#0f1419] dark:bg-emerald-500/15 text-white dark:text-emerald-300 border border-transparent dark:border-emerald-500/30 shadow-sm shrink-0"
+                      title="配置保存后，即使关闭网页或退出浏览器，服务器仍将7×24小时按您的设置持续运行"
+                    >
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+                      <span>实盘 · 24h托管</span>
+                      {!currentUser.can_use_live && (
+                        <span className="ml-0.5 px-1.5 py-0.2 rounded-full bg-amber-500/25 text-amber-300 font-bold">
+                          需VIP
+                        </span>
+                      )}
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold surface-subtle text-sub shrink-0">
+                      访客预览
                     </span>
                   )}
                 </div>
-              ) : (
-                <>
-                  <span className="px-2.5 sm:px-3.5 py-1 sm:py-1.5 rounded-full font-semibold surface-card text-main shadow-sm">
-                    访客预览
-                  </span>
-                  <button
-                    onClick={() => openAuthModal('register')}
-                    className="px-2.5 sm:px-3.5 py-1 sm:py-1.5 rounded-full font-semibold text-dim hover:text-main transition flex items-center gap-1"
-                    title="注册并登录账号后进入实盘系统"
-                  >
-                    <Lock className="w-3 h-3" strokeWidth={1.75} />
-                    <span>注册实盘</span>
-                  </button>
-                </>
-              )}
+                <p className="text-[11px] text-dim hidden xl:block mt-0.5 truncate">
+                  多策略独立网格 · 跨所脉冲狙击 · 毫秒级全周期持仓状态机
+                </p>
+              </div>
+            </button>
+          </div>
+
+          {/* Center: Unified Execution Command Dock */}
+          <div className="order-last lg:order-none w-full lg:w-auto flex items-center justify-between lg:justify-center rounded-full surface-subtle p-1 gap-1.5 shadow-inner">
+            <div
+              className={`flex items-center gap-1.5 px-2.5 sm:px-3 h-7 rounded-full text-[11px] sm:text-xs font-semibold min-w-0 ${
+                isTradingActive
+                  ? 'text-emerald-600 dark:text-emerald-400'
+                  : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
+                  ? 'text-rose-600 dark:text-rose-400'
+                  : 'text-amber-600 dark:text-amber-400'
+              }`}
+              title={tradingControl.status_detail || ''}
+            >
+              <span
+                className={`w-2 h-2 rounded-full shrink-0 ${
+                  isTradingActive
+                    ? 'bg-emerald-500 animate-ping'
+                    : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
+                    ? 'bg-rose-500'
+                    : 'bg-amber-500'
+                }`}
+              />
+              <span className="truncate max-w-[110px] sm:max-w-[160px]">
+                {tradingControl.status_label || (isTradingActive ? '运行中' : '已停止')}
+              </span>
+            </div>
+
+            <div className="h-4 w-px bg-[var(--border-strong)] hidden sm:block shrink-0" />
+
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                type="button"
+                onClick={handleStartTrading}
+                className={`h-7 px-3 rounded-full text-xs font-semibold flex items-center gap-1 whitespace-nowrap ${
+                  isTradingActive
+                    ? 'bg-[#0f1419] dark:bg-emerald-500 text-white dark:text-slate-950 shadow-sm'
+                    : 'text-main hover:bg-[var(--bg-card)] hover:shadow-sm'
+                }`}
+                title="启动自动交易执行"
+              >
+                <svg className="w-2.5 h-2.5" viewBox="0 0 24 24" fill="currentColor">
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+                <span>开始</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleStopTrading}
+                className={`h-7 px-3 rounded-full text-xs font-semibold flex items-center gap-1 whitespace-nowrap ${
+                  !isTradingActive
+                    ? 'surface-card text-main shadow-sm'
+                    : 'text-sub hover:text-main hover:bg-[var(--bg-card)]'
+                }`}
+                title="停止发送新订单，仅保留实时行情监控"
+              >
+                <svg className="w-2.5 h-2.5" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="5" y="5" width="14" height="14" rx="2" />
+                </svg>
+                <span>停止</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleKillSwitch}
+                className={`h-7 px-3 rounded-full text-xs font-semibold flex items-center gap-1 whitespace-nowrap ${
+                  isKillActive
+                    ? 'bg-emerald-600 text-white shadow-sm hover:bg-emerald-500'
+                    : 'text-rose-600 dark:text-rose-400 hover:bg-rose-500/12'
+                }`}
+                title="全局紧急熔断：立即撤单平仓并暂停策略"
+              >
+                <Power className="w-3 h-3" strokeWidth={2.1} />
+                <span>{isKillActive ? '解熔断' : '熔断'}</span>
+              </button>
             </div>
           </div>
 
-          {/* Right: Telemetry Pill, Execution Controls, User Badge & Theme */}
-          <div className="flex flex-wrap items-center justify-between sm:justify-end gap-2 text-xs">
+          {/* Right: Compact RTT + User Account Dock + Theme Toggle */}
+          <div className="flex items-center gap-1.5 sm:gap-2 text-xs shrink-0">
             <div
-              className="flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3.5 py-1.5 rounded-full surface-subtle font-mono text-[11px] sm:text-xs"
-              title="行情源与报单网络往返延迟 (RTT)"
+              className="hidden sm:flex items-center gap-1.5 px-2.5 h-8 rounded-full surface-subtle font-mono text-[11px]"
+              title={`${snapshot.feed_source === 'LIVE_WS' ? '实盘原生直连' : '50Hz仿真流'} · 报单网络往返延迟 (RTT)`}
             >
               <span className={`w-2 h-2 rounded-full shrink-0 ${wsConnected ? 'bg-emerald-500' : 'bg-rose-500'}`} />
-              <span className="hidden xl:inline font-sans text-main font-medium">
-                {snapshot.feed_source === 'LIVE_WS' ? '实盘原生直连' : '50Hz仿真流'}
-              </span>
-              <span className="hidden xl:inline text-dim">|</span>
               <Wifi className="w-3.5 h-3.5 text-sub shrink-0" strokeWidth={1.75} />
               <span className="text-main font-bold">{snapshot.last_order_rtt_ms}ms</span>
             </div>
 
-            {/* Unified Execution Control Group */}
-            <div className="order-last sm:order-none w-full sm:w-auto flex items-center justify-between sm:justify-start rounded-full surface-subtle p-1 gap-1">
-              <div
-                className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full text-[11px] sm:text-xs font-semibold min-w-0 ${
-                  isTradingActive
-                    ? 'text-emerald-600 dark:text-emerald-400'
-                    : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
-                    ? 'text-rose-600 dark:text-rose-400'
-                    : 'text-amber-600 dark:text-amber-400'
-                }`}
-                title={tradingControl.status_detail || ''}
-              >
-                <span
-                  className={`w-2 h-2 rounded-full shrink-0 ${
-                    isTradingActive
-                      ? 'bg-emerald-500 animate-ping'
-                      : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
-                      ? 'bg-rose-500'
-                      : 'bg-amber-500'
-                  }`}
-                />
-                <span className="truncate max-w-[92px] sm:max-w-none">
-                  {tradingControl.status_label || (isTradingActive ? '运行中' : '已停止')}
-                </span>
-              </div>
-
-              <div className="flex items-center gap-1 shrink-0">
+            {currentUser ? (
+              <div className="flex items-center gap-1.5 px-2 sm:px-2.5 h-8 rounded-full surface-subtle max-w-full">
                 <button
-                  onClick={handleStartTrading}
-                  className={`px-2.5 sm:px-3 py-1 rounded-full text-xs font-semibold transition flex items-center gap-1 whitespace-nowrap ${
-                    isTradingActive ? 'bg-[#0f1419] text-white shadow-sm' : 'text-main hover:bg-black/5'
-                  }`}
-                  title="启动毫秒级自动狙击交易"
+                  type="button"
+                  onClick={() => setActiveTab('membership')}
+                  className="flex items-center gap-1.5 text-left hover:text-sky-600 dark:hover:text-sky-400 min-w-0 px-0.5 rounded-full"
+                  title="点击进入会员中心"
                 >
-                  <svg className="w-2.5 h-2.5" viewBox="0 0 24 24" fill="currentColor">
-                    <polygon points="5 3 19 12 5 21 5 3" />
-                  </svg>
-                  <span>开始</span>
+                  <User className="w-3.5 h-3.5 text-main shrink-0" strokeWidth={1.85} />
+                  <span className="font-mono font-bold text-main truncate max-w-[74px] sm:max-w-[120px]">
+                    {currentUser.username}
+                  </span>
+                  <span
+                    className={`px-1.5 sm:px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
+                      currentUser.is_vip
+                        ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                        : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+                    }`}
+                  >
+                    {currentUser.is_vip ? currentUser.vip_label : '未开VIP'}
+                  </span>
                 </button>
-
                 <button
-                  onClick={handleStopTrading}
-                  className={`px-2.5 sm:px-3 py-1 rounded-full text-xs font-semibold transition flex items-center gap-1 whitespace-nowrap ${
-                    !isTradingActive ? 'surface-card text-main shadow-sm' : 'text-sub hover:text-main'
-                  }`}
-                  title="停止发送新订单，仅保留实时行情监控"
+                  type="button"
+                  onClick={() => openAuthModal('login')}
+                  className="px-2 py-0.5 rounded-full text-[10px] surface-card text-sub hover:text-main font-semibold shrink-0"
+                  title="切换账号"
                 >
-                  <svg className="w-2.5 h-2.5" viewBox="0 0 24 24" fill="currentColor">
-                    <rect x="5" y="5" width="14" height="14" rx="2" />
-                  </svg>
-                  <span>停止</span>
+                  切换
                 </button>
-
                 <button
-                  onClick={handleKillSwitch}
-                  className={`px-2.5 sm:px-3 py-1 rounded-full text-xs font-semibold transition flex items-center gap-1 whitespace-nowrap ${
-                    isKillActive ? 'bg-emerald-600 text-white' : 'text-rose-600 dark:text-rose-400 hover:bg-rose-500/10'
-                  }`}
-                  title="全局紧急熔断：立即撤单平仓并暂停策略"
+                  type="button"
+                  onClick={handleLogout}
+                  className="w-6 h-6 rounded-full flex items-center justify-center text-dim hover:text-rose-500 hover:bg-rose-500/10 shrink-0"
+                  title="退出当前账号"
                 >
-                  <Power className="w-3 h-3" strokeWidth={2} />
-                  <span>{isKillActive ? '解熔断' : '熔断'}</span>
+                  <LogOut className="w-3.5 h-3.5" strokeWidth={1.85} />
                 </button>
               </div>
-            </div>
+            ) : (
+              <div className="flex items-center gap-1.5">
+                <button type="button" onClick={() => openAuthModal('login')} className="btn-soft-pill px-3.5 h-8 text-xs">
+                  登录
+                </button>
+                <button type="button" onClick={() => openAuthModal('register')} className="btn-primary-pill px-3.5 h-8 text-xs">
+                  <Lock className="w-3 h-3" strokeWidth={2} />
+                  注册实盘
+                </button>
+              </div>
+            )}
 
-            <div className="flex items-center gap-1.5 sm:gap-2">
-              {/* User Account & VIP Status Pill */}
-              {currentUser ? (
-                <div className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full surface-subtle max-w-full">
-                  <button
-                    onClick={() => setActiveTab('membership')}
-                    className="flex items-center gap-1.5 text-left hover:opacity-85 transition min-w-0"
-                    title="点击进入会员中心"
-                  >
-                    <User className="w-3.5 h-3.5 text-main shrink-0" strokeWidth={1.75} />
-                    <span className="font-mono font-bold text-main truncate max-w-[78px] sm:max-w-[140px]">
-                      {currentUser.username}
-                    </span>
-                    <span
-                      className={`px-1.5 sm:px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
-                        currentUser.is_vip
-                          ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-                          : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
-                      }`}
-                    >
-                      {currentUser.is_vip ? currentUser.vip_label : '未开VIP'}
-                    </span>
-                  </button>
-                  <button
-                    onClick={() => openAuthModal('login')}
-                    className="px-2 py-0.5 rounded-full text-[10px] surface-card text-sub hover:text-main font-semibold transition shrink-0"
-                    title="切换账号"
-                  >
-                    切换
-                  </button>
-                  <button
-                    onClick={handleLogout}
-                    className="p-1 rounded-full text-dim hover:text-rose-500 transition shrink-0"
-                    title="退出当前账号"
-                  >
-                    <LogOut className="w-3.5 h-3.5" strokeWidth={1.75} />
-                  </button>
-                </div>
+            <button
+              type="button"
+              onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
+              className="w-8 h-8 rounded-full surface-subtle flex items-center justify-center text-main shrink-0"
+              title={theme === 'light' ? '切换至深色模式' : '切换至明亮模式'}
+            >
+              {theme === 'light' ? (
+                <Moon className="w-3.5 h-3.5 text-slate-700" strokeWidth={1.85} />
               ) : (
-                <div className="flex items-center gap-1.5">
-                  <button onClick={() => openAuthModal('login')} className="btn-soft-pill px-3 sm:px-4 py-1.5 text-xs">
-                    登录
-                  </button>
-                  <button onClick={() => openAuthModal('register')} className="btn-primary-pill px-3 sm:px-4 py-1.5 text-xs">
-                    注册
-                  </button>
-                </div>
+                <Sun className="w-3.5 h-3.5 text-amber-400" strokeWidth={1.85} />
               )}
-
-              {/* Theme Switcher */}
-              <button
-                onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
-                className="w-8 h-8 rounded-full surface-subtle flex items-center justify-center hover:opacity-85 text-main transition shrink-0"
-                title={theme === 'light' ? '切换至深色模式' : '切换至明亮模式'}
-              >
-                {theme === 'light' ? (
-                  <Moon className="w-3.5 h-3.5 text-slate-700" strokeWidth={1.75} />
-                ) : (
-                  <Sun className="w-3.5 h-3.5 text-amber-400" strokeWidth={1.75} />
-                )}
-              </button>
-            </div>
+            </button>
           </div>
         </div>
 
-        {/* Row 2: Pill Navigation Tabs (Left) | Context Bar (Right) */}
-        <div className="max-w-[1520px] mx-auto mt-2.5 sm:mt-3 pt-2 sm:pt-2.5 border-t border-line flex flex-col xl:flex-row xl:items-center xl:justify-between gap-2">
-          <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar sm:flex-wrap pb-0.5 sm:pb-0">
-            {[
-              { id: 'radar', label: '脉冲狙击台', icon: Radar, visible: true },
-              { id: 'watchlist', label: `策略参数矩阵 (${strategies.length})`, icon: Sliders, visible: true },
-              { id: 'exchanges', label: '交易所与风控', icon: Shield, visible: Boolean(currentUser) },
-              { id: 'analytics', label: '盈亏统计与诊断', icon: BarChart2, visible: true },
-              {
-                id: 'membership',
-                label: currentUser?.is_vip ? '会员中心 (VIP)' : '购买会员 / 解锁实盘',
-                icon: CreditCard,
-                visible: true,
-              },
-              {
-                id: 'admin',
-                label: '后台管理',
-                icon: Users,
-                visible: Boolean(currentUser?.is_admin),
-              },
-            ]
-              .filter((t) => t.visible)
-              .map((tab) => {
-                const Icon = tab.icon;
-                const active = activeTab === tab.id;
-                return (
-                  <button
-                    key={tab.id}
-                    onClick={() => setActiveTab(tab.id)}
-                    className={`flex items-center gap-1.5 px-3.5 sm:px-4 py-1.5 rounded-full text-xs font-semibold transition whitespace-nowrap shrink-0 ${
-                      active ? 'btn-primary-pill shadow-sm' : 'text-sub hover:text-main hover:bg-black/5'
-                    }`}
-                  >
-                    <Icon className="w-3.5 h-3.5 shrink-0" strokeWidth={1.75} />
-                    {tab.label}
-                  </button>
-                );
-              })}
-          </div>
+        {/* Tier 2: Pill Navigation Rail (Left) | Slim Live Telemetry Strip (Right) */}
+        <div className="border-t border-line bg-black/[0.012] dark:bg-white/[0.015]">
+          <div className="max-w-[1520px] mx-auto px-3 sm:px-5 lg:px-6 py-2 flex flex-col xl:flex-row xl:items-center xl:justify-between gap-2">
+            <nav
+              aria-label="主导航"
+              className="inline-flex items-center gap-1 p-1 rounded-full surface-subtle overflow-x-auto no-scrollbar max-w-full"
+            >
+              {[
+                { id: 'radar', label: '矩阵观察', icon: Radar, visible: true },
+                { id: 'watchlist', label: `策略参数矩阵 (${strategies.length})`, icon: Sliders, visible: true },
+                { id: 'exchanges', label: '交易所与风控', icon: Shield, visible: Boolean(currentUser) },
+                { id: 'analytics', label: '盈亏统计与诊断', icon: BarChart2, visible: true },
+                {
+                  id: 'membership',
+                  label: currentUser?.is_vip ? '会员中心 (VIP)' : '购买会员 / 解锁实盘',
+                  icon: CreditCard,
+                  visible: true,
+                },
+                {
+                  id: 'admin',
+                  label: '后台管理',
+                  icon: Users,
+                  visible: Boolean(currentUser?.is_admin),
+                },
+              ]
+                .filter((t) => t.visible)
+                .map((tab) => {
+                  const Icon = tab.icon;
+                  const active = activeTab === tab.id;
+                  return (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => setActiveTab(tab.id)}
+                      className={`nav-tab-pill px-3.5 sm:px-4 py-1.5 text-xs ${
+                        active
+                          ? 'nav-tab-active btn-primary-pill shadow-sm'
+                          : 'text-sub'
+                      }`}
+                    >
+                      <Icon className="w-3.5 h-3.5 shrink-0" strokeWidth={1.85} />
+                      {tab.label}
+                    </button>
+                  );
+                })}
+            </nav>
 
-          {/* Right Context Bar: Live Connection Summary OR Shadow Pulse Test Buttons */}
-          {isLiveMode ? (
-            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 text-[11px] sm:text-xs">
-              <span className="px-2.5 sm:px-3 py-1 rounded-full surface-subtle text-emerald-600 dark:text-emerald-400 font-semibold whitespace-nowrap">
-                Binance {liveStatus.binance_ws_connected ? '已连接' : '重连中'} · OKX{' '}
-                {liveStatus.okx_ws_connected ? '已连接' : '重连中'}
-              </span>
-              {liveStatus.follower_auth_status === 'VERIFIED' && (
-                <>
+            {/* Right Context Strip: Compact Live Status Badges OR Shadow Pulse Test Controls */}
+            {isLiveMode ? (
+              <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar text-[11px]">
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full surface-subtle font-semibold whitespace-nowrap shrink-0">
                   <span
-                    className={`px-2.5 sm:px-3 py-1 rounded-full text-[11px] font-bold whitespace-nowrap ${
-                      liveStatus.okx_pos_mode === 'long_short_mode'
-                        ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-                        : 'bg-amber-500/15 text-amber-600 dark:text-amber-300'
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      liveStatus.binance_ws_connected && liveStatus.okx_ws_connected ? 'bg-emerald-500' : 'bg-amber-500 animate-pulse'
                     }`}
-                  >
-                    {liveStatus.okx_pos_mode === 'long_short_mode' ? 'OKX 双向持仓' : 'OKX 单向持仓'}
+                  />
+                  <span className="text-main">
+                    BN {liveStatus.binance_ws_connected ? '在线' : '重连'} · OKX {liveStatus.okx_ws_connected ? '在线' : '重连'}
                   </span>
-                  <span
-                    title="OKX 私有 WebSocket 订单/条件单实时推送通道（毫秒级感知 Maker 止盈与条件止损成交）"
-                    className={`px-2.5 sm:px-3 py-1 rounded-full text-[11px] font-bold whitespace-nowrap ${
-                      liveStatus.okx_private_ws_connected
-                        ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-                        : 'bg-slate-500/15 text-dim'
-                    }`}
-                  >
-                    私有推单WS {liveStatus.okx_private_ws_connected ? '实时在线' : '轮询兜底'}
-                  </span>
-                  {Number(liveStatus.usdt_avail_usdt || 0) > 0 && (
-                    <span className="px-2.5 sm:px-3 py-1 rounded-full surface-subtle text-[11px] font-mono font-semibold text-main whitespace-nowrap">
-                      可用 {Number(liveStatus.usdt_avail_usdt).toFixed(2)}U
+                </span>
+                {liveStatus.follower_auth_status === 'VERIFIED' && (
+                  <>
+                    <span
+                      className={`px-2.5 py-1 rounded-full font-bold whitespace-nowrap shrink-0 ${
+                        liveStatus.okx_pos_mode === 'long_short_mode'
+                          ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                          : 'bg-amber-500/15 text-amber-600 dark:text-amber-300'
+                      }`}
+                    >
+                      {liveStatus.okx_pos_mode === 'long_short_mode' ? '双向持仓' : '单向持仓'}
                     </span>
-                  )}
-                </>
-              )}
-              <span
-                onClick={() => setActiveTab('exchanges')}
-                className="cursor-pointer px-2.5 sm:px-3 py-1 rounded-full surface-subtle text-main font-medium hover:opacity-85 transition truncate max-w-full sm:max-w-[340px]"
-              >
-                {liveStatus.follower_auth_message || '点击配置执行端 API'}
-              </span>
-            </div>
-          ) : (
-            activeTab === 'radar' && (
-              <div className="flex flex-wrap items-center gap-1.5 text-[11px] sm:text-xs">
-                <span className="text-dim mr-0.5">脉冲注入 ({selectedSymbol.split('/')[0]}):</span>
+                    <span
+                      title="OKX 私有 WebSocket 订单/条件单实时推送通道（毫秒级感知 Maker 止盈与条件止损成交）"
+                      className={`px-2.5 py-1 rounded-full font-bold whitespace-nowrap shrink-0 ${
+                        liveStatus.okx_private_ws_connected
+                          ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                          : 'bg-slate-500/15 text-dim'
+                      }`}
+                    >
+                      私有WS {liveStatus.okx_private_ws_connected ? '在线' : '轮询'}
+                    </span>
+                    {Number(liveStatus.usdt_avail_usdt || 0) > 0 && (
+                      <span className="px-2.5 py-1 rounded-full surface-subtle font-mono font-semibold text-main whitespace-nowrap shrink-0">
+                        可用 {Number(liveStatus.usdt_avail_usdt).toFixed(2)}U
+                      </span>
+                    )}
+                  </>
+                )}
                 <button
-                  onClick={() => handleInjectPulse('LONG', 0.0085, 'CONVERGE_TP', '多头拉升收敛止盈')}
-                  className="btn-soft-pill px-2.5 sm:px-3 py-1 text-xs text-emerald-600 dark:text-emerald-400"
+                  type="button"
+                  onClick={() => setActiveTab('exchanges')}
+                  title={liveStatus.follower_auth_message || '点击配置执行端 API'}
+                  className="px-2.5 py-1 rounded-full surface-subtle text-main font-medium truncate max-w-[200px] sm:max-w-[260px] shrink-0"
                 >
-                  <ArrowUpRight className="w-3.5 h-3.5" strokeWidth={2} />
-                  拉升止盈
-                </button>
-                <button
-                  onClick={() => handleInjectPulse('SHORT', 0.0085, 'CONVERGE_TP', '空头下挫收敛止盈')}
-                  className="btn-soft-pill px-2.5 sm:px-3 py-1 text-xs text-rose-600 dark:text-rose-400"
-                >
-                  <ArrowDownRight className="w-3.5 h-3.5" strokeWidth={2} />
-                  下挫止盈
-                </button>
-                <button
-                  onClick={() => handleInjectPulse('LONG', 0.0082, 'REVERSAL_SL', '主所假突破反转止损')}
-                  className="btn-soft-pill px-2.5 sm:px-3 py-1 text-xs text-amber-600 dark:text-amber-400"
-                >
-                  <RefreshCw className="w-3 h-3" strokeWidth={2} />
-                  反转止损
-                </button>
-                <button
-                  onClick={() => handleInjectPulse('LONG', 0.008, 'MM_WITHDRAW_MISS', '做市商抢先撤单未成交')}
-                  className="btn-soft-pill px-2.5 sm:px-3 py-1 text-xs"
-                >
-                  <Activity className="w-3.5 h-3.5" strokeWidth={1.75} />
-                  撤单未成
+                  {liveStatus.follower_auth_message || '点击配置执行端 API'}
                 </button>
               </div>
-            )
-          )}
+            ) : (
+              activeTab === 'radar' && (
+                <div className="flex flex-wrap items-center gap-1.5 text-[11px] sm:text-xs">
+                  <span className="text-dim mr-0.5">脉冲注入 ({selectedSymbol.split('/')[0]}):</span>
+                  <button
+                    type="button"
+                    onClick={() => handleInjectPulse('LONG', 0.0085, 'CONVERGE_TP', '多头拉升收敛止盈')}
+                    className="btn-soft-pill px-2.5 sm:px-3 py-1 text-xs text-emerald-600 dark:text-emerald-400"
+                  >
+                    <ArrowUpRight className="w-3.5 h-3.5" strokeWidth={2} />
+                    拉升止盈
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleInjectPulse('SHORT', 0.0085, 'CONVERGE_TP', '空头下挫收敛止盈')}
+                    className="btn-soft-pill px-2.5 sm:px-3 py-1 text-xs text-rose-600 dark:text-rose-400"
+                  >
+                    <ArrowDownRight className="w-3.5 h-3.5" strokeWidth={2} />
+                    下挫止盈
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleInjectPulse('LONG', 0.0082, 'REVERSAL_SL', '主所假突破反转止损')}
+                    className="btn-soft-pill px-2.5 sm:px-3 py-1 text-xs text-amber-600 dark:text-amber-400"
+                  >
+                    <RefreshCw className="w-3 h-3" strokeWidth={2} />
+                    反转止损
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleInjectPulse('LONG', 0.008, 'MM_WITHDRAW_MISS', '做市商抢先撤单未成交')}
+                    className="btn-soft-pill px-2.5 sm:px-3 py-1 text-xs"
+                  >
+                    <Activity className="w-3.5 h-3.5" strokeWidth={1.75} />
+                    撤单未成
+                  </button>
+                </div>
+              )
+            )}
+          </div>
         </div>
       </header>
 
@@ -2528,8 +2753,10 @@ export default function App() {
                   <div
                     key={s.symbol}
                     onClick={() => setSelectedSymbol(s.symbol)}
-                    className={`w-[80vw] max-w-[295px] shrink-0 snap-start sm:w-auto sm:max-w-none cursor-pointer surface-card p-4 sm:p-5 lg:p-6 transition-all ${
-                      isSelected ? 'ring-2 ring-[#0f1419] dark:ring-sky-400' : 'hover:opacity-95'
+                    className={`w-[80vw] max-w-[295px] shrink-0 snap-start sm:w-auto sm:max-w-none surface-card interactive-card p-4 sm:p-5 lg:p-6 ${
+                      isSelected
+                        ? 'ring-2 ring-[#0f1419] dark:ring-sky-400 shadow-[0_10px_28px_-8px_rgba(15,23,42,0.16)] dark:shadow-[0_12px_32px_-8px_rgba(56,189,248,0.22)]'
+                        : ''
                     }`}
                   >
                     <div className="flex items-center justify-between gap-2 mb-3 sm:mb-3.5">
@@ -2602,47 +2829,121 @@ export default function App() {
               })}
             </div>
 
-            {/* 8-Stage State Machine Pipeline (Matching Screenshot 1 `返佣规则` Step Flow Card) */}
+            {/* Adaptive Multi-Strategy Millisecond Position State Machine */}
             <div className="surface-card p-4 sm:p-6 lg:p-7">
-              <div className="flex flex-wrap items-center justify-between gap-2 mb-4 sm:mb-5">
-                <div className="flex items-center gap-2.5">
-                  <Cpu className="w-4 h-4 sm:w-5 sm:h-5 text-main shrink-0" strokeWidth={1.75} />
-                  <h3 className="text-sm sm:text-base font-bold text-main">
-                    毫秒级持仓状态机 ({selectedSymbol.replace(':USDT', '')})
-                  </h3>
-                </div>
-                <span className="text-[11px] sm:text-xs text-dim font-mono">
-                  净利 ≥ {((currentStrategy.take_profit_pct ?? 0.0025) * 100).toFixed(2)}% · 窗口{' '}
-                  {currentStrategy.window_ms ?? 150}ms · 阈值{' '}
-                  {((currentStrategy.min_jump_pct ?? 0.006) * 100).toFixed(2)}%
-                </span>
-              </div>
-
-              <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3 sm:gap-4">
-                {STATE_PIPELINE.map((st) => {
-                  const activeState = currentTelemetry.state || 'IDLE';
-                  const isCurrent = activeState === st.key;
-                  return (
-                    <div key={st.key} className="flex items-center gap-2.5 sm:gap-3">
-                      <div
-                        className={`w-9 h-9 sm:w-11 sm:h-11 rounded-xl sm:rounded-2xl flex items-center justify-center font-mono text-[11px] sm:text-xs font-bold shrink-0 transition ${
-                          isCurrent
-                            ? 'bg-[#0f1419] text-white shadow-sm'
-                            : 'surface-subtle text-sub'
-                        }`}
-                      >
-                        0{st.step}
-                      </div>
-                      <div className="min-w-0">
-                        <div className="text-xs font-bold text-main truncate">
-                          {st.step}. {st.label}
+              {(() => {
+                const sm = resolveStrategyStateMachine(currentStrategy, currentTelemetry);
+                const toneClsMap = {
+                  emerald: 'text-emerald-600 dark:text-emerald-400',
+                  rose: 'text-rose-600 dark:text-rose-400',
+                  sky: 'text-sky-600 dark:text-sky-400',
+                  violet: 'text-violet-600 dark:text-violet-400',
+                  dim: 'text-dim',
+                  main: 'text-main',
+                };
+                return (
+                  <>
+                    <div className="flex flex-wrap items-center justify-between gap-2.5 mb-4 sm:mb-5">
+                      <div className="flex flex-wrap items-center gap-2 min-w-0">
+                        <div className="icon-box w-8 h-8 border border-line">
+                          <Cpu className="w-4 h-4 text-main shrink-0" strokeWidth={1.85} />
                         </div>
-                        <div className="text-[11px] text-dim truncate mt-0.5">{st.desc}</div>
+                        <h3 className="text-sm sm:text-base font-bold text-main">
+                          毫秒级持仓状态机 ({selectedSymbol.replace(':USDT', '')})
+                        </h3>
+                        <span
+                          className={`text-[10px] sm:text-[11px] px-2.5 py-0.5 rounded-full font-bold shrink-0 ${strategyBadgeClass(
+                            sm.strategyType
+                          )}`}
+                        >
+                          {STRATEGY_LABEL_MAP[sm.strategyType] || sm.strategyType}
+                        </span>
+                        {sm.isUncertain && (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-rose-500/15 text-rose-600 dark:text-rose-400 border border-rose-500/30 animate-pulse">
+                            <AlertTriangle className="w-3 h-3" />
+                            平仓核验锁仓中
+                          </span>
+                        )}
                       </div>
+                      <span className="text-[11px] sm:text-xs text-dim font-mono">
+                        {sm.subtitle}
+                      </span>
                     </div>
-                  );
-                })}
-              </div>
+
+                    {/* Strategy-Aware Stage Pipeline */}
+                    <div className={`grid ${sm.gridColsClass} gap-2.5 sm:gap-3`}>
+                      {sm.pipeline.map((st, idx) => {
+                        const isCurrent = st.key === sm.activeKey;
+                        const isPassed = idx < sm.activeIdx;
+                        return (
+                          <div
+                            key={`${sm.strategyType}-${st.key}`}
+                            className={`relative rounded-2xl px-3 py-2.5 border transition-all flex items-center gap-2.5 min-w-0 ${
+                              isCurrent
+                                ? 'bg-[#0f1419] dark:bg-sky-500/15 text-white dark:text-sky-100 border-[#0f1419] dark:border-sky-400/60 shadow-md -translate-y-0.5'
+                                : isPassed
+                                ? 'surface-subtle interactive-subtle border-emerald-500/30 bg-emerald-500/[0.04]'
+                                : 'surface-subtle interactive-subtle'
+                            }`}
+                          >
+                            <div
+                              className={`w-8 h-8 sm:w-9 sm:h-9 rounded-xl flex items-center justify-center font-mono text-[11px] font-bold shrink-0 transition ${
+                                isCurrent
+                                  ? 'bg-white/15 dark:bg-sky-400 text-white dark:text-slate-950'
+                                  : isPassed
+                                  ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                                  : 'bg-[var(--bg-card)] text-sub border border-line'
+                              }`}
+                            >
+                              0{st.step}
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5">
+                                <span
+                                  className={`text-xs font-bold truncate ${
+                                    isCurrent ? 'text-white dark:text-sky-100' : 'text-main'
+                                  }`}
+                                >
+                                  {st.label}
+                                </span>
+                                {isCurrent && (
+                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping shrink-0" />
+                                )}
+                              </div>
+                              <div
+                                className={`text-[10px] sm:text-[11px] truncate mt-0.5 ${
+                                  isCurrent ? 'text-white/75 dark:text-sky-200/80' : 'text-dim'
+                                }`}
+                              >
+                                {st.desc}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Per-Strategy Live State Metrics Strip */}
+                    <div className="mt-3 grid grid-cols-2 lg:grid-cols-4 gap-2 sm:gap-2.5">
+                      {sm.metrics.map((m) => (
+                        <div
+                          key={m.label}
+                          className="surface-subtle interactive-subtle px-3 py-2 rounded-xl flex flex-col gap-0.5 min-w-0"
+                        >
+                          <span className="text-[10px] sm:text-[11px] text-dim truncate">{m.label}</span>
+                          <span
+                            className={`text-xs sm:text-sm font-mono font-bold truncate ${
+                              toneClsMap[m.tone] || 'text-main'
+                            }`}
+                          >
+                            {m.value}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                );
+              })()}
 
               {/* Active Position Status Bar: Live Exchange Positions & Strategy Takeover */}
               {((snapshot.active_positions || []).length > 0 || isLiveMode) && (
@@ -2776,7 +3077,7 @@ export default function App() {
                         return (
                           <div
                             key={rowKey}
-                            className="flex flex-col xl:flex-row xl:items-center justify-between gap-2.5 px-3 py-2.5 rounded-xl border border-line bg-white/60 dark:bg-slate-900/50 text-xs font-mono"
+                            className="flex flex-col xl:flex-row xl:items-center justify-between gap-2.5 px-3 py-2.5 rounded-xl border border-line bg-white/70 dark:bg-slate-900/55 text-xs font-mono transition-all hover:border-[var(--border-hover)] hover:shadow-sm hover:-translate-y-[1px]"
                           >
                             <div className="flex flex-wrap items-center gap-2 sm:gap-3">
                               <button
@@ -3752,10 +4053,10 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => updateCurrentStrategyField({ strategy_type: 'LEAD_LAG' })}
-                          className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold transition text-left ${
+                          className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold text-left ${
                             (currentStrategy.strategy_type || 'LEAD_LAG') === 'LEAD_LAG'
                               ? 'btn-primary-pill shadow-sm'
-                              : 'surface-card text-sub hover:text-main'
+                              : 'surface-card interactive-card text-sub hover:text-main'
                           }`}
                         >
                           <div className="flex items-center gap-1.5">
@@ -3767,10 +4068,10 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => updateCurrentStrategyField({ strategy_type: 'LONG_SHORT_GRID' })}
-                          className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold transition text-left ${
+                          className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold text-left ${
                             currentStrategy.strategy_type === 'LONG_SHORT_GRID'
-                              ? 'bg-sky-600 text-white shadow-sm'
-                              : 'surface-card text-sub hover:text-main'
+                              ? 'bg-sky-600 text-white shadow-md hover:bg-sky-500'
+                              : 'surface-card interactive-card text-sub hover:text-main'
                           }`}
                         >
                           <div className="flex items-center gap-1.5">
@@ -3782,10 +4083,10 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => updateCurrentStrategyField({ strategy_type: 'REVERSE_GRID' })}
-                          className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold transition text-left ${
+                          className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold text-left ${
                             currentStrategy.strategy_type === 'REVERSE_GRID'
-                              ? 'bg-teal-600 text-white shadow-sm'
-                              : 'surface-card text-sub hover:text-main'
+                              ? 'bg-teal-600 text-white shadow-md hover:bg-teal-500'
+                              : 'surface-card interactive-card text-sub hover:text-main'
                           }`}
                         >
                           <div className="flex items-center gap-1.5">
@@ -3797,10 +4098,10 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => updateCurrentStrategyField({ strategy_type: 'TREND_GRID' })}
-                          className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold transition text-left ${
+                          className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold text-left ${
                             currentStrategy.strategy_type === 'TREND_GRID'
-                              ? 'bg-violet-600 text-white shadow-sm'
-                              : 'surface-card text-sub hover:text-main'
+                              ? 'bg-violet-600 text-white shadow-md hover:bg-violet-500'
+                              : 'surface-card interactive-card text-sub hover:text-main'
                           }`}
                         >
                           <div className="flex items-center gap-1.5">
@@ -3812,10 +4113,10 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => updateCurrentStrategyField({ strategy_type: 'ADAPTIVE_GRID' })}
-                          className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold transition text-left ${
+                          className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold text-left ${
                             currentStrategy.strategy_type === 'ADAPTIVE_GRID'
-                              ? 'bg-amber-600 text-white shadow-sm'
-                              : 'surface-card text-sub hover:text-main'
+                              ? 'bg-amber-600 text-white shadow-md hover:bg-amber-500'
+                              : 'surface-card interactive-card text-sub hover:text-main'
                           }`}
                         >
                           <div className="flex items-center gap-1.5">

@@ -13,6 +13,8 @@
   --bg-hover: #eef2f6;
   --border-primary: #eef1f6;
   --border-strong: #e2e8f0;
+  --border-hover: #cbd5e1;
+  --ring-focus: rgba(15, 23, 42, 0.14);
   --text-primary: #0f172a;
   --text-secondary: #334155;
   --text-muted: #8492a6;
@@ -23,19 +25,24 @@
   --chart-axis: #8492a6;
   --chart-leader: #d97706;
   --chart-follower: #0284c7;
-  --shadow-card: 0 4px 24px -4px rgba(15, 23, 42, 0.04), 0 2px 6px -1px rgba(15, 23, 42, 0.02);
+  --shadow-card: 0 4px 20px -4px rgba(15, 23, 42, 0.05), 0 1px 4px -1px rgba(15, 23, 42, 0.03);
+  --shadow-card-hover: 0 12px 28px -8px rgba(15, 23, 42, 0.11), 0 4px 10px -2px rgba(15, 23, 42, 0.05);
+  --shadow-card-active: 0 2px 8px -2px rgba(15, 23, 42, 0.09);
+  --shadow-btn-hover: 0 6px 16px -4px rgba(15, 23, 42, 0.18);
 }
 
 [data-theme="dark"] {
   --bg-page: #0b0f17;
-  --bg-header: rgba(15, 21, 33, 0.90);
+  --bg-header: rgba(13, 19, 31, 0.88);
   --bg-card: #131b2e;
   --bg-subtle: #1a243b;
   --bg-icon-box: #1e293b;
   --bg-input: #192236;
-  --bg-hover: #1e293b;
+  --bg-hover: #22304d;
   --border-primary: #1e293b;
-  --border-strong: #2dd4bf22;
+  --border-strong: #2b3b57;
+  --border-hover: rgba(56, 189, 248, 0.35);
+  --ring-focus: rgba(56, 189, 248, 0.28);
   --text-primary: #f8fafc;
   --text-secondary: #cbd5e1;
   --text-muted: #64748b;
@@ -46,7 +53,10 @@
   --chart-axis: #64748b;
   --chart-leader: #f59e0b;
   --chart-follower: #38bdf8;
-  --shadow-card: 0 8px 28px -4px rgba(0, 0, 0, 0.4);
+  --shadow-card: 0 8px 26px -4px rgba(0, 0, 0, 0.42);
+  --shadow-card-hover: 0 16px 36px -8px rgba(0, 0, 0, 0.62), 0 0 0 1px rgba(56, 189, 248, 0.20);
+  --shadow-card-active: 0 3px 10px -2px rgba(0, 0, 0, 0.55);
+  --shadow-btn-hover: 0 8px 20px -4px rgba(0, 0, 0, 0.55);
 }
 
 @layer base {
@@ -72,19 +82,70 @@
     touch-action: manipulation;
   }
 
+  button:not(:disabled) {
+    cursor: pointer;
+    transition:
+      background-color 0.16s cubic-bezier(0.22, 1, 0.36, 1),
+      border-color 0.16s cubic-bezier(0.22, 1, 0.36, 1),
+      color 0.16s cubic-bezier(0.22, 1, 0.36, 1),
+      box-shadow 0.18s cubic-bezier(0.22, 1, 0.36, 1),
+      transform 0.12s cubic-bezier(0.22, 1, 0.36, 1),
+      opacity 0.16s ease;
+  }
+
+  button:not(:disabled):active {
+    transform: translateY(0.5px) scale(0.972);
+  }
+
+  button:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--ring-focus);
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+
   .font-mono {
     font-family: "JetBrains Mono", "Space Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
     font-feature-settings: "tnum" on, "zero" on;
   }
 }
 
-/* Main White Rounded-3xl Card (Matches Screenshots 1, 2, 3) */
+/* Main White Rounded-3xl Card */
 .surface-card {
   background-color: var(--bg-card);
   border: 1px solid var(--border-primary);
   box-shadow: var(--shadow-card);
   border-radius: 1.125rem; /* 18px mobile */
-  transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, transform 0.15s ease;
+  transition:
+    background-color 0.2s cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 0.2s cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+    transform 0.16s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.surface-card:hover {
+  border-color: var(--border-hover);
+  box-shadow: var(--shadow-card-hover);
+}
+
+/* Clickable / Selectable Interactive Card with tactile hover lift & springy press */
+.interactive-card {
+  cursor: pointer;
+  user-select: none;
+  will-change: transform, box-shadow;
+}
+
+.interactive-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-hover);
+  box-shadow: var(--shadow-card-hover);
+}
+
+.interactive-card:active {
+  transform: translateY(0px) scale(0.986);
+  box-shadow: var(--shadow-card-active);
 }
 
 @media (min-width: 640px) {
@@ -93,11 +154,32 @@
   }
 }
 
-/* Soft Filled Inner Sub-Card (Matches Screenshot 2 Info Boxes) */
+/* Soft Filled Inner Sub-Card */
 .surface-subtle {
   background-color: var(--bg-subtle);
   border: 1px solid var(--border-strong);
   border-radius: 0.875rem; /* 14px mobile */
+  transition:
+    background-color 0.16s cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 0.16s cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 0.18s cubic-bezier(0.22, 1, 0.36, 1),
+    transform 0.12s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.surface-subtle.cursor-pointer:hover,
+button.surface-subtle:not(:disabled):hover,
+.interactive-subtle:hover {
+  background-color: var(--bg-hover);
+  border-color: var(--border-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px -4px rgba(15, 23, 42, 0.10);
+}
+
+.surface-subtle.cursor-pointer:active,
+button.surface-subtle:not(:disabled):active,
+.interactive-subtle:active {
+  transform: translateY(0.5px) scale(0.978);
+  box-shadow: none;
 }
 
 @media (min-width: 640px) {
@@ -106,7 +188,7 @@
   }
 }
 
-/* Soft Rounded-2xl Icon Box (Matches Screenshot 1 Stat & Step Icons) */
+/* Soft Rounded-2xl Icon Box */
 .icon-box {
   background-color: var(--bg-icon-box);
   color: var(--text-primary);
@@ -115,6 +197,11 @@
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  transition: background-color 0.18s ease, transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.surface-card:hover .icon-box {
+  transform: scale(1.04);
 }
 
 @media (min-width: 640px) {
@@ -124,13 +211,13 @@
 }
 
 @layer components {
-  /* Solid Black Pill Button (Matches Screenshots 1, 2, 3 Primary Buttons) */
+  /* Solid Primary Pill Button */
   .btn-primary-pill {
     background-color: var(--btn-primary-bg);
     color: var(--btn-primary-text);
     border-radius: 9999px;
     font-weight: 600;
-    transition: all 0.15s ease;
+    transition: all 0.16s cubic-bezier(0.22, 1, 0.36, 1);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -138,14 +225,21 @@
     gap: 0.375rem;
   }
 
-  .btn-primary-pill:hover {
+  .btn-primary-pill:not(:disabled):hover {
     background-color: var(--btn-primary-hover);
-    transform: translateY(-1px);
+    transform: translateY(-1.5px);
+    box-shadow: var(--shadow-btn-hover);
+  }
+
+  .btn-primary-pill:not(:disabled):active {
+    transform: translateY(0.5px) scale(0.968);
+    box-shadow: 0 1px 4px rgba(15, 23, 42, 0.16);
   }
 
   .btn-primary-pill:disabled {
     opacity: 0.55;
     transform: none;
+    box-shadow: none;
     cursor: not-allowed;
   }
 
@@ -156,7 +250,7 @@
     border: 1px solid var(--border-strong);
     border-radius: 9999px;
     font-weight: 600;
-    transition: all 0.15s ease;
+    transition: all 0.16s cubic-bezier(0.22, 1, 0.36, 1);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -171,8 +265,46 @@
     }
   }
 
-  .btn-soft-pill:hover {
+  .btn-soft-pill:not(:disabled):hover {
     background-color: var(--bg-hover);
+    border-color: var(--border-hover);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px -4px rgba(15, 23, 42, 0.12);
+  }
+
+  .btn-soft-pill:not(:disabled):active {
+    transform: translateY(0.5px) scale(0.968);
+    box-shadow: none;
+  }
+
+  .btn-soft-pill:disabled {
+    opacity: 0.55;
+    transform: none;
+    box-shadow: none;
+    cursor: not-allowed;
+  }
+
+  /* Header Navigation Tab Pill */
+  .nav-tab-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    border-radius: 9999px;
+    font-weight: 600;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: all 0.16s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .nav-tab-pill:not(.nav-tab-active):hover {
+    background-color: var(--bg-card);
+    color: var(--text-primary);
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px -2px rgba(15, 23, 42, 0.08);
+  }
+
+  .nav-tab-pill:active {
+    transform: translateY(0.5px) scale(0.968);
   }
 
   /* Soft Filled Rounded-2xl Input (16px on mobile avoids iOS auto-zoom) */
@@ -202,7 +334,18 @@
     outline: none;
     background-color: var(--bg-card);
     border-color: var(--text-primary);
-    box-shadow: 0 0 0 3px rgba(15, 23, 42, 0.08);
+    box-shadow: 0 0 0 3px var(--ring-focus);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .surface-card,
+  .interactive-card,
+  .surface-subtle,
+  .icon-box,
+  button {
+    transition: none !important;
+    transform: none !important;
   }
 }
 
