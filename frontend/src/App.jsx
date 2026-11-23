@@ -167,8 +167,8 @@ function resolveStrategyStateMachine(cfg, tel) {
     const armedCount = idleLevels.filter((lv) => lv.armed !== false).length;
     const disarmedCount = idleLevels.length - armedCount;
     const trailActiveSlots = openSlots.filter((lv) => Boolean(lv.trail_active));
-    const longTrail = Number(gSnap.long_trail_stop_price || 0);
-    const shortTrail = Number(gSnap.short_trail_stop_price || 0);
+    const longTrail = Number(grid?.long_trail_stop_price || 0);
+    const shortTrail = Number(grid?.short_trail_stop_price || 0);
     const liveTrailPx = openLong > 0 && longTrail > 0 ? longTrail : openShort > 0 && shortTrail > 0 ? shortTrail : 0;
 
     if (exitingSlots.length > 0) activeKey = 'EXITING';
@@ -3117,10 +3117,10 @@ export default function App() {
                                 ? (() => {
                                     const revTrailCnt = levels.filter((lv) => lv.status === 'OPEN' && lv.trail_active).length;
                                     const revTrailPx =
-                                      openLong > 0 && Number(gSnap.long_trail_stop_price || 0) > 0
-                                        ? Number(gSnap.long_trail_stop_price)
-                                        : openShort > 0 && Number(gSnap.short_trail_stop_price || 0) > 0
-                                        ? Number(gSnap.short_trail_stop_price)
+                                      openLong > 0 && Number(grid?.long_trail_stop_price || 0) > 0
+                                        ? Number(grid?.long_trail_stop_price)
+                                        : openShort > 0 && Number(grid?.short_trail_stop_price || 0) > 0
+                                        ? Number(grid?.short_trail_stop_price)
                                         : 0;
                                     if (revTrailCnt > 0 && revTrailPx > 0) {
                                       return `保本追踪 ${fmtPx(revTrailPx)}`;
