@@ -3468,63 +3468,54 @@ def test_reverse_oscillating_grid_core_lifecycle():
     assert [e["slot_id"] for e in en2] == ["L2"]
     trk.mark_entry_filled("L2", 101.65, 0.20, 2.0, 0.1, cfg, round_trip_fee=0.0007)
 
-    # 3) Price hits L1 TP activation (101.75) -> activates Breakeven + Trailing TP (does NOT cap exit at 101.75!)
-    #    SL immediately steps into guaranteed net profit (> 100.82) & flags sl_needs_amend; rides higher to 102.60,
-    #    then pulls back to trigger GRID_TRAIL_TP cleanly with > 1.2% net gain!
-    _, ex_act = trk.evaluate_tick(101.78, 101.80, 101.79, cfg, is_net_mode=False, round_trip_fee=0.0010)
-    assert ex_act == []
-    assert trk.levels["L1"]["trail_active"] is True
-    assert trk.levels["L1"]["sl_price"] > 100.82
-    assert trk.levels["L1"]["sl_needs_amend"] is True
-    assert trk.levels["L1"]["trail_stop_price"] > 100.82
-    assert trk.get_cond_sl_exit_reason(trk.levels["L1"]) == "GRID_BE_SL"
-
-    # Once trail_active is True, widening grid_stop_loss_pct MUST NEVER widen profit-locked SL back into loss!
-    # Rally to 102.50 (above L1 act 101.75, below L2 act 102.59) so L1 rides & exits while L2 stays OPEN
-    locked_sl_l1 = trk.levels["L1"]["sl_price"]
-    cfg_wide = cfg.model_copy(update={"grid_stop_loss_pct": 0.05})
-    en_rally, _ = trk.evaluate_tick(102.50, 102.52, 102.51, cfg_wide, is_net_mode=False, round_trip_fee=0.0010)
-    for e_sub in en_rally:
-        trk.mark_entry_missed(e_sub["slot_id"])
-    assert trk.levels["L1"]["sl_price"] >= locked_sl_l1
-    assert trk.levels["L1"]["peak_price"] == 102.50
-    l1_trail_px = trk.levels["L1"]["trail_stop_price"]
-    assert l1_trail_px > 101.90
-
-    # Pullback below L1's trail_stop_price exits L1 via GRID_TRAIL_TP (L2 stays OPEN since L2 didn't hit act 102.59)
-    _, ex_l1 = trk.evaluate_tick(l1_trail_px - 0.02, l1_trail_px, l1_trail_px - 0.01, cfg, is_net_mode=False, round_trip_fee=0.0010)
+    # 3) Price hits L1 TP (101.75) -> L1 exits with GRID_TP!
+    _, ex_l1 = trk.evaluate_tick(101.78, 101.80, 101.79, cfg, is_net_mode=False, round_trip_fee=0.0007)
     assert [e["slot_id"] for e in ex_l1] == ["L1"]
-    assert ex_l1[0]["exit_reason"] == "GRID_TRAIL_TP"
-    trk.mark_exited("L1", 0.30, is_sl=False)
+    assert ex_l1[0]["exit_reason"] == "GRID_TP"
+    trk.mark_exited("L1", 0.17, is_sl=False)
     assert trk.levels["L1"]["armed"] is False
-    assert trk.levels["L1"]["trail_active"] is False
 
     # Clear L1 1.2s cooldown and stay above L1 at 101.85 -> L1 MUST NOT spuriously re-open!
     trk.levels["L1"]["cooldown_until_mono"] = 0.0
     trk.levels["L1"]["last_closed_mono"] = 0.0
-    en_no_restack, _ = trk.evaluate_tick(101.84, 101.86, 101.85, cfg, is_net_mode=False, round_trip_fee=0.0010)
+    en_no_restack, _ = trk.evaluate_tick(101.84, 101.86, 101.85, cfg, is_net_mode=False, round_trip_fee=0.0007)
     assert en_no_restack == []
 
-    # 4) Price pulls back below L1 (100.80 * (1 - 0.0003) = 100.77) -> L1 re-arms!
-    en_pull, _ = trk.evaluate_tick(100.50, 100.55, 100.525, cfg, is_net_mode=False, round_trip_fee=0.0010)
+    # 4) Price pulls back below L1 (100.80 * (1 - 0.002) = 100.598) -> L1 re-arms!
+    en_pull, _ = trk.evaluate_tick(100.50, 100.55, 100.525, cfg, is_net_mode=False, round_trip_fee=0.0007)
     assert en_pull == []
     assert trk.levels["L1"]["armed"] is True
 
-    # Price breaks UP across L1 (100.80) again while L2 is still OPEN at 101.65 (distance 0.79% >= 0.44%) -> L1 re-enters!
-    en_re, _ = trk.evaluate_tick(100.81, 100.83, 100.82, cfg, is_net_mode=False, round_trip_fee=0.0010)
+    # Price breaks UP across L1 (100.80) again while L2 is still OPEN at 101.65 (distance 0.79% >= 0.64%) -> L1 re-enters!
+    en_re, _ = trk.evaluate_tick(100.81, 100.83, 100.82, cfg, is_net_mode=False, round_trip_fee=0.0007)
     assert [e["slot_id"] for e in en_re] == ["L1"]
     trk.mark_entry_missed("L1")
     assert trk.levels["L1"]["status"] == "IDLE"
     assert trk.levels["L1"]["armed"] is True  # Miss preserves armed state!
 
-    # 5) Strict No Reverse-Locking: L2 is OPEN (LONG), so dropping below S1 (99.20) is blocked in BOTH net AND hedge mode!
-    en_net, _ = trk.evaluate_tick(99.15, 99.18, 99.165, cfg, is_net_mode=True, round_trip_fee=0.0010)
+    # 5) Net-mode mutual exclusion: L2 is OPEN (LONG), so dropping below S1 (99.20) is blocked in net_mode
+    en_net, _ = trk.evaluate_tick(99.15, 99.18, 99.165, cfg, is_net_mode=True, round_trip_fee=0.0007)
     assert en_net == []
-    en_hedge_blocked, _ = trk.evaluate_tick(99.15, 99.18, 99.165, cfg, is_net_mode=False, round_trip_fee=0.0010)
-    assert en_hedge_blocked == []
 
-    # Export & restore state preserves active_grid_mode, open L2, and disarmed slots!
-    trk.levels["S1"]["armed"] = False
+    # In hedge mode (is_net_mode=False), dropping below S1 (99.20) opens SHORT S1!
+    en_s1, _ = trk.evaluate_tick(99.15, 99.18, 99.165, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert [e["slot_id"] for e in en_s1] == ["S1"]
+    assert en_s1[0]["side"] == "SHORT"
+    trk.mark_entry_filled("S1", 99.15, 0.20, 2.0, 0.1, cfg, round_trip_fee=0.0007)
+    assert trk.levels["S1"]["armed"] is False
+    assert trk.levels["S1"]["tp_price"] == round(99.15 * (1.0 - 0.0085 - 0.0007), 2)  # 98.24
+    assert trk.levels["S1"]["sl_price"] == round(99.15 * (1.0 + 0.038), 2)            # 102.92
+
+    # S1 hits TP at 98.20!
+    _, ex_s1 = trk.evaluate_tick(98.18, 98.20, 98.19, cfg, is_net_mode=False, round_trip_fee=0.0007)
+    assert [e["slot_id"] for e in ex_s1] == ["S1"]
+    assert ex_s1[0]["exit_reason"] == "GRID_TP"
+    trk.mark_exited("S1", 0.17, is_sl=False)
+    trk.levels["S1"]["cooldown_until_mono"] = 0.0
+    trk.levels["S1"]["last_closed_mono"] = 0.0
+    assert trk.levels["S1"]["armed"] is False
+
+    # Export & restore state preserves active_grid_mode, open L2, and disarmed S1!
     exported = trk.export_state()
     assert exported["active_grid_mode"] == "REVERSE_OSCILLATING"
     assert "S1" in exported["disarmed_slots"]
@@ -3537,62 +3528,40 @@ def test_reverse_oscillating_grid_core_lifecycle():
 
     # 6) Stop-loss on L2 (entry 101.65, sl = 97.79) triggers GRID_SL and engages 120s post-SL cooldown
     now_pre = mono_ms()
-    _, ex_sl = trk_restored.evaluate_tick(97.70, 97.75, 97.725, cfg, is_net_mode=False, round_trip_fee=0.0010)
+    _, ex_sl = trk_restored.evaluate_tick(97.70, 97.75, 97.725, cfg, is_net_mode=False, round_trip_fee=0.0007)
     assert [e["slot_id"] for e in ex_sl] == ["L2"]
     assert ex_sl[0]["exit_reason"] == "GRID_SL"
     trk_restored.mark_exited("L2", -0.76, is_sl=True)
     assert trk_restored._post_sl_cooldown_until_mono >= now_pre + 110_000.0
     # During cooldown, flat drift outside range does NOT prematurely recenter or enter!
-    en_cd, _ = trk_restored.evaluate_tick(96.00, 96.04, 96.02, cfg, is_net_mode=False, round_trip_fee=0.0010)
+    en_cd, _ = trk_restored.evaluate_tick(96.00, 96.04, 96.02, cfg, is_net_mode=False, round_trip_fee=0.0007)
     assert en_cd == []
     assert trk_restored.center_price == 100.00
 
     # Once cooldown expires & flat outside range -> auto-recenters cleanly with all slots armed!
     trk_restored._post_sl_cooldown_until_mono = 0.0
-    en_rc, ex_rc = trk_restored.evaluate_tick(96.00, 96.04, 96.02, cfg, is_net_mode=False, round_trip_fee=0.0010)
+    en_rc, ex_rc = trk_restored.evaluate_tick(96.00, 96.04, 96.02, cfg, is_net_mode=False, round_trip_fee=0.0007)
     assert en_rc == [] and ex_rc == []
     assert trk_restored.center_price == 96.02
     assert all(lv["armed"] is True for lv in trk_restored.levels.values())
 
-    # 6b) Once flat, dropping below S1 opens SHORT S1 -> activates trailing TP -> rides lower -> exits GRID_TRAIL_TP!
-    s1_trig = trk_restored.levels["S1"]["trigger_price"]
-    en_s1, _ = trk_restored.evaluate_tick(s1_trig - 0.02, s1_trig - 0.01, s1_trig - 0.015, cfg, is_net_mode=False, round_trip_fee=0.0010)
-    assert [e["slot_id"] for e in en_s1] == ["S1"]
-    assert en_s1[0]["side"] == "SHORT"
-    s1_ep = s1_trig - 0.02
-    trk_restored.mark_entry_filled("S1", s1_ep, 0.20, 2.0, 0.1, cfg, round_trip_fee=0.0010)
-    s1_act = trk_restored.levels["S1"]["tp_price"]
-    trk_restored.evaluate_tick(s1_act - 0.50, s1_act - 0.48, s1_act - 0.49, cfg, is_net_mode=False, round_trip_fee=0.0010)
-    assert trk_restored.levels["S1"]["trail_active"] is True
-    assert trk_restored.levels["S1"]["sl_price"] < s1_ep
-    s1_trail = trk_restored.levels["S1"]["trail_stop_price"]
-    _, ex_s1 = trk_restored.evaluate_tick(s1_trail + 0.01, s1_trail + 0.03, s1_trail + 0.02, cfg, is_net_mode=False, round_trip_fee=0.0010)
-    assert [e["slot_id"] for e in ex_s1] == ["S1"]
-    assert ex_s1[0]["exit_reason"] == "GRID_TRAIL_TP"
-    trk_restored.mark_exited("S1", 0.25, is_sl=False)
-    assert trk_restored.levels["S1"]["armed"] is False
-
     # 7) Gap jump across multiple levels (100.0 -> 101.70) picks closest crossed L2 and disarms bypassed L1 on fill!
     trk_gap = LongShortGridTracker("SOL/USDT:USDT")
     trk_gap.sync_config(cfg, current_mid=100.00)
-    en_gap, _ = trk_gap.evaluate_tick(101.68, 101.70, 101.69, cfg, is_net_mode=False, round_trip_fee=0.0010)
+    en_gap, _ = trk_gap.evaluate_tick(101.68, 101.70, 101.69, cfg, is_net_mode=False, round_trip_fee=0.0007)
     assert [e["slot_id"] for e in en_gap] == ["L2"]
-    trk_gap.mark_entry_filled("L2", 101.70, 0.20, 2.0, 0.1, cfg, round_trip_fee=0.0010)
+    trk_gap.mark_entry_filled("L2", 101.70, 0.20, 2.0, 0.1, cfg, round_trip_fee=0.0007)
     assert trk_gap.levels["L1"]["armed"] is False  # Bypassed inner L1 disarmed!
 
-    # 8) Unrestricted two-way direction under BEAR/BULL trend_bias (when flat, zero reverse-locking):
-    #    BOTH upward LONG (涨破开多) and downward SHORT (跌破开空) trigger cleanly in LONG_SHORT mode!
+    # 8) Unrestricted two-way grid arbitrage under BEAR/BULL trend_bias: BOTH upward LONG (涨破开多)
+    #    and downward SHORT (跌破开空) trigger cleanly in LONG_SHORT mode!
     trk_bias = LongShortGridTracker("SOL/USDT:USDT")
     trk_bias.sync_config(cfg, current_mid=100.00)
     bear_bbw = {"timeframe": "15m", "bbw_pct": 2.5, "bbw_percentile": 45.0, "trend_bias": "BEAR"}
     en_bear_up, _ = trk_bias.evaluate_tick(100.82, 100.85, 100.835, cfg, is_net_mode=False, bbw_info=bear_bbw)
     assert [e["slot_id"] for e in en_bear_up] == ["L1"]
-    trk_bias.mark_entry_filled("L1", 100.85, 0.20, 2.0, 0.1, cfg, round_trip_fee=0.0010)
+    trk_bias.mark_entry_filled("L1", 100.85, 0.20, 2.0, 0.1, cfg, round_trip_fee=0.0007)
     bull_bbw = {"timeframe": "15m", "bbw_pct": 2.5, "bbw_percentile": 45.0, "trend_bias": "BULL"}
-    # While L1 is open, S1 is blocked (anti-reverse-lock); once L1 exits flat, S1 fires cleanly under BULL bias!
-    en_blocked_s1, _ = trk_bias.evaluate_tick(99.15, 99.18, 99.165, cfg, is_net_mode=False, bbw_info=bull_bbw)
-    assert en_blocked_s1 == []
-    trk_bias.mark_exited("L1", 0.15, is_sl=False)
     en_bull_dn, _ = trk_bias.evaluate_tick(99.15, 99.18, 99.165, cfg, is_net_mode=False, bbw_info=bull_bbw)
     assert [e["slot_id"] for e in en_bull_dn] == ["S1"]
 
@@ -3643,10 +3612,10 @@ def test_reverse_grid_engine_db_api_and_batch_e2e():
             eng.trading_active_by_mode["SHADOW"] = True
             eng._register_symbol_internal(cfg)
 
-            # Trailing TP REVERSE_OSCILLATING uses Taker+Taker RT fee (no ceiling-capping Maker TP order)
+            # Maker Post-Only fee applies cleanly to REVERSE_OSCILLATING
             _, f_ex = eng.get_leader_And_follower_cfg()
             rt_fee = eng._get_grid_rt_fee(cfg, "REVERSE_OSCILLATING", f_ex)
-            assert abs(rt_fee - (2.0 * float(f_ex["taker_fee"]))) < 1e-9
+            assert abs(rt_fee - (float(f_ex["taker_fee"]) + float(f_ex["maker_fee"]))) < 1e-9
 
             # Seed center at 0.2000
             eng._handle_follower_bbo("DOGE/USDT:USDT", 0.1999, 0.2001, 10000.0, 10000.0)
@@ -3655,7 +3624,7 @@ def test_reverse_grid_engine_db_api_and_batch_e2e():
             assert trk.levels["L1"]["trigger_price"] == 0.2016
             assert trk.levels["S1"]["trigger_price"] == 0.1984
 
-            # 1) Break UP past L1 (0.2016) -> opens LONG L1 -> breaks L2 (0.2032) -> activates trailing TP -> rides higher -> pulls back to harvest BOTH L1 & L2 profitably!
+            # 1) Break UP past L1 (0.2016) -> opens LONG L1 -> breaks L2 (0.2032) -> L1 hits TP -> L2 hits TP!
             eng._handle_follower_bbo("DOGE/USDT:USDT", 0.2016, 0.2017, 10000.0, 10000.0)
             await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
             assert "DOGE/USDT:USDT:L1" in eng.active_grid_positions
@@ -3672,28 +3641,26 @@ def test_reverse_grid_engine_db_api_and_batch_e2e():
             assert "DOGE/USDT:USDT:L2" in eng.active_grid_positions
             l2_pos = eng.active_grid_positions["DOGE/USDT:USDT:L2"]
 
-            # Disarm L3 and rally past L2's activation so BOTH L1 & L2 activate Breakeven + Trailing TP!
-            trk.levels["L3"]["armed"] = False
-            tp_l2 = l2_pos["tp_price"]
-            rally_px = round(tp_l2 + 0.0012, 4)
-            eng._handle_follower_bbo("DOGE/USDT:USDT", rally_px, rally_px + 0.0001, 10000.0, 10000.0)
-            await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
-            assert trk.levels["L1"]["trail_active"] is True
-            assert trk.levels["L2"]["trail_active"] is True
-            assert trk.levels["L1"]["sl_price"] > l1_pos["entry_price"]
-            assert trk.levels["L2"]["sl_price"] > l2_pos["entry_price"]
-
-            # Pull back below both trailing stop lines -> both L1 & L2 harvest uncapped trailing profit cleanly!
-            trail_low = min(trk.levels["L1"]["trail_stop_price"], trk.levels["L2"]["trail_stop_price"])
-            eng._handle_follower_bbo("DOGE/USDT:USDT", trail_low - 0.0002, trail_low - 0.0001, 10000.0, 10000.0)
+            # Price hits L1 TP -> L1 closes profitable; L1 is disarmed so it does NOT restack
+            tp_l1 = l1_pos["tp_price"]
+            eng._handle_follower_bbo("DOGE/USDT:USDT", tp_l1 + 0.0001, tp_l1 + 0.0002, 10000.0, 10000.0)
             await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
             assert "DOGE/USDT:USDT:L1" not in eng.active_grid_positions
-            assert "DOGE/USDT:USDT:L2" not in eng.active_grid_positions
             assert trk.levels["L1"]["armed"] is False
+            assert eng.stats_by_mode["SHADOW"]["win_count"] == 1
+            assert eng.stats_by_mode["SHADOW"]["total_net_pnl"] > 0
+
+            # Complete L2 TP cleanly so long side is flat (using L3's trigger > tp_l2 or recentering cleanly)
+            tp_l2 = l2_pos["tp_price"]
+            # Disarm L3 so we cleanly harvest L2 and stay flat for the downward SHORT test
+            trk.levels["L3"]["armed"] = False
+            eng._handle_follower_bbo("DOGE/USDT:USDT", tp_l2 + 0.0001, tp_l2 + 0.0002, 10000.0, 10000.0)
+            await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
+            assert "DOGE/USDT:USDT:L2" not in eng.active_grid_positions
             assert eng.stats_by_mode["SHADOW"]["win_count"] == 2
             assert eng.stats_by_mode["SHADOW"]["total_net_pnl"] > 0
 
-            # 2) Break DOWN past S1 (0.1984) -> opens SHORT S1 -> breaks S2 -> rides lower -> bounces to harvest S1 & S2 profitably!
+            # 2) Break DOWN past S1 (0.1984) -> opens SHORT S1 -> breaks S2 (0.1968) -> S1 & S2 both close profitable!
             eng._handle_follower_bbo("DOGE/USDT:USDT", 0.1983, 0.1984, 10000.0, 10000.0)
             await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
             assert "DOGE/USDT:USDT:S1" in eng.active_grid_positions
@@ -3702,22 +3669,23 @@ def test_reverse_grid_engine_db_api_and_batch_e2e():
             assert s1_pos["tp_price"] < s1_pos["entry_price"]
             assert s1_pos["sl_price"] > s1_pos["entry_price"]
 
-            eng._handle_follower_bbo("DOGE/USDT:USDT", 0.1966, 0.1967, 10000.0, 10000.0)
+            tp_s1 = s1_pos["tp_price"]
+            eng._handle_follower_bbo("DOGE/USDT:USDT", tp_s1 - 0.0002, tp_s1 - 0.0001, 10000.0, 10000.0)
             await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
-            assert "DOGE/USDT:USDT:S2" in eng.active_grid_positions
+            assert "DOGE/USDT:USDT:S1" not in eng.active_grid_positions
+            assert "DOGE/USDT:USDT:S2" in eng.active_grid_positions  # Price also crossed S2 (0.1968)!
             s2_pos = eng.active_grid_positions["DOGE/USDT:USDT:S2"]
 
-            # Disarm S3 right before dropping past S3 (0.1952) so S1 & S2 cleanly harvest and flatten
-            trk.levels["S3"]["armed"] = False
-            drop_px = round(s2_pos["tp_price"] - 0.0012, 4)
-            eng._handle_follower_bbo("DOGE/USDT:USDT", drop_px - 0.0001, drop_px, 10000.0, 10000.0)
+            # Harvest S2 TP cleanly (with S3 below TP range) -> all slots flat and 4 profitable round-trips!
+            tp_s2 = s2_pos["tp_price"]
+            eng._handle_follower_bbo("DOGE/USDT:USDT", tp_s2 - 0.0002, tp_s2 - 0.0001, 10000.0, 10000.0)
             await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
-            assert trk.levels["S1"]["trail_active"] is True
-            assert trk.levels["S2"]["trail_active"] is True
-
-            trail_high = max(trk.levels["S1"]["trail_stop_price"], trk.levels["S2"]["trail_stop_price"])
-            eng._handle_follower_bbo("DOGE/USDT:USDT", trail_high + 0.0001, trail_high + 0.0002, 10000.0, 10000.0)
-            await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
+            assert "DOGE/USDT:USDT:S2" not in eng.active_grid_positions
+            # Close S3 if triggered at tp_s2 <= 0.1952
+            if "DOGE/USDT:USDT:S3" in eng.active_grid_positions:
+                tp_s3 = eng.active_grid_positions["DOGE/USDT:USDT:S3"]["tp_price"]
+                eng._handle_follower_bbo("DOGE/USDT:USDT", tp_s3 - 0.0002, tp_s3 - 0.0001, 10000.0, 10000.0)
+                await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
             assert not eng.active_grid_positions
             assert eng.stats_by_mode["SHADOW"]["win_count"] >= 4
             assert eng.stats_by_mode["SHADOW"]["loss_count"] == 0
@@ -4297,37 +4265,29 @@ def test_reverse_grid_sl_tightening_trend_pyramid_lock_and_follower_priority():
     }
     bear_bbw = {**bull_bbw, "ema_fast": 99.2, "ema_slow": 100.5, "ema_gap_pct": -1.29, "trend_bias": "BEAR"}
 
-    # While L1 is OPEN, dropping below S1 MUST be blocked (strict no reverse-locking!); once flat, S1 fires under BULL bias!
-    en_s1_blocked, _ = trk.evaluate_tick(99.38, 99.39, 99.385, rev_cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=bull_bbw)
-    assert en_s1_blocked == []
-    trk.mark_exited("L1", 0.05, is_sl=False)
-
     # Even under strong BULL trend_bias, dropping below S1 (99.40) in REVERSE_OSCILLATING MUST open SHORT S1 (跌破开空)!
-    en_s1_bull, _ = trk.evaluate_tick(99.38, 99.39, 99.385, rev_cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=bull_bbw)
+    en_s1_bull, _ = trk.evaluate_tick(99.38, 99.39, 99.385, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=bull_bbw)
     assert len(en_s1_bull) == 1 and en_s1_bull[0]["slot_id"] == "S1" and en_s1_bull[0]["side"] == "SHORT"
-    trk.mark_entry_filled("S1", 99.38, 1.0, 1.0, 0.05, rev_cfg, round_trip_fee=0.0010)
+    trk.mark_entry_filled("S1", 99.38, 1.0, 1.0, 0.05, rev_cfg, round_trip_fee=0.0007)
 
-    # S1 hits activation at 98.60 -> activates trailing TP -> rides to 98.10 -> bounces past trail stop -> exits GRID_TRAIL_TP!
-    en_at_tp, ex_s1_act = trk.evaluate_tick(98.09, 98.10, 98.095, rev_cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=bull_bbw)
+    # S1 hits TP at 98.65 -> exits with GRID_TP!
+    en_at_tp, ex_s1_tp = trk.evaluate_tick(98.64, 98.65, 98.645, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=bull_bbw)
     for e_sub in en_at_tp:
         trk.mark_entry_missed(e_sub["slot_id"])
-    assert ex_s1_act == [] and trk.levels["S1"]["trail_active"] is True
-    s1_t_stop = trk.levels["S1"]["trail_stop_price"]
-    _, ex_s1_tp = trk.evaluate_tick(s1_t_stop + 0.01, s1_t_stop + 0.02, s1_t_stop + 0.015, rev_cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=bull_bbw)
-    assert [e["slot_id"] for e in ex_s1_tp] == ["S1"] and ex_s1_tp[0]["exit_reason"] == "GRID_TRAIL_TP"
-    trk.mark_exited("S1", 0.085, is_sl=False)
+    assert [e["slot_id"] for e in ex_s1_tp] == ["S1"] and ex_s1_tp[0]["exit_reason"] == "GRID_TP"
+    trk.mark_exited("S1", 0.065, is_sl=False)
     trk.levels["S1"]["cooldown_until_mono"] = 0.0
     trk.levels["S1"]["last_closed_mono"] = 0.0
 
     # Shallow bounce just 0.05% above S1 (99.40 * 1.0005 = 99.45) immediately re-arms S1 for repeated grid arbitrage!
-    trk.evaluate_tick(99.44, 99.46, 99.45, rev_cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=bull_bbw)
+    trk.evaluate_tick(99.44, 99.46, 99.45, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=bull_bbw)
     assert trk.levels["S1"]["armed"] is True
-    en_s1_repeat, _ = trk.evaluate_tick(99.38, 99.39, 99.385, rev_cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=bull_bbw)
+    en_s1_repeat, _ = trk.evaluate_tick(99.38, 99.39, 99.385, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=bull_bbw)
     assert len(en_s1_repeat) == 1 and en_s1_repeat[0]["slot_id"] == "S1"
     trk.mark_entry_missed("S1")
 
     # Even under strong BEAR trend_bias, rising above L2 (101.20) in REVERSE_OSCILLATING MUST open LONG L2 (涨破开多)!
-    en_l2_bear, _ = trk.evaluate_tick(101.21, 101.22, 101.215, rev_cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=bear_bbw)
+    en_l2_bear, _ = trk.evaluate_tick(101.21, 101.22, 101.215, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=bear_bbw)
     assert len(en_l2_bear) == 1 and en_l2_bear[0]["slot_id"] == "L2" and en_l2_bear[0]["side"] == "LONG"
 
     # 4) Follower priority: even if an unconfigured secondary exchange is active, verified/configured OKX wins
@@ -4703,24 +4663,21 @@ def test_isolated_grid_strategy_modules_and_zero_cross_impact():
     assert rev_trk.levels["L1"]["armed"] is False  # NOT wiped by unrelated trend/BBW change!
     assert rev_trk.last_bbw_info is None
 
-    # Full REVERSE_GRID arbitrage cycle under opposing BULL EMA: breakdown S1 -> Trailing TP -> shallow bounce re-arm -> S1 again!
-    en_s1, _ = rev_trk.evaluate_tick(99.38, 99.39, 99.385, rev_cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=extreme_bbw)
+    # Full REVERSE_GRID arbitrage cycle under opposing BULL EMA: breakdown S1 -> TP -> shallow bounce re-arm -> S1 again!
+    en_s1, _ = rev_trk.evaluate_tick(99.38, 99.39, 99.385, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=extreme_bbw)
     assert [e["slot_id"] for e in en_s1] == ["S1"]
-    rev_trk.mark_entry_filled("S1", 99.38, 0.2, 0.2, 1.0, rev_cfg, 0.0010)
-    en_at_tp, ex_act = rev_trk.evaluate_tick(98.20, 98.22, 98.21, rev_cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=extreme_bbw)
+    rev_trk.mark_entry_filled("S1", 99.38, 0.2, 0.2, 1.0, rev_cfg, 0.0007)
+    en_at_tp, ex_tp = rev_trk.evaluate_tick(98.60, 98.62, 98.61, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=extreme_bbw)
     for e_sub in en_at_tp:
         rev_trk.mark_entry_missed(e_sub["slot_id"])
-    assert ex_act == [] and rev_trk.levels["S1"]["trail_active"] is True
-    s1_trail_px = rev_trk.levels["S1"]["trail_stop_price"]
-    _, ex_tp = rev_trk.evaluate_tick(s1_trail_px + 0.01, s1_trail_px + 0.02, s1_trail_px + 0.015, rev_cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=extreme_bbw)
-    assert [e["slot_id"] for e in ex_tp] == ["S1"] and ex_tp[0]["exit_reason"] == "GRID_TRAIL_TP"
+    assert [e["slot_id"] for e in ex_tp] == ["S1"] and ex_tp[0]["exit_reason"] == "GRID_TP"
     rev_trk.mark_exited("S1", 0.12, is_sl=False)
     rev_trk.levels["S1"]["cooldown_until_mono"] = 0.0
     rev_trk.levels["S1"]["last_closed_mono"] = 0.0
     # Re-arm on shallow bounce above S1 (99.40 * 1.0004 = 99.44) and fire again
-    rev_trk.evaluate_tick(99.43, 99.45, 99.44, rev_cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=extreme_bbw)
+    rev_trk.evaluate_tick(99.43, 99.45, 99.44, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=extreme_bbw)
     assert rev_trk.levels["S1"]["armed"] is True
-    en_s1_2, _ = rev_trk.evaluate_tick(99.38, 99.39, 99.385, rev_cfg, is_net_mode=False, round_trip_fee=0.0010, bbw_info=extreme_bbw)
+    en_s1_2, _ = rev_trk.evaluate_tick(99.38, 99.39, 99.385, rev_cfg, is_net_mode=False, round_trip_fee=0.0007, bbw_info=extreme_bbw)
     assert [e["slot_id"] for e in en_s1_2] == ["S1"]
 
     # 3) Live strategy switching: never swaps mid-position, cleanly swaps with zero state bleed once flat
@@ -4751,10 +4708,8 @@ def test_isolated_grid_strategy_modules_and_zero_cross_impact():
     assert sw_trk.levels["S1"]["trigger_price"] < 150.0
 
     # 4) Polymorphic hooks & clean reset_runtime_state
-    assert rev_trk.supports_maker_tp(rev_cfg) is False
+    assert rev_trk.supports_maker_tp(rev_cfg) is True
     assert rev_trk.uses_livermore_sl_amend() is False
-    assert rev_trk.get_cond_sl_exit_reason({"side": "LONG", "entry_price": 100.0, "sl_price": 100.3, "trail_active": True}) == "GRID_BE_SL"
-    assert rev_trk.get_cond_sl_exit_reason({"side": "LONG", "entry_price": 100.0, "sl_price": 98.8, "trail_active": False}) == "GRID_SL"
     assert rev_trk.get_entry_log_tags("LONG") == ("多空震荡开仓", "涨破开多")
     assert rev_trk.get_exit_log_tag() == "多空震荡平仓"
     assert rev_trk.get_mode_display_name() == "多空震荡"
