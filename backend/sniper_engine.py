@@ -747,7 +747,7 @@ class BidirectionalSniperEngine:
     def _get_grid_rt_fee(cfg: SymbolStrategy, active_mode: str, follower_ex: Dict[str, Any]) -> float:
         taker_fee = float(follower_ex.get("taker_fee", 0.0005))
         maker_fee = float(follower_ex.get("maker_fee", 0.0002))
-        if active_mode in ("MEAN_REVERSION", "REVERSE_OSCILLATING") and cfg.use_post_only_tp:
+        if active_mode == "MEAN_REVERSION" and cfg.use_post_only_tp:
             return taker_fee + maker_fee
         return 2.0 * taker_fee
 
@@ -1201,9 +1201,9 @@ class BidirectionalSniperEngine:
                             # Protect recovered grid position on OKX immediately if not under kill switch!
                             sl_breached_on_recover = False
                             if not self.risk_config.kill_switch_active:
-                                slot_tp_px = float(lv.get("tp_price") or 0.0)
+                                slot_tp_px = float(lv.get("tp_price") or 0.0) if tracker.supports_maker_tp(cfg) else 0.0
                                 slot_sl_px = float(lv.get("sl_price") or 0.0)
-                                if (cfg.use_post_only_tp and slot_tp_px > 0) or slot_sl_px > 0:
+                                if (tracker.supports_maker_tp(cfg) and slot_tp_px > 0) or slot_sl_px > 0:
                                     await self.executor.place_protective_orders(
                                         cfg=cfg,
                                         side=side,
@@ -1813,7 +1813,7 @@ class BidirectionalSniperEngine:
             min_notional = 0.0
             thinnest_leg_usdt = round(float(new_cfg.order_usdt), 2)
             if is_grid_strategy(new_cfg.strategy_type):
-                eff_rt_fee = maker_rt_fee if (new_cfg.use_post_only_tp and new_cfg.strategy_type != "TREND_GRID") else taker_rt_fee
+                eff_rt_fee = maker_rt_fee if (new_cfg.use_post_only_tp and new_cfg.strategy_type not in ("TREND_GRID", "REVERSE_GRID")) else taker_rt_fee
                 # 1. Diagnose current config
                 if new_cfg.grid_step_pct < 0.0055:
                     issues.append(f"网格步长偏窄 ({new_cfg.grid_step_pct*100:.2f}% < 推荐 0.60%)")
@@ -1951,7 +1951,7 @@ class BidirectionalSniperEngine:
                         fixes.append(f"追踪倍率→{new_cfg.trend_trailing_mult:g}x")
                         changed = True
                     if req.auto_fix_anomalies:
-                        eff_rt_fee = maker_rt_fee if (new_cfg.use_post_only_tp and new_cfg.strategy_type != "TREND_GRID") else taker_rt_fee
+                        eff_rt_fee = maker_rt_fee if (new_cfg.use_post_only_tp and new_cfg.strategy_type not in ("TREND_GRID", "REVERSE_GRID")) else taker_rt_fee
                         min_safe_tp = round(max(new_cfg.grid_step_pct, eff_rt_fee + 0.0005), 6)
                         if new_cfg.grid_take_profit_pct < min_safe_tp - 1e-7:
                             new_cfg.grid_take_profit_pct = min_safe_tp
@@ -1983,7 +1983,7 @@ class BidirectionalSniperEngine:
                                 fixes.append(f"修正止损→{new_cfg.grid_stop_loss_pct*100:.1f}%")
                                 changed = True
                         elif new_cfg.strategy_type == "REVERSE_GRID" and new_cfg.grid_stop_loss_pct <= new_cfg.grid_step_pct + 1e-6:
-                            new_cfg.grid_stop_loss_pct = round(min(0.90, max(new_cfg.grid_range_pct + 0.003, new_cfg.grid_step_pct * 2.5, new_cfg.grid_step_pct + 0.005)), 4)
+                            new_cfg.grid_stop_loss_pct = round(min(0.90, max(0.012, new_cfg.grid_step_pct * 2.0)), 4)
                             fixes.append(f"修正单格止损→{new_cfg.grid_stop_loss_pct*100:.2f}%")
                             changed = True
                         if new_cfg.strategy_type in ("TREND_GRID", "ADAPTIVE_GRID"):
@@ -2439,8 +2439,11 @@ class BidirectionalSniperEngine:
                     lv_ref = tracker.levels.get(gpos.get("grid_slot_id", ""))
                     if lv_ref and float(lv_ref.get("sl_price") or 0.0) > 0:
                         gpos["sl_price"] = float(lv_ref["sl_price"])
+                    slot_trail = float(lv_ref.get("trail_stop_price") or 0.0) if lv_ref else 0.0
                     gpos["trail_stop_price"] = (
-                        tracker.long_trail_stop_price if gpos["side"] == "LONG" else tracker.short_trail_stop_price
+                        slot_trail
+                        if slot_trail > 0
+                        else (tracker.long_trail_stop_price if gpos["side"] == "LONG" else tracker.short_trail_stop_price)
                     )
             if amend_slots and cur_mode == "LIVE" and not self.risk_config.kill_switch_active:
                 for sid_amend in amend_slots:
@@ -2809,12 +2812,12 @@ class BidirectionalSniperEngine:
                 gk = f"{sym}:{slot_id}"
                 self._uncertain_grid_notional.pop(gk, None)
 
-                # Place real OKX Maker Post-Only TP limit order (Mean-Reversion) + Conditional SL algo (Trend / non-PO)
+                # Place real OKX Maker Post-Only TP limit order (Mean-Reversion only) + Conditional SL algo
                 sl_breached_on_place = False
                 if exec_mode == "LIVE" and not self.risk_config.kill_switch_active:
-                    slot_tp_px = float(lv.get("tp_price") or 0.0)
+                    slot_tp_px = float(lv.get("tp_price") or 0.0) if tracker.supports_maker_tp(cfg) else 0.0
                     slot_sl_px = float(lv.get("sl_price") or 0.0)
-                    if (cfg.use_post_only_tp and slot_tp_px > 0) or slot_sl_px > 0:
+                    if (tracker.supports_maker_tp(cfg) and slot_tp_px > 0) or slot_sl_px > 0:
                         await self.executor.place_protective_orders(
                             cfg=cfg,
                             side=side,
@@ -3027,6 +3030,39 @@ class BidirectionalSniperEngine:
                 if new_sl <= 0:
                     return
                 side = str(lv.get("side") or "LONG")
+                gk = f"{sym}:{slot_id}"
+                # If strategy switched to uncapped trailing TP (supports_maker_tp=False), release any legacy
+                # resting Maker TP first so OKX unlocks closeable sz for the native Conditional SL algo!
+                if not tracker.supports_maker_tp(cfg) and lv.get("maker_tp_live"):
+                    c_tp = await self.executor.cancel_slot_protective_orders(
+                        sym,
+                        gk,
+                        exchange_cfg=follower_ex,
+                        cancel_tp=True,
+                        cancel_sl=False,
+                        expected_contracts=float(lv.get("contracts") or 0.0),
+                    )
+                    if c_tp.get("tp_fully_filled"):
+                        avg_tp_px = float(c_tp.get("tp_avg_px") or lv.get("tp_price") or lv.get("entry_price") or 0.0)
+                        self._finalize_grid_slot_trade(
+                            cfg=cfg,
+                            tracker=tracker,
+                            lv=dict(lv),
+                            exit_avg=avg_tp_px,
+                            is_maker=True,
+                            exit_reason="GRID_TP",
+                            order_id=c_tp.get("tp_order_id") or "maker-tp",
+                            latency_ms=0.0,
+                            exec_mode=exec_mode,
+                            actual_exit_fee_usdt=float(c_tp.get("tp_fee_usdt") or 0.0),
+                        )
+                        self._save_open_strategy_state()
+                        return
+                    if not c_tp.get("reconcile_uncertain"):
+                        lv["maker_tp_order_id"] = ""
+                        lv["maker_tp_live"] = False
+                        if gk in self.active_grid_positions:
+                            self.active_grid_positions[gk]["maker_tp_live"] = False
                 upd = await self.executor.update_slot_sl_order(
                     cfg=cfg,
                     slot_key=f"{sym}:{slot_id}",

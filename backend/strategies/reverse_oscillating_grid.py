@@ -1,14 +1,20 @@
 """
-Standalone Reverse Oscillating Grid Strategy (`REVERSE_GRID` — 多空震荡网格).
+Standalone Reverse Oscillating Grid Strategy (`REVERSE_GRID` — 多空震荡网格 · 保本移动止盈增强版).
 
 Completely isolated trading logic — zero coupling to MEAN_REVERSION, TREND_BREAKOUT,
 ADAPTIVE_GRID, BBW, or lagging EMA indicators:
 - L1..Ln ABOVE center (涨破开多), S1..Sn BELOW center (跌破开空)
-- Equal per-slot sizing + fixed per-slot take-profit (supports Maker Post-Only TP) + per-slot hard SL
-- Dynamic per-slot SL tightening/widening sync on open positions when user changes `grid_stop_loss_pct`
-- Per-slot crossing re-arm hysteresis (`rearm_buf`) & bypassed-inner-level disarming so post-TP slots
-  never immediately re-stack while cleanly re-arming on shallow pullbacks
-- Symmetric anti-stacking spacing (0.55 * step) + concurrent ENTERING guard + 120s post-SL cooldown
+- Strict single-direction mutual exclusion (even in hedge mode): NEVER holds upper LONG + lower SHORT
+  simultaneously (eliminating the "buy-high / sell-low" reverse-locking loss trap)
+- Uncapped per-slot Breakeven + Trailing Take-Profit:
+  * Below activation (`grid_take_profit_pct + rt_fee`): protected by tight per-slot hard SL (`grid_stop_loss_pct`)
+  * Once favorable move reaches `grid_take_profit_pct + rt_fee`: activates per-slot trailing TP, locks guaranteed
+    net profit floor on exchange-native Conditional SL, and ratchets trailing stop / OKX SL upward with momentum
+  * Exits cleanly on retracement via `GRID_TRAIL_TP` (or profit-locked `GRID_BE_SL`), opening profit ceiling
+- Dynamic per-slot SL sync on open pre-profit-lock positions when user changes `grid_stop_loss_pct`
+  (never widens a profit-locked slot back into a loss)
+- Per-slot crossing re-arm hysteresis (`rearm_buf`) & bypassed-inner-level disarming
+- Symmetric anti-stacking spacing (0.55 * step) + concurrent ENTERING guard + 120s post-loss-SL cooldown
 """
 from typing import Dict, List, Optional, Tuple
 
@@ -20,13 +26,27 @@ from backend.strategies.base import BaseGridStrategy
 class ReverseOscillatingGridStrategy(BaseGridStrategy):
     strategy_type = "REVERSE_GRID"
     default_grid_mode = "REVERSE_OSCILLATING"
-    default_regime_reason = "手动指定多空震荡网格（跌破开空 / 涨破开多）"
+    default_regime_reason = "多空震荡（涨破开多/跌破开空 · 保本移动止盈 · 禁反向锁亏）"
 
     def supports_maker_tp(self, cfg: SymbolStrategy) -> bool:
-        return bool(cfg.use_post_only_tp)
+        # Trailing TP must NEVER place a fixed ceiling Maker limit order that caps winners;
+        # freeing OKX closeable sz also ensures native Conditional SL algos install reliably.
+        return False
 
     def uses_livermore_sl_amend(self) -> bool:
         return False
+
+    def get_cond_sl_exit_reason(self, lv: dict) -> str:
+        e_px = float(lv.get("entry_price") or 0.0)
+        sl_px = float(lv.get("sl_price") or 0.0)
+        if lv.get("trail_active"):
+            return "GRID_BE_SL"
+        if e_px > 0 and sl_px > 0:
+            if lv.get("side") == "LONG" and sl_px > e_px:
+                return "GRID_BE_SL"
+            if lv.get("side") == "SHORT" and sl_px < e_px:
+                return "GRID_BE_SL"
+        return "GRID_SL"
 
     def get_entry_log_tags(self, side: str) -> Tuple[str, str]:
         return ("多空震荡开仓", "涨破开多" if side == "LONG" else "跌破开空")
@@ -49,8 +69,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
     ) -> str:
         return (
             f"[多空震荡成交] {self.symbol} [{slot_id}] {side} 均价: {avg_price:.{cfg.price_precision}f} | "
-            f"数量: {filled_qty} | 止盈目标: {lv.get('tp_price', 0):.{cfg.price_precision}f} | "
-            f"止损: {lv.get('sl_price', 0):.{cfg.price_precision}f}{prot_suffix}"
+            f"数量: {filled_qty} | 追踪激活: {lv.get('tp_price', 0):.{cfg.price_precision}f} | "
+            f"硬止损: {lv.get('sl_price', 0):.{cfg.price_precision}f}{prot_suffix}"
         )
 
     def _compute_sig_params(self, cfg: SymbolStrategy) -> tuple:
@@ -66,6 +86,38 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             round(float(cfg.grid_stop_loss_pct), 6),
             int(cfg.price_precision),
         )
+
+    def _refresh_side_trail_summaries(self):
+        long_peaks = [
+            float(lv.get("peak_price") or 0.0)
+            for lv in self.levels.values()
+            if lv["side"] == "LONG" and lv["status"] in ("OPEN", "EXITING") and float(lv.get("peak_price") or 0.0) > 0
+        ]
+        long_trails = [
+            float(lv.get("trail_stop_price") or 0.0)
+            for lv in self.levels.values()
+            if lv["side"] == "LONG"
+            and lv["status"] in ("OPEN", "EXITING")
+            and lv.get("trail_active")
+            and float(lv.get("trail_stop_price") or 0.0) > 0
+        ]
+        short_troughs = [
+            float(lv.get("trough_price") or 0.0)
+            for lv in self.levels.values()
+            if lv["side"] == "SHORT" and lv["status"] in ("OPEN", "EXITING") and float(lv.get("trough_price") or 0.0) > 0
+        ]
+        short_trails = [
+            float(lv.get("trail_stop_price") or 0.0)
+            for lv in self.levels.values()
+            if lv["side"] == "SHORT"
+            and lv["status"] in ("OPEN", "EXITING")
+            and lv.get("trail_active")
+            and float(lv.get("trail_stop_price") or 0.0) > 0
+        ]
+        self.long_peak_price = max(long_peaks) if long_peaks else 0.0
+        self.long_trail_stop_price = max(long_trails) if long_trails else 0.0
+        self.short_trough_price = min(short_troughs) if short_troughs else 0.0
+        self.short_trail_stop_price = min(short_trails) if short_trails else 0.0
 
     def _build_levels(self, cfg: SymbolStrategy, preserve_cooldowns: bool = False):
         if self.center_price <= 0:
@@ -118,6 +170,10 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     "cooldown_until_mono": cd_u,
                     "maker_tp_touched_mono": 0.0,
                     "cond_sl_touched_mono": 0.0,
+                    "trail_active": False,
+                    "peak_price": 0.0,
+                    "trough_price": 0.0,
+                    "trail_stop_price": 0.0,
                 }
 
         if cfg.grid_side_mode in ("LONG_SHORT", "SHORT_ONLY"):
@@ -149,9 +205,14 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     "cooldown_until_mono": cd_u,
                     "maker_tp_touched_mono": 0.0,
                     "cond_sl_touched_mono": 0.0,
+                    "trail_active": False,
+                    "peak_price": 0.0,
+                    "trough_price": 0.0,
+                    "trail_stop_price": 0.0,
                 }
 
         self.levels = new_levels
+        self._refresh_side_trail_summaries()
 
     def sync_config(self, cfg: SymbolStrategy, current_mid: float = 0.0, bbw_info: Optional[dict] = None):
         self.active_grid_mode = "REVERSE_OSCILLATING"
@@ -219,8 +280,14 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         entries: List[dict] = []
         prec = self._calc_prec(cfg)
         step = max(0.0001, float(cfg.grid_step_pct))
+        tp_act = max(0.0030, float(cfg.grid_take_profit_pct))
+        rt_fee = max(0.0004, float(round_trip_fee))
+        # Guaranteed net-profit lock buffer strictly below activation threshold
+        be_lock_buf = min(max(0.0020, tp_act * 0.35), max(0.0010, tp_act * 0.60))
+        # Trailing retracement: tight enough to lock net profit immediately, wide enough to ride waves
+        trail_ret = min(max(0.0032, tp_act * 0.55), max(0.0025, tp_act * 0.70), 0.0080)
 
-        # 1. Check exits & dynamic SL parameter sync on OPEN slots
+        # 1. Check exits, per-slot Breakeven + Trailing TP, and pre-BE dynamic SL parameter sync
         rev_sl_pct = max(0.002, float(cfg.grid_stop_loss_pct))
         rev_room_buf = max(0.0025, step * 0.30)
         for lv in self.levels.values():
@@ -228,72 +295,140 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 continue
             e_px = float(lv.get("entry_price") or 0.0)
             cur_sl_px = float(lv.get("sl_price") or 0.0)
-            if e_px > 0:
+            is_trail_active = bool(lv.get("trail_active", False))
+
+            # Clear any legacy resting Maker TP order once so profits run uncapped & OKX SL installs cleanly
+            if lv.get("maker_tp_live") and not lv.get("_legacy_tp_clear_sent"):
+                lv["_legacy_tp_clear_sent"] = True
+                lv["sl_needs_amend"] = True
+
+            # Dynamic SL sync ONLY when slot is NOT yet in profit-lock (never widen a locked winner back into loss!)
+            if e_px > 0 and not is_trail_active:
                 if lv["side"] == "LONG":
+                    in_profit_sl = cur_sl_px > e_px
                     target_rev_sl = round(e_px * max(0.05, 1.0 - rev_sl_pct), prec)
-                    if abs(cur_sl_px - target_rev_sl) > 1e-9 and bid >= target_rev_sl * (1.0 + rev_room_buf):
+                    if not in_profit_sl and abs(cur_sl_px - target_rev_sl) > 1e-9 and bid >= target_rev_sl * (1.0 + rev_room_buf):
                         lv["sl_price"] = target_rev_sl
+                        cur_sl_px = target_rev_sl
                         lv["sl_needs_amend"] = True
                 else:
+                    in_profit_sl = cur_sl_px > 0 and cur_sl_px < e_px
                     target_rev_sl = round(e_px * (1.0 + rev_sl_pct), prec)
-                    if (cur_sl_px <= 0 or abs(cur_sl_px - target_rev_sl) > 1e-9) and ask <= target_rev_sl * max(
-                        0.05, 1.0 - rev_room_buf
+                    if (
+                        not in_profit_sl
+                        and (cur_sl_px <= 0 or abs(cur_sl_px - target_rev_sl) > 1e-9)
+                        and ask <= target_rev_sl * max(0.05, 1.0 - rev_room_buf)
                     ):
                         lv["sl_price"] = target_rev_sl
+                        cur_sl_px = target_rev_sl
                         lv["sl_needs_amend"] = True
 
             if now_m < float(lv.get("exit_retry_until_mono") or 0.0):
                 continue
-            tp_px = float(lv.get("tp_price") or 0.0)
-            sl_px = float(lv.get("sl_price") or 0.0)
-            maker_live = bool(lv.get("maker_tp_live", False))
+
+            act_px = float(lv.get("tp_price") or 0.0)
+            if act_px <= 0 and e_px > 0:
+                act_px = round(
+                    e_px * (1.0 + tp_act + rt_fee) if lv["side"] == "LONG" else e_px * max(0.05, 1.0 - tp_act - rt_fee),
+                    prec,
+                )
+                lv["tp_price"] = act_px
 
             if lv["side"] == "LONG":
-                if tp_px > 0 and bid >= tp_px:
-                    if maker_live:
-                        touched = float(lv.get("maker_tp_touched_mono") or 0.0)
-                        if touched <= 0.0:
-                            lv["maker_tp_touched_mono"] = now_m
-                            touched = now_m
-                        if (now_m - touched >= 4500.0) or (bid >= tp_px * 1.0025):
-                            lv["status"] = "EXITING"
-                            exits.append({**lv, "exit_reason": "GRID_TP", "target_price": bid})
-                    else:
+                prev_peak = float(lv.get("peak_price") or 0.0)
+                peak = max(prev_peak, e_px, bid)
+                lv["peak_price"] = peak
+
+                if not is_trail_active and act_px > 0 and bid >= act_px:
+                    is_trail_active = True
+                    lv["trail_active"] = True
+
+                if is_trail_active and e_px > 0:
+                    be_floor = round(e_px * (1.0 + rt_fee + be_lock_buf), prec)
+                    cand_trail = round(max(be_floor, peak * (1.0 - trail_ret)), prec)
+                    prev_trail = float(lv.get("trail_stop_price") or 0.0)
+                    trail_px = max(prev_trail, cand_trail)
+                    lv["trail_stop_price"] = trail_px
+
+                    # Ratchet exchange-native Conditional SL into profit (immediate on activation, then every +0.25%)
+                    target_okx_sl = round(max(be_floor, trail_px * (1.0 - 0.0010)), prec)
+                    if (cur_sl_px < be_floor - 1e-9 or target_okx_sl >= cur_sl_px * 1.0025) and bid >= target_okx_sl * 1.0008:
+                        lv["sl_price"] = target_okx_sl
+                        cur_sl_px = target_okx_sl
+                        lv["sl_needs_amend"] = True
+
+                    if trail_px > 0 and bid <= trail_px:
                         lv["status"] = "EXITING"
-                        exits.append({**lv, "exit_reason": "GRID_TP", "target_price": bid})
-                elif sl_px > 0 and bid <= sl_px:
+                        lv["exiting_is_sl"] = False
+                        # Disarm bypassed IDLE LONG levels below current pullback so we never knife-catch on reversal
+                        for other in self.levels.values():
+                            if other["side"] == "LONG" and other["status"] == "IDLE" and float(other.get("trigger_price") or 0.0) <= mid:
+                                other["armed"] = False
+                        exits.append({**lv, "exit_reason": "GRID_TRAIL_TP", "target_price": bid})
+                        continue
+
+                sl_px = float(lv.get("sl_price") or 0.0)
+                if sl_px > 0 and bid <= sl_px:
                     if self._should_fire_software_sl(lv, bid, sl_px, True, now_m):
+                        is_profit_sl = bool(is_trail_active or (e_px > 0 and sl_px > e_px))
                         lv["status"] = "EXITING"
-                        lv["exiting_is_sl"] = True
-                        exits.append({**lv, "exit_reason": "GRID_SL", "target_price": bid})
+                        lv["exiting_is_sl"] = not is_profit_sl
+                        exits.append(
+                            {**lv, "exit_reason": "GRID_BE_SL" if is_profit_sl else "GRID_SL", "target_price": bid}
+                        )
                 else:
-                    if maker_live and float(lv.get("maker_tp_touched_mono") or 0.0) > 0.0 and bid < tp_px * 0.9995:
-                        lv["maker_tp_touched_mono"] = 0.0
                     if float(lv.get("cond_sl_touched_mono") or 0.0) > 0.0 and sl_px > 0 and bid > sl_px * 1.0005:
                         lv["cond_sl_touched_mono"] = 0.0
             else:
-                if tp_px > 0 and ask <= tp_px:
-                    if maker_live:
-                        touched = float(lv.get("maker_tp_touched_mono") or 0.0)
-                        if touched <= 0.0:
-                            lv["maker_tp_touched_mono"] = now_m
-                            touched = now_m
-                        if (now_m - touched >= 4500.0) or (ask <= tp_px * 0.9975):
-                            lv["status"] = "EXITING"
-                            exits.append({**lv, "exit_reason": "GRID_TP", "target_price": ask})
-                    else:
+                prev_trough = float(lv.get("trough_price") or 0.0)
+                trough = min(prev_trough, e_px, ask) if prev_trough > 0 else min(e_px, ask)
+                lv["trough_price"] = trough
+
+                if not is_trail_active and act_px > 0 and ask <= act_px:
+                    is_trail_active = True
+                    lv["trail_active"] = True
+
+                if is_trail_active and e_px > 0:
+                    be_floor = round(e_px * max(0.05, 1.0 - rt_fee - be_lock_buf), prec)
+                    cand_trail = round(min(be_floor, trough * (1.0 + trail_ret)), prec)
+                    prev_trail = float(lv.get("trail_stop_price") or 0.0)
+                    trail_px = min(prev_trail, cand_trail) if prev_trail > 0 else cand_trail
+                    lv["trail_stop_price"] = trail_px
+
+                    target_okx_sl = round(min(be_floor, trail_px * (1.0 + 0.0010)), prec)
+                    if (
+                        cur_sl_px <= 0
+                        or cur_sl_px > be_floor + 1e-9
+                        or target_okx_sl <= cur_sl_px * 0.9975
+                    ) and ask <= target_okx_sl * 0.9992:
+                        lv["sl_price"] = target_okx_sl
+                        cur_sl_px = target_okx_sl
+                        lv["sl_needs_amend"] = True
+
+                    if trail_px > 0 and ask >= trail_px:
                         lv["status"] = "EXITING"
-                        exits.append({**lv, "exit_reason": "GRID_TP", "target_price": ask})
-                elif sl_px > 0 and ask >= sl_px:
+                        lv["exiting_is_sl"] = False
+                        # Disarm bypassed IDLE SHORT levels above current bounce so we never knife-catch on reversal
+                        for other in self.levels.values():
+                            if other["side"] == "SHORT" and other["status"] == "IDLE" and float(other.get("trigger_price") or 0.0) >= mid:
+                                other["armed"] = False
+                        exits.append({**lv, "exit_reason": "GRID_TRAIL_TP", "target_price": ask})
+                        continue
+
+                sl_px = float(lv.get("sl_price") or 0.0)
+                if sl_px > 0 and ask >= sl_px:
                     if self._should_fire_software_sl(lv, ask, sl_px, False, now_m):
+                        is_profit_sl = bool(is_trail_active or (e_px > 0 and sl_px < e_px))
                         lv["status"] = "EXITING"
-                        lv["exiting_is_sl"] = True
-                        exits.append({**lv, "exit_reason": "GRID_SL", "target_price": ask})
+                        lv["exiting_is_sl"] = not is_profit_sl
+                        exits.append(
+                            {**lv, "exit_reason": "GRID_BE_SL" if is_profit_sl else "GRID_SL", "target_price": ask}
+                        )
                 else:
-                    if maker_live and float(lv.get("maker_tp_touched_mono") or 0.0) > 0.0 and ask > tp_px * 1.0005:
-                        lv["maker_tp_touched_mono"] = 0.0
                     if float(lv.get("cond_sl_touched_mono") or 0.0) > 0.0 and sl_px > 0 and ask < sl_px * 0.9995:
                         lv["cond_sl_touched_mono"] = 0.0
+
+        self._refresh_side_trail_summaries()
 
         # 2. Flat Auto-Recenter (never preempts L1/S1 trigger distance)
         if allow_recenter and not self._has_active_slots():
@@ -315,12 +450,13 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         if (
             not allow_entries
             or now_m < self._post_sl_cooldown_until_mono
-            or any("SL" in str(e.get("exit_reason") or "") for e in exits)
-            or any(lv.get("status") == "EXITING" and lv.get("exiting_is_sl") for lv in self.levels.values())
+            or bool(exits)
+            or any(lv.get("status") == "EXITING" for lv in self.levels.values())
         ):
             return [], exits
 
-        # 3. Crossing re-arm hysteresis & bidirectional Reverse Oscillating entries (涨破开多 / 跌破开空)
+        # 3. Crossing re-arm hysteresis & strict single-side bidirectional Reverse Oscillating entries
+        #    (涨破开多 / 跌破开空 — NEVER opens opposite side while existing side is active -> zero reverse-locking!)
         rearm_buf = min(step * 0.05, 0.0003)
         for lv in self.levels.values():
             if lv["status"] != "IDLE":
@@ -353,8 +489,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
 
         if (
             not has_entering_long
+            and not has_short_active
             and cfg.grid_side_mode in ("LONG_SHORT", "LONG_ONLY")
-            and not (is_net_mode and has_short_active)
             and self.center_price < mid <= range_upper
         ):
             long_cands = []
@@ -374,8 +510,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
 
         if (
             not has_entering_short
+            and not has_long_active
             and cfg.grid_side_mode in ("LONG_SHORT", "SHORT_ONLY")
-            and not (is_net_mode and has_long_active)
             and range_lower <= mid < self.center_price
         ):
             short_cands = []
@@ -417,6 +553,11 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         lv["opened_mono_ms"] = mono_ms()
         lv["maker_tp_touched_mono"] = 0.0
         lv["cond_sl_touched_mono"] = 0.0
+        lv["trail_active"] = False
+        lv["trail_stop_price"] = 0.0
+        lv["peak_price"] = entry_price if lv["side"] == "LONG" else 0.0
+        lv["trough_price"] = entry_price if lv["side"] == "SHORT" else 0.0
+        lv.pop("_legacy_tp_clear_sent", None)
 
         prec = self._calc_prec(cfg)
         step = max(0.0001, float(cfg.grid_step_pct))
@@ -424,6 +565,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         sl_pct = float(cfg.grid_stop_loss_pct)
 
         if lv["side"] == "LONG":
+            # tp_price marks the Trailing TP activation price (NOT a fixed Maker TP ceiling!)
             lv["tp_price"] = round(entry_price * (1.0 + float(cfg.grid_take_profit_pct) + round_trip_fee), prec)
             lv["sl_price"] = round(entry_price * max(0.05, 1.0 - sl_pct), prec)
             for other in self.levels.values():
@@ -439,6 +581,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 if other["slot_id"] != slot_id and other["side"] == "SHORT" and other["status"] == "IDLE":
                     if float(other.get("trigger_price") or 0.0) >= entry_price * (1.0 + rearm_buf):
                         other["armed"] = False
+        self._refresh_side_trail_summaries()
 
     def recover_open_position(
         self,
@@ -486,6 +629,10 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         lv["exit_retry_until_mono"] = 0.0
         lv["maker_tp_touched_mono"] = 0.0
         lv["cond_sl_touched_mono"] = 0.0
+        lv["trail_active"] = False
+        lv["trail_stop_price"] = 0.0
+        lv["peak_price"] = entry_price if side == "LONG" else 0.0
+        lv["trough_price"] = entry_price if side == "SHORT" else 0.0
 
         if side == "LONG":
             lv["tp_price"] = round(entry_price * (1.0 + float(cfg.grid_take_profit_pct) + round_trip_fee), prec)
@@ -495,6 +642,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 entry_price * max(0.05, 1.0 - float(cfg.grid_take_profit_pct) - round_trip_fee), prec
             )
             lv["sl_price"] = round(entry_price * (1.0 + sl_pct), prec)
+        self._refresh_side_trail_summaries()
         return target_slot
 
     def clear_external_exit(self, slot_id: str):
@@ -503,6 +651,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             return
         if lv.get("ephemeral_recovered"):
             self.levels.pop(slot_id, None)
+            self._refresh_side_trail_summaries()
             return
         now_m = mono_ms()
         lv["status"] = "IDLE"
@@ -520,8 +669,14 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         lv["cond_sl_algo_id"] = ""
         lv["cond_sl_live"] = False
         lv["cond_sl_touched_mono"] = 0.0
+        lv["trail_active"] = False
+        lv["peak_price"] = 0.0
+        lv["trough_price"] = 0.0
+        lv["trail_stop_price"] = 0.0
+        lv.pop("_legacy_tp_clear_sent", None)
         lv.pop("exiting_is_sl", None)
         lv.pop("recovered", None)
+        self._refresh_side_trail_summaries()
 
     def mark_exited(self, slot_id: str, net_pnl: float, is_sl: bool = False):
         lv = self.levels.get(slot_id)
@@ -545,10 +700,17 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 lv["cond_sl_algo_id"] = ""
                 lv["cond_sl_live"] = False
                 lv["cond_sl_touched_mono"] = 0.0
+                lv["trail_active"] = False
+                lv["peak_price"] = 0.0
+                lv["trough_price"] = 0.0
+                lv["trail_stop_price"] = 0.0
+                lv.pop("_legacy_tp_clear_sent", None)
                 lv.pop("sl_needs_amend", None)
                 lv.pop("exiting_is_sl", None)
                 lv.pop("recovered", None)
-        if is_sl:
+        self._refresh_side_trail_summaries()
+        # Only engage 120s penalty cooldown on actual losing stop-losses (not profitable BE/Trailing exits)
+        if is_sl and net_pnl < 0:
             self._post_sl_cooldown_until_mono = max(self._post_sl_cooldown_until_mono, now_m + 120_000.0)
         else:
             self.completed_cycles += 1
@@ -556,17 +718,25 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
 
     def export_state(self) -> dict:
         disarmed_slots = [sid for sid, lv in self.levels.items() if lv.get("armed") is False]
+        serialized_slots = []
+        for s_item in self._serialize_open_slots():
+            lv_ref = self.levels.get(s_item["slot_id"], {})
+            s_item["trail_active"] = bool(lv_ref.get("trail_active", False))
+            s_item["peak_price"] = float(lv_ref.get("peak_price") or 0.0)
+            s_item["trough_price"] = float(lv_ref.get("trough_price") or 0.0)
+            s_item["trail_stop_price"] = float(lv_ref.get("trail_stop_price") or 0.0)
+            serialized_slots.append(s_item)
         return {
             "strategy_type": self.strategy_type,
             "center_price": float(self.center_price or 0.0),
             "active_grid_mode": "REVERSE_OSCILLATING",
-            "long_peak_price": 0.0,
-            "short_trough_price": 0.0,
+            "long_peak_price": float(self.long_peak_price or 0.0),
+            "short_trough_price": float(self.short_trough_price or 0.0),
             "completed_cycles": int(self.completed_cycles or 0),
             "total_net_pnl": float(self.total_net_pnl or 0.0),
             "last_bbw_info": None,
             "needs_post_trend_recenter": False,
-            "open_slots": self._serialize_open_slots(),
+            "open_slots": serialized_slots,
             "disarmed_slots": disarmed_slots,
         }
 
@@ -595,6 +765,10 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             lv = self._restore_common_slot_fields(slot, cfg, grid_mode="REVERSE_OSCILLATING")
             lv["armed"] = False
             e_px = float(lv.get("entry_price") or 0.0)
+            lv["trail_active"] = bool(slot.get("trail_active", False))
+            lv["peak_price"] = float(slot.get("peak_price") or (e_px if lv["side"] == "LONG" else 0.0))
+            lv["trough_price"] = float(slot.get("trough_price") or (e_px if lv["side"] == "SHORT" else 0.0))
+            lv["trail_stop_price"] = float(slot.get("trail_stop_price") or 0.0)
             if float(lv.get("tp_price") or 0.0) <= 0 and e_px > 0:
                 lv["tp_price"] = round(
                     e_px * (1.0 + float(cfg.grid_take_profit_pct) + 0.001)
@@ -602,6 +776,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     else e_px * max(0.05, 1.0 - float(cfg.grid_take_profit_pct) - 0.001),
                     prec,
                 )
+        self._refresh_side_trail_summaries()
 
     def get_snapshot(self) -> dict:
         open_long = sum(1 for lv in self.levels.values() if lv["side"] == "LONG" and lv["status"] in ("OPEN", "EXITING"))
@@ -614,10 +789,10 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             "center_price": self.center_price,
             "active_grid_mode": "REVERSE_OSCILLATING",
             "regime_reason": self.last_regime_reason,
-            "long_peak_price": 0.0,
-            "short_trough_price": 0.0,
-            "long_trail_stop_price": 0.0,
-            "short_trail_stop_price": 0.0,
+            "long_peak_price": float(self.long_peak_price or 0.0),
+            "short_trough_price": float(self.short_trough_price or 0.0),
+            "long_trail_stop_price": float(self.long_trail_stop_price or 0.0),
+            "short_trail_stop_price": float(self.short_trail_stop_price or 0.0),
             "bbw_timeframe": "",
             "bbw_pct": None,
             "bbw_percentile": None,
@@ -645,6 +820,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     "weight_pct": lv.get("weight_pct", 0.0),
                     "maker_tp_live": bool(lv.get("maker_tp_live", False)),
                     "cond_sl_live": bool(lv.get("cond_sl_live", False)),
+                    "trail_active": bool(lv.get("trail_active", False)),
+                    "trail_stop_price": float(lv.get("trail_stop_price") or 0.0),
                     "armed": bool(lv.get("armed", True)),
                     "status": lv["status"],
                     "entry_price": lv["entry_price"],

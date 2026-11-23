@@ -57,11 +57,11 @@ const STRATEGY_STATE_PIPELINES = {
     { key: 'RECENTER', step: '6', label: '套利闭环', desc: '空仓漂移重锚' },
   ],
   REVERSE_GRID: [
-    { key: 'ANCHOR', step: '1', label: '中枢布网', desc: '上多下空双向档' },
+    { key: 'ANCHOR', step: '1', label: '中枢布网', desc: '上多下空单向防锁' },
     { key: 'WATCH', step: '2', label: '多空巡航', desc: '涨破开多·跌破开空' },
     { key: 'ENTERING', step: '3', label: '突破建仓', desc: 'IOC滑点保护' },
-    { key: 'HOLDING', step: '4', label: '挂单守护', desc: 'Maker止盈·单格止损' },
-    { key: 'EXITING', step: '5', label: '平仓结算', desc: '止盈或单格止损' },
+    { key: 'HOLDING', step: '4', label: '保本追踪', desc: '条件止损·移动止盈' },
+    { key: 'EXITING', step: '5', label: '平仓结算', desc: '追踪止盈或硬止损' },
     { key: 'REARM', step: '6', label: '撤防复装', desc: '回踩滞回重装' },
   ],
   TREND_GRID: [
@@ -166,6 +166,10 @@ function resolveStrategyStateMachine(cfg, tel) {
     const idleLevels = levels.filter((lv) => lv.status === 'IDLE');
     const armedCount = idleLevels.filter((lv) => lv.armed !== false).length;
     const disarmedCount = idleLevels.length - armedCount;
+    const trailActiveSlots = openSlots.filter((lv) => Boolean(lv.trail_active));
+    const longTrail = Number(gSnap.long_trail_stop_price || 0);
+    const shortTrail = Number(gSnap.short_trail_stop_price || 0);
+    const liveTrailPx = openLong > 0 && longTrail > 0 ? longTrail : openShort > 0 && shortTrail > 0 ? shortTrail : 0;
 
     if (exitingSlots.length > 0) activeKey = 'EXITING';
     else if (enteringSlots.length > 0) activeKey = 'ENTERING';
@@ -174,14 +178,17 @@ function resolveStrategyStateMachine(cfg, tel) {
     else if (centerPx > 0 && levels.length > 0) activeKey = 'WATCH';
     else activeKey = 'ANCHOR';
 
-    subtitle = `多空震荡 · 步长 ${stepPct}% · 止盈 ${tpPct}% · 单格止损 ${slPct}% · ${cfg?.use_post_only_tp !== false ? 'Maker止盈' : 'Taker止盈'}`;
+    subtitle = `多空震荡 · 步长 ${stepPct}% · 激活 ${tpPct}%保本追踪 · 硬止损 ${slPct}% · 禁反向锁亏`;
     metrics = [
       { label: '网格中枢价', value: fmtPx(centerPx), tone: 'main' },
-      { label: '活跃槽位 (多/空)', value: `${openLong} 多 / ${openShort} 空`, tone: openLong + openShort > 0 ? 'emerald' : 'main' },
+      { label: '活跃槽位 (单向防锁)', value: `${openLong} 多 / ${openShort} 空`, tone: openLong + openShort > 0 ? 'emerald' : 'main' },
       {
-        label: '挂单 / 档位就绪',
-        value: `TP挂单 ${makerTpCount} · 就绪 ${armedCount}/${idleLevels.length}`,
-        tone: makerTpCount > 0 ? 'sky' : 'main',
+        label: trailActiveSlots.length > 0 ? '移动追踪锁利线' : '条件止损 / 就绪档位',
+        value:
+          trailActiveSlots.length > 0 && liveTrailPx > 0
+            ? `追踪中 ${fmtPx(liveTrailPx)} (${trailActiveSlots.length}槽)`
+            : `条件SL ${condSlCount} · 就绪 ${armedCount}/${idleLevels.length}`,
+        tone: trailActiveSlots.length > 0 ? 'emerald' : condSlCount > 0 ? 'sky' : 'main',
       },
       { label: `套利闭环 (${cycles}轮)`, value: fmtSigned(gridNetPnl), tone: gridNetPnl >= 0 ? 'emerald' : 'rose' },
     ];
@@ -426,6 +433,11 @@ const buildGridPreviewAndDiagnostics = (cfg, okxMinNotional = 0, followerMid = 0
       severity: 'error',
       msg: `单格硬止损 (${(sl * 100).toFixed(2)}%) ≤ 每格间距 (${(step * 100).toFixed(2)}%)，轻微回撤即触发止损`,
     });
+  } else if (st === 'REVERSE_GRID' && sl > Math.max(0.018, step * 3.0) + 1e-6) {
+    alerts.push({
+      severity: 'warn',
+      msg: `单格硬止损 (${(sl * 100).toFixed(2)}%) 偏宽，易造成盈亏比倒挂（建议收紧至 1.20%~1.80%，配 2~3 层）`,
+    });
   }
   if (isTrendLike && dzMult * step > rng + 1e-6) {
     alerts.push({
@@ -531,6 +543,14 @@ const EXIT_BADGE_MAP = {
   GRID_TP: {
     text: '网格止盈',
     cls: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30',
+  },
+  GRID_TRAIL_TP: {
+    text: '移动追踪止盈',
+    cls: 'bg-teal-500/15 text-teal-600 dark:text-teal-300 border-teal-500/30',
+  },
+  GRID_BE_SL: {
+    text: '浮盈保本止损',
+    cls: 'bg-sky-500/10 text-sky-600 dark:text-sky-300 border-sky-500/30',
   },
   GRID_SL: {
     text: '网格止损',
@@ -3093,7 +3113,21 @@ export default function App() {
                               )}
                             </div>
                             <div className="text-[10px] text-dim truncate mt-0.5">
-                              {makerTpCnt > 0
+                              {isRev
+                                ? (() => {
+                                    const revTrailCnt = levels.filter((lv) => lv.status === 'OPEN' && lv.trail_active).length;
+                                    const revTrailPx =
+                                      openLong > 0 && Number(gSnap.long_trail_stop_price || 0) > 0
+                                        ? Number(gSnap.long_trail_stop_price)
+                                        : openShort > 0 && Number(gSnap.short_trail_stop_price || 0) > 0
+                                        ? Number(gSnap.short_trail_stop_price)
+                                        : 0;
+                                    if (revTrailCnt > 0 && revTrailPx > 0) {
+                                      return `保本追踪 ${fmtPx(revTrailPx)}`;
+                                    }
+                                    return `单向防锁 · 步长 ${stepPctVal.toFixed(2)}%`;
+                                  })()
+                                : makerTpCnt > 0
                                 ? `Maker挂单 ${makerTpCnt} · ${cycles}轮`
                                 : `步长 ${stepPctVal.toFixed(2)}% · ${cycles}轮`}
                             </div>
@@ -3103,7 +3137,7 @@ export default function App() {
                         <div className="mt-3 sm:mt-3.5 pt-2.5 sm:pt-3 border-t border-line space-y-1.5">
                           <div className="flex items-center justify-between gap-1 text-[10px] sm:text-[11px] font-mono text-dim">
                             <span className="truncate">
-                              盈 {tpPctVal.toFixed(2)}% · 损 {slPctVal.toFixed(1)}%
+                              {isRev ? `激活 ${tpPctVal.toFixed(2)}% · 损 ${slPctVal.toFixed(1)}%` : `盈 ${tpPctVal.toFixed(2)}% · 损 ${slPctVal.toFixed(1)}%`}
                             </span>
                             <span
                               className={`truncate ${
@@ -4486,7 +4520,7 @@ export default function App() {
                       const showFixedTpInput = !isTrendGrid;
                       const showRangeInput = !isTrendGrid || Boolean(currentStrategy.grid_recenter_enabled ?? true);
                       const showMrRangeFittingButtons = !isTrendGrid;
-                      const showMakerPostOnlySwitch = !isTrendGrid;
+                      const showMakerPostOnlySwitch = !isTrendGrid && !isReverseGrid;
                       const showBbwSqueezePercentile = isAdaptiveGrid;
                       const symTel = snapshot?.telemetry?.[currentStrategy.symbol] || {};
                       const gridDiag = buildGridPreviewAndDiagnostics(
@@ -4582,7 +4616,11 @@ export default function App() {
 
                           <div>
                             <label className="font-bold text-main block mb-2">
-                              {isTrendGrid ? '单边金字塔追单层数 (建议 3~5 层)' : '单边网格层数'}
+                              {isTrendGrid
+                                ? '单边金字塔追单层数 (建议 3~5 层)'
+                                : isReverseGrid
+                                ? '单边网格层数 (建议 2~3 层防追末端)'
+                                : '单边网格层数'}
                             </label>
                             <input
                               type="number"
@@ -4620,7 +4658,7 @@ export default function App() {
                             <div>
                               <label className="font-bold text-main block mb-2">
                                 {isReverseGrid
-                                  ? '多空震荡单格止盈目标 (%)'
+                                  ? '保本移动止盈激活阈值 (%)'
                                   : isAdaptiveGrid
                                   ? '震荡阶段单格止盈目标 (%)'
                                   : '传统网格单格止盈目标 (%)'}
@@ -4632,8 +4670,9 @@ export default function App() {
                                 onChangeRatio={(v) => updateCurrentStrategyField({ grid_take_profit_pct: v })}
                               />
                               <div className="text-[10px] text-dim mt-1 leading-snug">
-                                标的价格涨幅 · {currentStrategy.leverage ?? 5}x 杠杆≈保证金收益{' '}
-                                {((currentStrategy.grid_take_profit_pct ?? 0.0065) * (currentStrategy.leverage ?? 5) * 100).toFixed(1)}%
+                                {isReverseGrid
+                                  ? `浮盈达此阈值自动上移止损锁利保本并启动移动回撤止盈（不封顶）`
+                                  : `标的价格涨幅 · ${currentStrategy.leverage ?? 5}x 杠杆≈保证金收益 ${((currentStrategy.grid_take_profit_pct ?? 0.0065) * (currentStrategy.leverage ?? 5) * 100).toFixed(1)}%`}
                               </div>
                             </div>
                           )}
