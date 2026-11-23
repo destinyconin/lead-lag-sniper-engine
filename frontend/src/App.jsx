@@ -2197,58 +2197,55 @@ export default function App() {
       )}
 
       {/* ==================== TOP HEADER ==================== */}
-      <header
-        className="sticky top-0 z-30 backdrop-blur-xl border-b border-line shadow-[0_2px_16px_-6px_rgba(15,23,42,0.08)] dark:shadow-[0_4px_24px_-6px_rgba(0,0,0,0.45)]"
-        style={{ backgroundColor: 'var(--bg-header)' }}
-      >
-        {/* Tier 1: Brand Identity | Execution Command Dock | Utility & Account Dock */}
-        <div className="max-w-[1520px] mx-auto px-3 sm:px-5 lg:px-6 pt-2.5 sm:pt-3 pb-2.5 flex flex-wrap lg:flex-nowrap items-center justify-between gap-2.5 sm:gap-3">
-          {/* Left: Brand Identity + Live Cloud Badge */}
+      <header className="sticky top-0 z-30 neu-header">
+        {/* Tier 1: Brand Identity | Carved Execution Command Dock | Utility & Account Dock */}
+        <div className="max-w-[1520px] mx-auto px-3 sm:px-5 lg:px-6 pt-3 pb-2.5 flex flex-wrap lg:flex-nowrap items-center justify-between gap-2.5 sm:gap-3.5">
+          {/* Left: Brand Identity + Sculpted Live Badge */}
           <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
             <button
               type="button"
               onClick={() => setActiveTab('radar')}
-              className="group flex items-center gap-2.5 sm:gap-3 min-w-0 text-left rounded-2xl pr-1.5 py-0.5 hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+              className="group flex items-center gap-2.5 sm:gap-3 min-w-0 text-left rounded-2xl pr-2 py-0.5"
               title="返回矩阵观察"
             >
-              <div className="icon-box w-9 h-9 sm:w-10 sm:h-10 border border-line shadow-sm group-hover:border-sky-500/40 group-hover:scale-105">
+              <div className="icon-box w-9 h-9 sm:w-10 sm:h-10 group-hover:scale-105">
                 <svg className="w-4 h-4 sm:w-5 sm:h-5 text-main" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1">
                   <path d="M2 12h4l3-8 4 16 3-8h6" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
               </div>
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <h1 className="font-bold text-sm sm:text-[17px] tracking-tight text-main leading-tight truncate">
+                  <h1 className="brand-title-luxury text-[15px] sm:text-[18px] text-main leading-tight truncate">
                     无聊的交易系统
                   </h1>
                   {currentUser ? (
                     <span
-                      className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] sm:text-[11px] font-semibold bg-[#0f1419] dark:bg-emerald-500/15 text-white dark:text-emerald-300 border border-transparent dark:border-emerald-500/30 shadow-sm shrink-0"
+                      className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] sm:text-[11px] font-semibold neu-badge shrink-0"
                       title="配置保存后，即使关闭网页或退出浏览器，服务器仍将7×24小时按您的设置持续运行"
                     >
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-                      <span>实盘 · 24h托管</span>
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                      <span className="text-main">实盘 · 24h托管</span>
                       {!currentUser.can_use_live && (
-                        <span className="ml-0.5 px-1.5 py-0.2 rounded-full bg-amber-500/25 text-amber-300 font-bold">
+                        <span className="ml-0.5 px-1.5 py-0.2 rounded-full bg-amber-500/20 text-amber-600 dark:text-amber-300 font-bold">
                           需VIP
                         </span>
                       )}
                     </span>
                   ) : (
-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold surface-subtle text-sub shrink-0">
+                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-semibold neu-badge text-sub shrink-0">
                       访客预览
                     </span>
                   )}
                 </div>
-                <p className="text-[11px] text-dim hidden xl:block mt-0.5 truncate">
+                <p className="text-[11px] text-dim hidden xl:block mt-0.5 truncate tracking-wide">
                   多策略独立网格 · 跨所脉冲狙击 · 毫秒级全周期持仓状态机
                 </p>
               </div>
             </button>
           </div>
 
-          {/* Center: Unified Execution Command Dock */}
-          <div className="order-last lg:order-none w-full lg:w-auto flex items-center justify-between lg:justify-center rounded-full surface-subtle p-1 gap-1.5 shadow-inner">
+          {/* Center: Carved Soft-Neumorphic Execution Command Dock */}
+          <div className="order-last lg:order-none w-full lg:w-auto flex items-center justify-between lg:justify-center rounded-full neu-well p-1.5 gap-1.5">
             <div
               className={`flex items-center gap-1.5 px-2.5 sm:px-3 h-7 rounded-full text-[11px] sm:text-xs font-semibold min-w-0 ${
                 isTradingActive
@@ -2268,21 +2265,21 @@ export default function App() {
                     : 'bg-amber-500'
                 }`}
               />
-              <span className="truncate max-w-[110px] sm:max-w-[160px]">
+              <span className="truncate max-w-[115px] sm:max-w-[165px]">
                 {tradingControl.status_label || (isTradingActive ? '运行中' : '已停止')}
               </span>
             </div>
 
             <div className="h-4 w-px bg-[var(--border-strong)] hidden sm:block shrink-0" />
 
-            <div className="flex items-center gap-1 shrink-0">
+            <div className="flex items-center gap-1.5 shrink-0">
               <button
                 type="button"
                 onClick={handleStartTrading}
-                className={`h-7 px-3 rounded-full text-xs font-semibold flex items-center gap-1 whitespace-nowrap ${
+                className={`h-7 px-3.5 rounded-full text-xs flex items-center gap-1 whitespace-nowrap ${
                   isTradingActive
-                    ? 'bg-[#0f1419] dark:bg-emerald-500 text-white dark:text-slate-950 shadow-sm'
-                    : 'text-main hover:bg-[var(--bg-card)] hover:shadow-sm'
+                    ? 'btn-primary-pill'
+                    : 'text-sub hover:text-main neu-btn'
                 }`}
                 title="启动自动交易执行"
               >
@@ -2295,10 +2292,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleStopTrading}
-                className={`h-7 px-3 rounded-full text-xs font-semibold flex items-center gap-1 whitespace-nowrap ${
+                className={`h-7 px-3.5 rounded-full text-xs flex items-center gap-1 whitespace-nowrap ${
                   !isTradingActive
-                    ? 'surface-card text-main shadow-sm'
-                    : 'text-sub hover:text-main hover:bg-[var(--bg-card)]'
+                    ? 'neu-btn text-main'
+                    : 'text-sub hover:text-main hover:bg-[var(--bg-hover)]'
                 }`}
                 title="停止发送新订单，仅保留实时行情监控"
               >
@@ -2311,10 +2308,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleKillSwitch}
-                className={`h-7 px-3 rounded-full text-xs font-semibold flex items-center gap-1 whitespace-nowrap ${
+                className={`h-7 px-3.5 rounded-full text-xs flex items-center gap-1 whitespace-nowrap ${
                   isKillActive
-                    ? 'bg-emerald-600 text-white shadow-sm hover:bg-emerald-500'
-                    : 'text-rose-600 dark:text-rose-400 hover:bg-rose-500/12'
+                    ? 'bg-emerald-600 text-white shadow-md hover:bg-emerald-500'
+                    : 'neu-btn text-rose-600 dark:text-rose-400'
                 }`}
                 title="全局紧急熔断：立即撤单平仓并暂停策略"
               >
@@ -2324,10 +2321,10 @@ export default function App() {
             </div>
           </div>
 
-          {/* Right: Compact RTT + User Account Dock + Theme Toggle */}
-          <div className="flex items-center gap-1.5 sm:gap-2 text-xs shrink-0">
+          {/* Right: Compact RTT Well + Account Dock + Sculpted Circular Theme Button */}
+          <div className="flex items-center gap-2 text-xs shrink-0">
             <div
-              className="hidden sm:flex items-center gap-1.5 px-2.5 h-8 rounded-full surface-subtle font-mono text-[11px]"
+              className="hidden sm:flex items-center gap-1.5 px-3 h-9 rounded-full neu-well font-mono text-[11px]"
               title={`${snapshot.feed_source === 'LIVE_WS' ? '实盘原生直连' : '50Hz仿真流'} · 报单网络往返延迟 (RTT)`}
             >
               <span className={`w-2 h-2 rounded-full shrink-0 ${wsConnected ? 'bg-emerald-500' : 'bg-rose-500'}`} />
@@ -2336,11 +2333,11 @@ export default function App() {
             </div>
 
             {currentUser ? (
-              <div className="flex items-center gap-1.5 px-2 sm:px-2.5 h-8 rounded-full surface-subtle max-w-full">
+              <div className="flex items-center gap-1.5 px-2 sm:px-2.5 h-9 rounded-full neu-well max-w-full">
                 <button
                   type="button"
                   onClick={() => setActiveTab('membership')}
-                  className="flex items-center gap-1.5 text-left hover:text-sky-600 dark:hover:text-sky-400 min-w-0 px-0.5 rounded-full"
+                  className="flex items-center gap-1.5 text-left hover:text-sky-600 dark:hover:text-sky-400 min-w-0 px-1 rounded-full"
                   title="点击进入会员中心"
                 >
                   <User className="w-3.5 h-3.5 text-main shrink-0" strokeWidth={1.85} />
@@ -2348,7 +2345,7 @@ export default function App() {
                     {currentUser.username}
                   </span>
                   <span
-                    className={`px-1.5 sm:px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
                       currentUser.is_vip
                         ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
                         : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
@@ -2360,7 +2357,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => openAuthModal('login')}
-                  className="px-2 py-0.5 rounded-full text-[10px] surface-card text-sub hover:text-main font-semibold shrink-0"
+                  className="px-2.5 py-1 rounded-full text-[10px] neu-btn text-sub hover:text-main shrink-0"
                   title="切换账号"
                 >
                   切换
@@ -2368,18 +2365,18 @@ export default function App() {
                 <button
                   type="button"
                   onClick={handleLogout}
-                  className="w-6 h-6 rounded-full flex items-center justify-center text-dim hover:text-rose-500 hover:bg-rose-500/10 shrink-0"
+                  className="w-7 h-7 rounded-full neu-btn flex items-center justify-center text-dim hover:text-rose-500 shrink-0"
                   title="退出当前账号"
                 >
                   <LogOut className="w-3.5 h-3.5" strokeWidth={1.85} />
                 </button>
               </div>
             ) : (
-              <div className="flex items-center gap-1.5">
-                <button type="button" onClick={() => openAuthModal('login')} className="btn-soft-pill px-3.5 h-8 text-xs">
+              <div className="flex items-center gap-2">
+                <button type="button" onClick={() => openAuthModal('login')} className="btn-soft-pill px-4 h-9 text-xs">
                   登录
                 </button>
-                <button type="button" onClick={() => openAuthModal('register')} className="btn-primary-pill px-3.5 h-8 text-xs">
+                <button type="button" onClick={() => openAuthModal('register')} className="btn-primary-pill px-4 h-9 text-xs">
                   <Lock className="w-3 h-3" strokeWidth={2} />
                   注册实盘
                 </button>
@@ -2389,24 +2386,24 @@ export default function App() {
             <button
               type="button"
               onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
-              className="w-8 h-8 rounded-full surface-subtle flex items-center justify-center text-main shrink-0"
+              className="w-9 h-9 rounded-full neu-btn flex items-center justify-center text-main shrink-0"
               title={theme === 'light' ? '切换至深色模式' : '切换至明亮模式'}
             >
               {theme === 'light' ? (
-                <Moon className="w-3.5 h-3.5 text-slate-700" strokeWidth={1.85} />
+                <Moon className="w-4 h-4 text-slate-700" strokeWidth={1.85} />
               ) : (
-                <Sun className="w-3.5 h-3.5 text-amber-400" strokeWidth={1.85} />
+                <Sun className="w-4 h-4 text-amber-400" strokeWidth={1.85} />
               )}
             </button>
           </div>
         </div>
 
-        {/* Tier 2: Pill Navigation Rail (Left) | Slim Live Telemetry Strip (Right) */}
-        <div className="border-t border-line bg-black/[0.012] dark:bg-white/[0.015]">
-          <div className="max-w-[1520px] mx-auto px-3 sm:px-5 lg:px-6 py-2 flex flex-col xl:flex-row xl:items-center xl:justify-between gap-2">
+        {/* Tier 2: Carved Pill Navigation Rail (Left) | Porcelain Live Status Strip (Right) */}
+        <div className="border-t border-line/60">
+          <div className="max-w-[1520px] mx-auto px-3 sm:px-5 lg:px-6 py-2.5 flex flex-col xl:flex-row xl:items-center xl:justify-between gap-2.5">
             <nav
               aria-label="主导航"
-              className="inline-flex items-center gap-1 p-1 rounded-full surface-subtle overflow-x-auto no-scrollbar max-w-full"
+              className="inline-flex items-center gap-1.5 p-1.5 rounded-full neu-well overflow-x-auto xl:overflow-visible no-scrollbar max-w-full"
             >
               {[
                 { id: 'radar', label: '矩阵观察', icon: Radar, visible: true },
@@ -2435,9 +2432,9 @@ export default function App() {
                       key={tab.id}
                       type="button"
                       onClick={() => setActiveTab(tab.id)}
-                      className={`nav-tab-pill px-3.5 sm:px-4 py-1.5 text-xs ${
+                      className={`nav-tab-pill px-4 py-1.5 text-xs ${
                         active
-                          ? 'nav-tab-active btn-primary-pill shadow-sm'
+                          ? 'nav-tab-active btn-primary-pill'
                           : 'text-sub'
                       }`}
                     >
@@ -2448,10 +2445,10 @@ export default function App() {
                 })}
             </nav>
 
-            {/* Right Context Strip: Compact Live Status Badges OR Shadow Pulse Test Controls */}
+            {/* Right Context Strip: Sculpted Live Status Badges OR Shadow Pulse Test Controls */}
             {isLiveMode ? (
-              <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar text-[11px]">
-                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full surface-subtle font-semibold whitespace-nowrap shrink-0">
+              <div className="flex items-center gap-2 overflow-x-auto xl:overflow-visible no-scrollbar text-[11px]">
+                <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full neu-well font-semibold whitespace-nowrap shrink-0">
                   <span
                     className={`w-1.5 h-1.5 rounded-full ${
                       liveStatus.binance_ws_connected && liveStatus.okx_ws_connected ? 'bg-emerald-500' : 'bg-amber-500 animate-pulse'
@@ -2464,26 +2461,26 @@ export default function App() {
                 {liveStatus.follower_auth_status === 'VERIFIED' && (
                   <>
                     <span
-                      className={`px-2.5 py-1 rounded-full font-bold whitespace-nowrap shrink-0 ${
+                      className={`px-3 py-1.5 rounded-full neu-badge whitespace-nowrap shrink-0 ${
                         liveStatus.okx_pos_mode === 'long_short_mode'
-                          ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-                          : 'bg-amber-500/15 text-amber-600 dark:text-amber-300'
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-amber-600 dark:text-amber-300'
                       }`}
                     >
                       {liveStatus.okx_pos_mode === 'long_short_mode' ? '双向持仓' : '单向持仓'}
                     </span>
                     <span
                       title="OKX 私有 WebSocket 订单/条件单实时推送通道（毫秒级感知 Maker 止盈与条件止损成交）"
-                      className={`px-2.5 py-1 rounded-full font-bold whitespace-nowrap shrink-0 ${
+                      className={`px-3 py-1.5 rounded-full neu-badge whitespace-nowrap shrink-0 ${
                         liveStatus.okx_private_ws_connected
-                          ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-                          : 'bg-slate-500/15 text-dim'
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-dim'
                       }`}
                     >
                       私有WS {liveStatus.okx_private_ws_connected ? '在线' : '轮询'}
                     </span>
                     {Number(liveStatus.usdt_avail_usdt || 0) > 0 && (
-                      <span className="px-2.5 py-1 rounded-full surface-subtle font-mono font-semibold text-main whitespace-nowrap shrink-0">
+                      <span className="px-3 py-1.5 rounded-full neu-well font-mono font-semibold text-main whitespace-nowrap shrink-0">
                         可用 {Number(liveStatus.usdt_avail_usdt).toFixed(2)}U
                       </span>
                     )}
@@ -2493,7 +2490,7 @@ export default function App() {
                   type="button"
                   onClick={() => setActiveTab('exchanges')}
                   title={liveStatus.follower_auth_message || '点击配置执行端 API'}
-                  className="px-2.5 py-1 rounded-full surface-subtle text-main font-medium truncate max-w-[200px] sm:max-w-[260px] shrink-0"
+                  className="px-3 py-1.5 rounded-full neu-btn text-main truncate max-w-[200px] sm:max-w-[260px] shrink-0"
                 >
                   {liveStatus.follower_auth_message || '点击配置执行端 API'}
                 </button>
@@ -2608,7 +2605,7 @@ export default function App() {
                         type="button"
                         onClick={() => setConfirmResetStats(false)}
                         disabled={resettingStats}
-                        className="px-2 py-1 rounded-lg text-xs text-sub border border-line bg-white/80 dark:bg-slate-800/80 hover:text-main transition-colors cursor-pointer"
+                        className="px-3 py-1 rounded-full text-xs text-sub neu-btn hover:text-main cursor-pointer"
                       >
                         取消
                       </button>
@@ -2619,7 +2616,7 @@ export default function App() {
                       onClick={() => setConfirmResetStats(true)}
                       disabled={resettingStats}
                       title="一键清零净收益、抢单成交、闭环胜率、触发信号统计并从 0 重新累计（不会平仓或影响在途持仓）"
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium border border-line bg-white/80 dark:bg-slate-800/80 text-sub hover:text-main hover:bg-sky-500/10 hover:border-sky-500/40 disabled:opacity-50 transition-colors cursor-pointer"
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium neu-btn text-sub hover:text-main disabled:opacity-50 cursor-pointer"
                     >
                       <RefreshCw className={`w-3.5 h-3.5 ${resettingStats ? 'animate-spin' : ''}`} />
                       <span>一键刷新清零统计</span>
@@ -3314,7 +3311,7 @@ export default function App() {
                         type="button"
                         onClick={handleSyncPositions}
                         disabled={syncingPositions}
-                        className="px-3 py-1.5 rounded-lg text-xs font-medium border border-line bg-white/80 dark:bg-slate-800/80 text-main hover:bg-sky-500/10 hover:border-sky-500/40 disabled:opacity-50 transition-colors cursor-pointer"
+                        className="px-3.5 py-1.5 rounded-full text-xs font-medium neu-btn text-main disabled:opacity-50 cursor-pointer"
                       >
                         {syncingPositions ? '同步中...' : '同步交易所持仓'}
                       </button>
@@ -3351,7 +3348,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="px-3 py-2 rounded-xl border border-line bg-white/70 dark:bg-slate-900/60 flex flex-col gap-0.5 min-w-0">
+                    <div className="px-3 py-2 surface-subtle flex flex-col gap-0.5 min-w-0">
                       <div className="flex items-center justify-between gap-1 text-[11px] text-sub">
                         <span className="truncate">持仓实时净浮盈亏</span>
                         <span
@@ -3372,7 +3369,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="px-3 py-2 rounded-xl border border-line bg-white/70 dark:bg-slate-900/60 flex flex-col gap-0.5 min-w-0">
+                    <div className="px-3 py-2 surface-subtle flex flex-col gap-0.5 min-w-0">
                       <div className="flex items-center justify-between gap-1 text-[11px] text-sub">
                         <span className="truncate">在途持仓总名义</span>
                         <span className="font-mono text-[10px] text-dim shrink-0">
@@ -3429,7 +3426,7 @@ export default function App() {
                         return (
                           <div
                             key={rowKey}
-                            className="flex flex-col xl:flex-row xl:items-center justify-between gap-2.5 px-3 py-2.5 rounded-xl border border-line bg-white/70 dark:bg-slate-900/55 text-xs font-mono transition-all hover:border-[var(--border-hover)] hover:shadow-sm hover:-translate-y-[1px]"
+                            className="flex flex-col xl:flex-row xl:items-center justify-between gap-2.5 px-3 py-2.5 surface-subtle interactive-subtle text-xs font-mono"
                           >
                             <div className="flex flex-wrap items-center gap-2 sm:gap-3">
                               <button
