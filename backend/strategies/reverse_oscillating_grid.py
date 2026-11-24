@@ -597,9 +597,13 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             return
 
         if self.locked_mode == "LONG":
-            raw_floor = round(vwap * (1.0 + rt_fee), prec)
-            self.group_floor_price = max(self.group_floor_price, raw_floor) if self.group_floor_price > 0 else raw_floor
             max_entry = max(float(lv.get("entry_price") or 0.0) for lv in group_slots)
+            # Add calibrated slippage + net-profit cushion (+0.08%~+0.10%) above RT fee so live Taker exit
+            # slippage at the group floor still settles strictly net-profitable (while never crossing L2 entry!)
+            headroom_pct = max(0.0, (max_entry - vwap) / max(1e-12, vwap))
+            slip_buf = min(0.0010, max(0.0005, headroom_pct * 0.35)) if headroom_pct > rt_fee + 0.0006 else 0.0004
+            raw_floor = round(vwap * (1.0 + rt_fee + slip_buf), prec)
+            self.group_floor_price = max(self.group_floor_price, raw_floor) if self.group_floor_price > 0 else raw_floor
             self.long_peak_price = max(self.long_peak_price, max_entry, ref_price)
             cand_trail = round(max(self.group_floor_price, self.long_peak_price * (1.0 - retr)), prec)
             self.long_trail_stop_price = (
@@ -616,9 +620,11 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                         lv["sl_price"] = target_sl
                         lv["sl_needs_amend"] = True
         elif self.locked_mode == "SHORT":
-            raw_floor = round(vwap * max(0.05, 1.0 - rt_fee), prec)
-            self.group_floor_price = min(self.group_floor_price, raw_floor) if self.group_floor_price > 0 else raw_floor
             min_entry = min(float(lv.get("entry_price") or 0.0) for lv in group_slots)
+            headroom_pct = max(0.0, (vwap - min_entry) / max(1e-12, vwap))
+            slip_buf = min(0.0010, max(0.0005, headroom_pct * 0.35)) if headroom_pct > rt_fee + 0.0006 else 0.0004
+            raw_floor = round(vwap * max(0.05, 1.0 - rt_fee - slip_buf), prec)
+            self.group_floor_price = min(self.group_floor_price, raw_floor) if self.group_floor_price > 0 else raw_floor
             trough_cands = [p for p in (self.short_trough_price, min_entry, ref_price) if p > 0]
             self.short_trough_price = min(trough_cands) if trough_cands else 0.0
             cand_trail = round(min(self.group_floor_price, self.short_trough_price * (1.0 + retr)), prec)

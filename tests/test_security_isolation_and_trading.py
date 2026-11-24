@@ -3519,9 +3519,9 @@ def test_reverse_oscillating_grid_core_lifecycle():
     assert ex_l2 == [] and [e["slot_id"] for e in en_l2] == ["L2"] and en_l2[0]["order_usdt"] == 500.0
     trk.mark_entry_filled("L2", 101.20, 5.0, 5.0, 1.0, cfg, round_trip_fee=0.0010)
     assert trk.strategy.group_trail_active is True
-    # Q 10@100.60 + L2 5@101.20 -> exact weighted avg 100.80, floor = 100.80 * 1.001 = 100.90
+    # Q 10@100.60 + L2 5@101.20 -> exact weighted avg 100.80, floor includes RT fee + slippage/profit cushion (> 100.90, < 101.20)
     assert trk.strategy.group_vwap == 100.80
-    assert trk.strategy.group_floor_price == round(100.80 * 1.001, 2)
+    assert round(100.80 * 1.0015, 2) <= trk.strategy.group_floor_price < 101.20
     assert trk.long_trail_stop_price == trk.strategy.group_floor_price
 
     # Rally to L3 (101.80) -> Buy L3 (30% = 300U), monotonic VWAP & floor ratchet upward!
@@ -3622,7 +3622,7 @@ def test_reverse_oscillating_grid_core_lifecycle():
     trk_s.mark_entry_filled("S2", 98.80, 5.0, 5.0, 1.0, cfg, round_trip_fee=0.0010)
     assert trk_s.strategy.group_trail_active is True
     assert trk_s.strategy.group_vwap == 99.20
-    assert trk_s.strategy.group_floor_price == round(99.20 * 0.999, 2)
+    assert 98.80 < trk_s.strategy.group_floor_price <= round(99.20 * 0.9985, 2)
     # Drop to S5 (97.00) -> full S-group close (GRID_GROUP_TP)!
     _, ex_s5 = trk_s.evaluate_tick(96.99, 97.00, 96.995, cfg, is_net_mode=False, round_trip_fee=0.0010)
     assert set(e["slot_id"] for e in ex_s5) == {"QS", "S2"}
@@ -3767,6 +3767,41 @@ def test_reverse_grid_engine_db_api_and_batch_e2e():
             assert cleanup_called["called"] is True
             assert trk.strategy.reconcile_verified is True
             assert trk.strategy.cycle_phase == "COOLDOWN"
+
+            # 2c) Verify manual_close_position records MANUAL_CLOSE in trade_logs/stats & blocks instant re-open!
+            op_cfg = SymbolStrategy(
+                symbol="OP/USDT:USDT",
+                strategy_type="LONG_SHORT_GRID",
+                grid_side_mode="LONG_SHORT",
+                grid_levels=3,
+                grid_step_pct=0.006,
+                grid_take_profit_pct=0.0065,
+                grid_range_pct=0.025,
+                grid_stop_loss_pct=0.04,
+                order_usdt=10.0,
+                leverage=5,
+                price_precision=5,
+                qty_precision=1,
+            )
+            eng._register_symbol_internal(op_cfg)
+            eng._handle_follower_bbo("OP/USDT:USDT", 0.07090, 0.07100, 10000.0, 10000.0)
+            # Trigger SHORT S1 at 0.07138
+            eng._handle_follower_bbo("OP/USDT:USDT", 0.07140, 0.07142, 10000.0, 10000.0)
+            await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
+            assert "OP/USDT:USDT:S1" in eng.active_grid_positions
+            pre_recent_len = len(eng.stats_by_mode["SHADOW"]["recent_trades"])
+            mc_res = await eng.manual_close_position("OP/USDT:USDT", "SHORT", slot_id="S1")
+            assert mc_res["ok"] is True
+            assert "OP/USDT:USDT:S1" not in eng.active_grid_positions
+            assert len(eng.stats_by_mode["SHADOW"]["recent_trades"]) == pre_recent_len + 1
+            assert eng.stats_by_mode["SHADOW"]["recent_trades"][0]["reason"] == "MANUAL_CLOSE_S1"
+            # Immediately receiving the same BBO tick 100ms later MUST NOT re-open S1 (3-min cooldown + recenter!)
+            eng._handle_follower_bbo("OP/USDT:USDT", 0.07140, 0.07142, 10000.0, 10000.0)
+            await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
+            assert "OP/USDT:USDT:S1" not in eng.active_grid_positions
+            # Remove OP before batch validate assertions on DOGE below
+            eng.strategies.pop("OP/USDT:USDT", None)
+            eng.grid_trackers.pop("OP/USDT:USDT", None)
 
             # 3) Dashboard snapshot exposes REVERSE_GRID & REVERSE_OSCILLATING properly
             dash = eng.build_dashboard_snapshot(radar_symbol="DOGE/USDT:USDT")

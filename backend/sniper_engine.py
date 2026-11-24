@@ -1475,18 +1475,38 @@ class BidirectionalSniperEngine:
             }
 
     async def manual_close_position(self, symbol: str, side: str, slot_id: Optional[str] = None) -> Dict[str, Any]:
-        """Closes a specific strategy slot (without liquidating sibling slots) or whole exchange position."""
+        """
+        Closes a specific strategy slot (without liquidating sibling slots) or whole exchange position:
+        1) Cancels & reconciles protective orders FIRST so OKX releases locked availPos (preventing 51169 blocks).
+        2) Records every closed slot / position into `trade_logs` (`MANUAL_CLOSE`) & stats immediately.
+        3) Applies a 3-minute manual-close cooldown (and recenters flat grid) so the running grid strategy
+           NEVER immediately re-opens the exact same slot 1 second later!
+        """
         if self.is_guest_preview:
             return {"ok": False, "message": "游客预览模式不可操作实盘持仓"}
 
-        _, follower_ex = self.get_leader_And_follower_cfg()
+        leader_ex, follower_ex = self.get_leader_And_follower_cfg()
         cur_mode = self.risk_config.trading_mode
+        manual_cd_ms = 180_000.0  # 3-minute anti-reopen cooldown after manual close
+
+        m_state = self.math_states.get(symbol)
+        f_book = m_state.latest_follower if m_state else None
+        live_mid = float(f_book.mid) if (f_book and f_book.mid > 0) else 0.0
+        live_exit_ref = (
+            (float(f_book.bid) if side == "LONG" else float(f_book.ask))
+            if (f_book and f_book.bid > 0 and f_book.ask > 0)
+            else live_mid
+        )
 
         async with self._get_symbol_exec_lock(symbol):
             tracker = self.grid_trackers.get(symbol)
             cfg = self.strategies.get(symbol)
             same_side_open = (
-                [lv for lv in tracker.levels.values() if lv.get("side") == side and lv.get("status") in ("OPEN", "EXITING")]
+                [
+                    lv
+                    for lv in tracker.levels.values()
+                    if lv.get("side") == side and lv.get("status") in ("OPEN", "EXITING")
+                ]
                 if tracker
                 else []
             )
@@ -1495,77 +1515,303 @@ class BidirectionalSniperEngine:
                 and tracker is not None
                 and slot_id in tracker.levels
                 and tracker.levels[slot_id].get("side") == side
+                and tracker.levels[slot_id].get("status") in ("OPEN", "EXITING")
                 and len(same_side_open) > 1
             )
-            ex_pos_meta = self.exchange_live_positions.get(f"{symbol}:{side}", {})
+            ex_pos_meta = dict(self.exchange_live_positions.get(f"{symbol}:{side}", {}) or {})
             real_mgn_mode = str(ex_pos_meta.get("mgn_mode") or "cross")
+            if live_exit_ref <= 0:
+                live_exit_ref = float(ex_pos_meta.get("mark_price") or ex_pos_meta.get("entry_price") or 0.0)
 
-            if cur_mode == "LIVE":
-                if single_slot_partial and cfg is not None:
-                    # Reconcile/cancel this slot's protective orders FIRST before partial close!
-                    lv = tracker.levels[slot_id]
-                    slot_qty = float(lv.get("filled_qty") or 0.0)
+            target_slots: List[dict] = []
+            if tracker:
+                if single_slot_partial and slot_id:
+                    target_slots = [tracker.levels[slot_id]]
+                else:
+                    target_slots = list(same_side_open)
+
+            # 1) Reconcile & cancel protective orders BEFORE executing market close (unlocks OKX availPos!)
+            remaining_slots: List[dict] = []
+            already_settled_cnt = 0
+            if cur_mode == "LIVE" and tracker and cfg is not None and target_slots:
+                for lv in target_slots:
+                    sid = str(lv["slot_id"])
+                    gk = f"{symbol}:{sid}"
                     slot_ct = float(lv.get("contracts") or 0.0)
                     slot_ct_val = float(lv.get("ct_val") or 1.0)
-                    e_px = float(lv.get("entry_price") or 0.0)
+                    c_info = await self.executor.cancel_slot_protective_orders(
+                        symbol=symbol,
+                        slot_key=gk,
+                        exchange_cfg=follower_ex,
+                        cancel_tp=True,
+                        cancel_sl=True,
+                        expected_contracts=slot_ct,
+                    )
+                    if c_info.get("tp_fully_filled"):
+                        avg_px = float(c_info.get("tp_avg_px") or lv.get("tp_price") or lv.get("entry_price") or live_exit_ref)
+                        self._finalize_grid_slot_trade(
+                            cfg=cfg,
+                            tracker=tracker,
+                            lv=dict(lv),
+                            exit_avg=avg_px,
+                            is_maker=True,
+                            exit_reason="GRID_TP",
+                            order_id=c_info.get("tp_order_id") or "maker-tp",
+                            latency_ms=0.0,
+                            exec_mode="LIVE",
+                            actual_exit_fee_usdt=float(c_info.get("tp_fee_usdt") or 0.0),
+                        )
+                        already_settled_cnt += 1
+                    elif c_info.get("sl_already_filled"):
+                        avg_px = float(c_info.get("sl_avg_px") or lv.get("sl_price") or lv.get("entry_price") or live_exit_ref)
+                        self._finalize_grid_slot_trade(
+                            cfg=cfg,
+                            tracker=tracker,
+                            lv=dict(lv),
+                            exit_avg=avg_px,
+                            is_maker=False,
+                            exit_reason=tracker.get_cond_sl_exit_reason(lv),
+                            order_id=c_info.get("sl_order_id") or "cond-sl",
+                            latency_ms=0.0,
+                            exec_mode="LIVE",
+                            actual_exit_fee_usdt=float(c_info.get("sl_fee_usdt") or 0.0),
+                        )
+                        already_settled_cnt += 1
+                    elif c_info.get("reconcile_uncertain"):
+                        return {"ok": False, "message": f"{symbol} [{sid}] 交易所保护单状态未确认，请稍后重试防重复平仓"}
+                    else:
+                        partial_ct = float(c_info.get("tp_filled_ct") or 0.0)
+                        rem_ct = float(max(Decimal("0"), Decimal(str(max(0.0, slot_ct))) - Decimal(str(max(0.0, partial_ct)))))
+                        if slot_ct > 0 and rem_ct <= 0.0:
+                            avg_px = float(c_info.get("tp_avg_px") or lv.get("tp_price") or lv.get("entry_price") or live_exit_ref)
+                            self._finalize_grid_slot_trade(
+                                cfg=cfg,
+                                tracker=tracker,
+                                lv=dict(lv),
+                                exit_avg=avg_px,
+                                is_maker=True,
+                                exit_reason="GRID_TP",
+                                order_id=c_info.get("tp_order_id") or "maker-tp",
+                                latency_ms=0.0,
+                                exec_mode="LIVE",
+                                actual_exit_fee_usdt=float(c_info.get("tp_fee_usdt") or 0.0),
+                            )
+                            already_settled_cnt += 1
+                        else:
+                            item_copy = dict(lv)
+                            item_copy["_partial_maker_ct"] = partial_ct
+                            item_copy["_partial_maker_px"] = float(c_info.get("tp_avg_px") or 0.0)
+                            item_copy["_partial_maker_fee"] = float(c_info.get("tp_fee_usdt") or 0.0)
+                            item_copy["_rem_contracts"] = rem_ct if slot_ct > 0 else 0.0
+                            item_copy["_rem_qty"] = (
+                                rem_ct * slot_ct_val if (slot_ct > 0 and slot_ct_val > 0) else float(lv.get("filled_qty") or 0.0)
+                            )
+                            remaining_slots.append(item_copy)
+            else:
+                for lv in target_slots:
+                    item_copy = dict(lv)
+                    item_copy["_partial_maker_ct"] = 0.0
+                    item_copy["_partial_maker_px"] = 0.0
+                    item_copy["_partial_maker_fee"] = 0.0
+                    item_copy["_rem_contracts"] = float(lv.get("contracts") or 0.0)
+                    item_copy["_rem_qty"] = float(lv.get("filled_qty") or 0.0)
+                    remaining_slots.append(item_copy)
+
+            # 2) Execute the actual exchange close and record EVERY closed slot / position into trade_logs!
+            now_m = mono_ms()
+            if remaining_slots and tracker and cfg is not None:
+                total_qty = sum(max(0.0, float(it.get("_rem_qty") or 0.0)) for it in remaining_slots)
+                total_contracts = float(
+                    sum((Decimal(str(max(0.0, float(it.get("_rem_contracts") or 0.0)))) for it in remaining_slots), Decimal("0"))
+                )
+                ct_val = float(remaining_slots[0].get("ct_val") or 1.0)
+                eff_mgn = str(remaining_slots[0].get("mgn_mode") or real_mgn_mode)
+                ref_px = live_exit_ref or float(remaining_slots[0].get("entry_price") or 0.0)
+
+                if cur_mode == "LIVE":
                     exit_res = await self.executor.execute_exit_with_retry(
                         cfg=cfg,
                         side=side,
-                        qty=slot_qty,
+                        qty=total_qty,
                         exit_reason="MANUAL_CLOSE",
-                        tp_price=e_px,
+                        tp_price=ref_px,
                         exchange_cfg=follower_ex,
-                        contracts=slot_ct or None,
-                        ct_val=slot_ct_val or None,
-                        order_key=f"{symbol}:{slot_id}",
-                        allow_close_position_fallback=False,
-                        mgn_mode=str(lv.get("mgn_mode") or real_mgn_mode),
+                        contracts=total_contracts or None,
+                        ct_val=ct_val or None,
+                        order_key=f"{symbol}:{slot_id}" if single_slot_partial else f"{symbol}:__manual__",
+                        allow_close_position_fallback=(not single_slot_partial),
+                        mgn_mode=eff_mgn,
                     )
                     if exit_res.status == "UNCERTAIN":
-                        return {"ok": False, "message": f"单格手动平仓未确认: {exit_res.raw_msg}"}
+                        return {"ok": False, "message": f"手动平仓未确认: {exit_res.raw_msg}"}
+                    fill_avg = float(exit_res.avg_price or ref_px)
+                    fill_oid = str(exit_res.order_id or f"manual-{wall_ms()}")
+                    fill_lat = float(exit_res.latency_ms or 0.0)
+                    fill_fee_total = float(exit_res.fee_usdt or 0.0)
+                else:
+                    fill_avg = ref_px
+                    fill_oid = f"sim-manual-{wall_ms()}"
+                    fill_lat = 0.0
+                    fill_fee_total = 0.0
+
+                total_rem_notional = sum(
+                    max(0.0, float(it.get("_rem_qty") or 0.0)) * max(1e-12, fill_avg) for it in remaining_slots
+                )
+                for it in remaining_slots:
+                    sid = str(it["slot_id"])
+                    p_ct = float(it.get("_partial_maker_ct") or 0.0)
+                    p_px = float(it.get("_partial_maker_px") or 0.0)
+                    p_fee = float(it.get("_partial_maker_fee") or 0.0)
+                    r_ct = float(it.get("_rem_contracts") or 0.0)
+                    r_qty = float(it.get("_rem_qty") or 0.0)
+                    slot_ct_tot = p_ct + r_ct
+                    if p_ct > 0 and p_px > 0 and slot_ct_tot > 0:
+                        blended_px = (p_ct * p_px + r_ct * fill_avg) / slot_ct_tot
+                        maker_frac = p_ct / slot_ct_tot
+                    else:
+                        blended_px = fill_avg
+                        maker_frac = 0.0
+                    share_fee = (
+                        fill_fee_total * ((r_qty * fill_avg) / total_rem_notional)
+                        if (fill_fee_total > 0 and total_rem_notional > 0)
+                        else 0.0
+                    )
+                    self._finalize_grid_slot_trade(
+                        cfg=cfg,
+                        tracker=tracker,
+                        lv=it,
+                        exit_avg=blended_px,
+                        is_maker=False,
+                        exit_reason="MANUAL_CLOSE",
+                        order_id=fill_oid,
+                        latency_ms=fill_lat,
+                        exec_mode=cur_mode,
+                        maker_fraction=maker_frac,
+                        actual_exit_fee_usdt=p_fee + share_fee,
+                    )
+
+                # Apply 3-minute anti-reopen cooldown (and recenter flat grid) so it NEVER pops right back up!
+                now_after = mono_ms()
+                if single_slot_partial and slot_id and slot_id in tracker.levels:
+                    lv_closed = tracker.levels[slot_id]
+                    lv_closed["armed"] = False
+                    lv_closed["cooldown_until_mono"] = max(float(lv_closed.get("cooldown_until_mono") or 0.0), now_after + manual_cd_ms)
                     res = {
                         "ok": True,
-                        "message": f"OKX {symbol} [{slot_id}] 单格减仓平仓已成交（其余同向网格槽位不受影响）",
+                        "message": f"OKX {symbol} [{slot_id}] 已手动平仓并记入历史明细（该格暂停重开 3 分钟）",
                     }
                 else:
-                    # Cancel same-side tracked protective orders before full close-position
-                    if tracker:
-                        for sid, lv in list(tracker.levels.items()):
-                            if lv.get("side") == side and lv.get("status") in ("OPEN", "EXITING"):
-                                await self.executor.cancel_slot_protective_orders(
-                                    symbol, f"{symbol}:{sid}", exchange_cfg=follower_ex, cancel_tp=True, cancel_sl=True
-                                )
+                    if tracker.active_grid_mode == "REVERSE_OSCILLATING":
+                        # Flat REVERSE_GRID cycle: keep verified clean + 3-min restart cooldown before re-anchoring to NONE
+                        if not tracker._has_active_slots():
+                            tracker.mark_reconcile_verified_clean()
+                            tracker.strategy.restart_cooldown_until_mono = max(
+                                float(getattr(tracker.strategy, "restart_cooldown_until_mono", 0.0)),
+                                now_after + manual_cd_ms,
+                            )
+                            tracker.strategy.cycle_phase = "COOLDOWN"
+                            tracker.strategy.restart_reason = "TP_COOLDOWN"
+                    else:
+                        if not tracker._has_active_slots() and live_mid > 0:
+                            tracker.recenter(live_mid, cfg)
+                    tracker._post_sl_cooldown_until_mono = max(
+                        float(tracker._post_sl_cooldown_until_mono or 0.0),
+                        now_after + manual_cd_ms,
+                    )
+                    self.exchange_live_positions.pop(f"{symbol}:{side}", None)
+                    res = {
+                        "ok": True,
+                        "message": f"OKX {symbol} ({'多' if side == 'LONG' else '空'}) 已手动平仓并记入历史明细（该标的暂停新开仓 3 分钟）",
+                    }
+            elif already_settled_cnt > 0:
+                now_after = mono_ms()
+                if tracker:
+                    tracker._post_sl_cooldown_until_mono = max(
+                        float(tracker._post_sl_cooldown_until_mono or 0.0),
+                        now_after + manual_cd_ms,
+                    )
+                res = {
+                    "ok": True,
+                    "message": f"{symbol} 保护单已成交并已记入历史成交明细（该标的暂停新开仓 3 分钟）",
+                }
+            else:
+                # Non-grid (LEAD_LAG or unmanaged exchange position) full market close
+                if cur_mode == "LIVE":
                     res = await self.executor.close_exchange_position(
                         symbol=symbol, side=side, mgn_mode=real_mgn_mode, exchange_cfg=follower_ex
                     )
                     if not res.get("ok"):
                         return res
-            else:
-                res = {"ok": True, "message": f"模拟持仓 {symbol} ({side}) 已平仓"}
+                else:
+                    res = {"ok": True, "message": f"模拟持仓 {symbol} ({side}) 已平仓"}
 
-            # Clear local tracking entries cleanly (if full close-position ran, clear ALL same-side slots!)
-            if tracker:
-                clear_all_side = not single_slot_partial
-                for sid, lv in list(tracker.levels.items()):
-                    if (single_slot_partial and sid == slot_id) or (
-                        clear_all_side and lv.get("side") == side and lv.get("status") != "IDLE"
-                    ):
-                        tracker.clear_external_exit(sid)
-                        self.active_grid_positions.pop(f"{symbol}:{sid}", None)
-            if not single_slot_partial:
+                ap = self.active_positions.get(symbol)
+                entry_px = float((ap or ex_pos_meta).get("entry_price") or 0.0)
+                qty_closed = float((ap or ex_pos_meta).get("qty") or 0.0)
+                exit_px = live_exit_ref or float((ap or ex_pos_meta).get("mark_price") or entry_px)
+                if entry_px > 0 and qty_closed > 0 and exit_px > 0:
+                    taker_fee = float(follower_ex.get("taker_fee", 0.0005))
+                    gross_pnl = (exit_px - entry_px) * qty_closed if side == "LONG" else (entry_px - exit_px) * qty_closed
+                    total_fee = (entry_px + exit_px) * qty_closed * taker_fee
+                    net_pnl = gross_pnl - total_fee
+                    now_dt = datetime.now()
+                    now_time_str = now_dt.strftime("%H:%M:%S.") + f"{int(now_dt.microsecond / 1000):03d}"
+                    now_wall = wall_ms()
+                    tr_rec = {
+                        "time": now_time_str,
+                        "symbol": symbol,
+                        "strategy_type": cfg.strategy_type if cfg else "LEAD_LAG",
+                        "leader_ex": leader_ex["exchange_id"],
+                        "follower_ex": follower_ex["exchange_id"],
+                        "side": side,
+                        "trading_mode": cur_mode,
+                        "order_id": f"manual-{symbol}-{now_wall}",
+                        "exit_order_type": "TAKER_IOC",
+                        "leader_jump_pct": 0.0,
+                        "follower_lag_pct": 0.0,
+                        "expected_net_pct": 0.0,
+                        "actual_slippage_pct": 0.0,
+                        "beta_est": 1.0,
+                        "leader_snapshot_price": entry_px,
+                        "follower_snapshot_price": entry_px,
+                        "reservation_price": exit_px,
+                        "entry_price": entry_px,
+                        "exit_price": exit_px,
+                        "filled_qty": qty_closed,
+                        "gross_pnl_usdt": round(gross_pnl, 4),
+                        "fee_usdt": round(total_fee, 4),
+                        "net_pnl_usdt": round(net_pnl, 4),
+                        "signal_ts_ms": now_wall,
+                        "submit_ts_ms": now_wall,
+                        "ack_ts_ms": now_wall,
+                        "signal_to_fill_ms": 0.0,
+                        "hold_duration_ms": int(max(1.0, now_m - float((ap or {}).get("opened_mono_ms") or now_m))),
+                        "exit_reason": "MANUAL_CLOSE",
+                    }
+                    if not self.is_guest_preview:
+                        self.db.record_trade_async(tr_rec, user_id=self.user_id)
+                    self._accumulate_trade_into_stats(tr_rec, is_historical=False, mode_override=cur_mode)
+
                 self.exchange_live_positions.pop(f"{symbol}:{side}", None)
-
-            ap = self.active_positions.get(symbol)
-            if ap and ap.get("side") == side and not single_slot_partial:
-                self.active_positions.pop(symbol, None)
-                self.symbol_states[symbol] = SniperState.IDLE
-                ev = self.book_events.get(symbol)
-                if ev:
-                    ev.set()
-                if not self.is_guest_preview:
-                    self.db.upsert_position_async(
-                        symbol, follower_ex["exchange_id"], side, 0.0, float(ap.get("entry_price") or 0.0), "", "", "CLOSED", wall_ms(), user_id=self.user_id
-                    )
+                if ap and ap.get("side") == side:
+                    self.active_positions.pop(symbol, None)
+                    self.symbol_states[symbol] = SniperState.IDLE
+                    ev = self.book_events.get(symbol)
+                    if ev:
+                        ev.set()
+                    if not self.is_guest_preview:
+                        self.db.upsert_position_async(
+                            symbol,
+                            follower_ex["exchange_id"],
+                            side,
+                            0.0,
+                            float(ap.get("entry_price") or 0.0),
+                            "",
+                            "",
+                            "CLOSED",
+                            wall_ms(),
+                            user_id=self.user_id,
+                        )
 
         if cur_mode == "LIVE":
             await self.sync_live_exchange_positions(trigger="manual_close")
