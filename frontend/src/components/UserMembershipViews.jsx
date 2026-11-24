@@ -1673,6 +1673,8 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
   });
   const [userSearch, setUserSearch] = useState('');
   const [orderFilter, setOrderFilter] = useState('ALL');
+  const [confirmDeleteOrderId, setConfirmDeleteOrderId] = useState(null);
+  const [confirmClearClosedOrders, setConfirmClearClosedOrders] = useState(false);
   const [feedbackFilter, setFeedbackFilter] = useState('ALL');
   const [feedbackSearch, setFeedbackSearch] = useState('');
   const [replyDrafts, setReplyDrafts] = useState({});
@@ -1861,6 +1863,53 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
         onCurrentUserRefresh();
       } else {
         showToast(data.detail || '审核操作失败', 'error');
+      }
+    } finally {
+      adminBusyRef.current = false;
+      setAdminBusy(false);
+    }
+  };
+
+  const handleDeleteOrder = async (orderId) => {
+    if (adminBusyRef.current) return;
+    adminBusyRef.current = true;
+    setAdminBusy(true);
+    try {
+      const res = await fetch(`/api/admin/orders/${orderId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        showToast(data.message || '订单记录已删除', 'info');
+        setDashboard(data.dashboard);
+        setConfirmDeleteOrderId(null);
+      } else {
+        showToast(data.detail || '删除订单失败', 'error');
+      }
+    } finally {
+      adminBusyRef.current = false;
+      setAdminBusy(false);
+    }
+  };
+
+  const handleClearClosedOrders = async () => {
+    if (adminBusyRef.current) return;
+    adminBusyRef.current = true;
+    setAdminBusy(true);
+    try {
+      const res = await fetch('/api/admin/orders/cleanup-closed', {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        showToast(data.message || '已清理已关闭订单', 'info');
+        setDashboard(data.dashboard);
+        setConfirmClearClosedOrders(false);
+        setConfirmDeleteOrderId(null);
+      } else {
+        showToast(data.detail || '批量清理失败', 'error');
       }
     } finally {
       adminBusyRef.current = false;
@@ -2518,6 +2567,38 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                   {f.l}
                 </button>
               ))}
+              {(dashboard.orders || []).some((o) => ['EXPIRED', 'CANCELLED', 'REJECTED'].includes(o.status)) && (
+                confirmClearClosedOrders ? (
+                  <div className="flex items-center gap-1.5 pl-1">
+                    <span className="text-[11px] text-rose-600 dark:text-rose-400">清理全部超时/取消/拒绝订单？</span>
+                    <button
+                      type="button"
+                      disabled={adminBusy}
+                      onClick={handleClearClosedOrders}
+                      className="btn-primary-pill px-3 py-1.5 text-[11px]"
+                    >
+                      确认清理
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmClearClosedOrders(false)}
+                      className="btn-soft-pill px-2.5 py-1.5 text-[11px]"
+                    >
+                      取消
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={adminBusy}
+                    onClick={() => setConfirmClearClosedOrders(true)}
+                    className="btn-soft-pill px-3 py-1.5 sm:py-2 text-xs text-rose-600 dark:text-rose-400"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" strokeWidth={1.75} />
+                    <span>清理已关闭订单</span>
+                  </button>
+                )
+              )}
             </div>
           </div>
 
@@ -2582,25 +2663,64 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                       </td>
                       <td className="py-3.5 px-3 text-dim">{o.created_at}</td>
                       <td className="py-3.5 px-3 text-right font-sans space-x-2 whitespace-nowrap">
-                        {o.status !== 'PAID' ? (
-                          <>
+                        {confirmDeleteOrderId === o.id ? (
+                          <div className="inline-flex items-center justify-end gap-1.5">
+                            <span className="text-[11px] text-rose-600 dark:text-rose-400">
+                              {o.status === 'PAID' ? '仅删流水不收回VIP，确认？' : '确认删除此订单？'}
+                            </span>
                             <button
-                              onClick={() => handleAuditOrder(o.id, 'APPROVE')}
-                              className="btn-primary-pill px-3.5 py-1.5 text-[11px]"
+                              type="button"
+                              disabled={adminBusy}
+                              onClick={() => handleDeleteOrder(o.id)}
+                              className="btn-primary-pill px-3 py-1 text-[11px]"
                             >
-                              手动确认并开通
+                              确认删除
                             </button>
-                            {o.status === 'PENDING' && (
-                              <button
-                                onClick={() => handleAuditOrder(o.id, 'EXPIRE')}
-                                className="btn-soft-pill px-3 py-1.5 text-[11px] text-rose-600"
-                              >
-                                关闭监控
-                              </button>
-                            )}
-                          </>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteOrderId(null)}
+                              className="btn-soft-pill px-2.5 py-1 text-[11px]"
+                            >
+                              取消
+                            </button>
+                          </div>
                         ) : (
-                          <span className="text-dim">已归档</span>
+                          <>
+                            {o.status !== 'PAID' ? (
+                              <>
+                                <button
+                                  type="button"
+                                  disabled={adminBusy}
+                                  onClick={() => handleAuditOrder(o.id, 'APPROVE')}
+                                  className="btn-primary-pill px-3.5 py-1.5 text-[11px]"
+                                >
+                                  手动确认并开通
+                                </button>
+                                {o.status === 'PENDING' && (
+                                  <button
+                                    type="button"
+                                    disabled={adminBusy}
+                                    onClick={() => handleAuditOrder(o.id, 'EXPIRE')}
+                                    className="btn-soft-pill px-3 py-1.5 text-[11px] text-amber-600 dark:text-amber-400"
+                                  >
+                                    关闭监控
+                                  </button>
+                                )}
+                              </>
+                            ) : (
+                              <span className="text-dim mr-1">已归档</span>
+                            )}
+                            <button
+                              type="button"
+                              disabled={adminBusy}
+                              onClick={() => setConfirmDeleteOrderId(o.id)}
+                              title="删除此条订单流水记录"
+                              className="btn-soft-pill px-2.5 py-1.5 text-[11px] text-rose-600 dark:text-rose-400"
+                            >
+                              <Trash2 className="w-3 h-3" strokeWidth={1.75} />
+                              <span>删除</span>
+                            </button>
+                          </>
                         )}
                       </td>
                     </tr>

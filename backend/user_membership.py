@@ -122,6 +122,13 @@ CREATE TABLE IF NOT EXISTS user_feedback_messages (
     admin_deleted BOOLEAN DEFAULT 0,
     admin_deleted_at INTEGER DEFAULT 0
 );
+
+-- 12. 已核销链上交易哈希防重放归档表（删除已支付订单时保留哈希记录）
+CREATE TABLE IF NOT EXISTS consumed_tx_hashes (
+    tx_hash VARCHAR(128) PRIMARY KEY,
+    order_no VARCHAR(64) DEFAULT '',
+    archived_at TEXT DEFAULT ''
+);
 """
 
 FEEDBACK_SUBMIT_COOLDOWN_SECONDS = 86400
@@ -677,13 +684,20 @@ class UserMembershipManager:
     def is_tx_hash_already_used(self, tx_hash: str) -> bool:
         if not tx_hash:
             return False
+        clean = tx_hash.strip()
         conn = self._connect()
         try:
             row = conn.execute(
                 "SELECT id FROM membership_orders WHERE LOWER(tx_hash) = LOWER(?) AND status = 'PAID' LIMIT 1",
-                (tx_hash.strip(),),
+                (clean,),
             ).fetchone()
-            return row is not None
+            if row is not None:
+                return True
+            archived = conn.execute(
+                "SELECT tx_hash FROM consumed_tx_hashes WHERE tx_hash = LOWER(?) LIMIT 1",
+                (clean,),
+            ).fetchone()
+            return archived is not None
         finally:
             conn.close()
 
@@ -887,6 +901,11 @@ class UserMembershipManager:
                     "SELECT id FROM membership_orders WHERE LOWER(tx_hash) = LOWER(?) AND status = 'PAID' LIMIT 1",
                     (clean_tx,),
                 ).fetchone()
+                if not dup:
+                    dup = cur.execute(
+                        "SELECT tx_hash FROM consumed_tx_hashes WHERE tx_hash = LOWER(?) LIMIT 1",
+                        (clean_tx,),
+                    ).fetchone()
                 if dup:
                     conn.rollback()
                     return {"ok": False, "message": "该交易哈希已被其他订单使用"}
@@ -1352,6 +1371,70 @@ class UserMembershipManager:
                 cur.execute("UPDATE membership_orders SET status = 'REJECTED' WHERE id = ? AND status != 'PAID'", (order_id,))
                 conn.commit()
                 return {"ok": True, "message": f"已拒绝订单 {o_row['order_no']}"}
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def admin_delete_order(self, order_id: int) -> Dict[str, Any]:
+        conn = self._connect(isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            o_row = cur.execute("SELECT * FROM membership_orders WHERE id = ?", (order_id,)).fetchone()
+            if not o_row:
+                conn.rollback()
+                return {"ok": False, "message": "该条订单记录不存在或已被删除"}
+
+            # Preserve on-chain 0x tx_hash in replay-guard table before removing a PAID Web3 order
+            tx_clean = (o_row["tx_hash"] or "").strip()
+            if (
+                o_row["status"] == "PAID"
+                and tx_clean.lower().startswith("0x")
+                and len(tx_clean) == 66
+            ):
+                cur.execute(
+                    "INSERT OR IGNORE INTO consumed_tx_hashes (tx_hash, order_no, archived_at) VALUES (?, ?, ?)",
+                    (tx_clean.lower(), o_row["order_no"], _now_str()),
+                )
+
+            cur.execute("DELETE FROM membership_orders WHERE id = ?", (order_id,))
+            conn.commit()
+            extra = "（用户已生效的会员时长不受影响）" if o_row["status"] == "PAID" else ""
+            return {
+                "ok": True,
+                "message": f"已删除订单记录 {o_row['order_no']}（用户 {o_row['username']}）{extra}",
+            }
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def admin_clear_closed_orders(self) -> Dict[str, Any]:
+        conn = self._connect(isolation_level=None)
+        try:
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            self._expire_overdue_orders_in_tx(cur)
+            cur.execute("DELETE FROM membership_orders WHERE status IN ('EXPIRED', 'CANCELLED', 'REJECTED')")
+            deleted_count = int(cur.rowcount or 0)
+            conn.commit()
+            if deleted_count == 0:
+                return {"ok": True, "deleted_count": 0, "message": "当前没有可清理的已超时/取消/拒绝订单"}
+            return {
+                "ok": True,
+                "deleted_count": deleted_count,
+                "message": f"已批量清理 {deleted_count} 条已超时/已取消/已拒绝订单流水",
+            }
         except Exception:
             try:
                 conn.rollback()

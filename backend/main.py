@@ -1147,6 +1147,22 @@ async def admin_audit_order(req: AdminAuditOrderRequest, authorization: str = He
     return {**res, "dashboard": await _admin_summary_async()}
 
 
+@app.delete("/api/admin/orders/cleanup-closed")
+async def admin_clear_closed_orders(authorization: str = Header(default="")):
+    _require_admin(authorization)
+    res = await asyncio.to_thread(user_manager.admin_clear_closed_orders)
+    return {**res, "dashboard": await _admin_summary_async()}
+
+
+@app.delete("/api/admin/orders/{order_id}")
+async def admin_delete_order(order_id: int, authorization: str = Header(default="")):
+    _require_admin(authorization)
+    res = await asyncio.to_thread(user_manager.admin_delete_order, order_id)
+    if not res["ok"]:
+        raise HTTPException(status_code=400, detail=res["message"])
+    return {**res, "dashboard": await _admin_summary_async()}
+
+
 @app.post("/api/admin/vip-codes/generate")
 async def admin_generate_vip_codes(req: AdminGenerateVipCodesRequest, authorization: str = Header(default="")):
     _require_admin(authorization)

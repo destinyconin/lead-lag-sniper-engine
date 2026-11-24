@@ -5456,6 +5456,85 @@ def test_user_feedback_24h_limit_reply_and_independent_soft_delete():
         assert adm_final["messages"] == []
 
 
+def test_admin_delete_web3_orders_and_tx_replay_guard():
+    """
+    Verifies admin deletion of Web3 membership orders:
+    1. Non-admin gets 403 on DELETE /api/admin/orders/{id} and cleanup-closed.
+    2. Admin can delete individual PENDING / EXPIRED / PAID orders and dashboard stats update cleanly.
+    3. Deleting a PAID Web3 order preserves the user's active VIP duration AND keeps the 0x tx_hash
+       recorded in consumed_tx_hashes so on-chain replay remains blocked.
+    4. Batch cleanup-closed deletes only EXPIRED/CANCELLED/REJECTED orders, leaving PENDING & PAID intact.
+    """
+    import backend.main as main_mod
+    from backend.main import app
+
+    rate_limiter._buckets.clear()
+
+    with TestClient(app) as client:
+        r_u = client.post(
+            "/api/auth/register",
+            json={"username": "ord_del_user", "password": "password123", "email": "ord@test.io"},
+            headers={"X-Forwarded-For": "203.0.113.55"},
+        )
+        assert r_u.status_code == 200
+        hdr_u = {"Authorization": f"Bearer {r_u.json()['token']}"}
+
+        r_adm = client.post("/api/auth/login", json={"username": "admin", "password": "admin123456"})
+        assert r_adm.status_code == 200
+        hdr_adm = {"Authorization": f"Bearer {r_adm.json()['token']}"}
+
+        # Non-admin rejected
+        assert client.delete("/api/admin/orders/1", headers=hdr_u).status_code == 403
+        assert client.delete("/api/admin/orders/cleanup-closed", headers=hdr_u).status_code == 403
+
+        plans = client.get("/api/membership/plans", headers=hdr_u).json()["plans"]
+        plan_id = plans[0]["id"]
+
+        # Create order 1 (will be confirmed PAID onchain then deleted by admin)
+        o1 = client.post("/api/membership/purchase", json={"plan_id": plan_id, "force_new": True}, headers=hdr_u).json()["order"]
+        tx_hex = "0x" + "ab" * 32
+        paid_res = main_mod.user_manager.confirm_order_paid_onchain(o1["id"], "Arbitrum", tx_hex, float(o1["pay_amount_usdt"]))
+        assert paid_res["ok"] is True
+
+        # Delete PAID order -> succeeds, user remains VIP, tx_hash still blocked from replay
+        del_paid = client.delete(f"/api/admin/orders/{o1['id']}", headers=hdr_adm)
+        assert del_paid.status_code == 200
+        assert del_paid.json()["dashboard"]["stats"]["total_orders"] == 0
+        assert main_mod.user_manager.is_tx_hash_already_used(tx_hex) is True
+
+        me_after = client.get("/api/auth/me", headers=hdr_u).json()["user"]
+        assert me_after["is_vip"] is True
+
+        # Deleting missing order returns 400
+        assert client.delete(f"/api/admin/orders/{o1['id']}", headers=hdr_adm).status_code == 400
+
+        # Create order 2 (expire it), order 3 (cancel it), order 4 (keep PENDING)
+        o2 = client.post("/api/membership/purchase", json={"plan_id": plan_id, "force_new": True}, headers=hdr_u).json()["order"]
+        assert client.post("/api/admin/orders/audit", json={"order_id": o2["id"], "action": "EXPIRE"}, headers=hdr_adm).status_code == 200
+
+        o3 = client.post("/api/membership/purchase", json={"plan_id": plan_id, "force_new": True}, headers=hdr_u).json()["order"]
+        assert client.post(f"/api/membership/orders/{o3['order_no']}/cancel", headers=hdr_u).status_code == 200
+
+        o4 = client.post("/api/membership/purchase", json={"plan_id": plan_id, "force_new": True}, headers=hdr_u).json()["order"]
+
+        # Attempt replay of tx_hex against o4 MUST still be rejected!
+        replay_res = main_mod.user_manager.confirm_order_paid_onchain(o4["id"], "Arbitrum", tx_hex, float(o4["pay_amount_usdt"]))
+        assert replay_res["ok"] is False
+
+        # Batch cleanup-closed removes o2 (EXPIRED) & o3 (CANCELLED), preserves o4 (PENDING)
+        clr = client.delete("/api/admin/orders/cleanup-closed", headers=hdr_adm)
+        assert clr.status_code == 200
+        assert clr.json()["deleted_count"] == 2
+        rem_ids = [o["id"] for o in clr.json()["dashboard"]["orders"]]
+        assert rem_ids == [o4["id"]]
+
+        # Delete remaining PENDING o4 directly
+        del_p = client.delete(f"/api/admin/orders/{o4['id']}", headers=hdr_adm)
+        assert del_p.status_code == 200
+        assert del_p.json()["dashboard"]["orders"] == []
+
+
+
 
 
 
