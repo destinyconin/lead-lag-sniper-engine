@@ -266,4 +266,14 @@ class AdminAuditOrderRequest(BaseModel):
     tx_hash: Optional[str] = None
 
 
+class UserFeedbackCreateRequest(BaseModel):
+    category: str = Field(default="问题反馈", max_length=32)
+    title: str = Field(default="", max_length=120)
+    content: str = Field(..., min_length=2, max_length=2000)
+
+
+class AdminFeedbackReplyRequest(BaseModel):
+    reply: str = Field(..., min_length=1, max_length=2000)
+
+
 

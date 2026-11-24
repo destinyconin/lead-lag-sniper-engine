@@ -3,16 +3,19 @@ import {
   AlertCircle,
   BarChart2,
   Check,
+  CheckCircle2,
   Clock,
   Copy,
   CreditCard,
   Edit3,
   Key,
   Lock,
+  MessageSquare,
   Plus,
   QrCode,
   RefreshCw,
   Search,
+  Send,
   Share2,
   Shield,
   ShoppingCart,
@@ -46,6 +49,19 @@ function formatCountdown(seconds) {
   const mins = Math.floor(s / 60);
   const secs = s % 60;
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+const FEEDBACK_CATEGORIES = ['策略问题', '账户与会员', 'Bug反馈', '功能建议', '其他'];
+
+function formatDurationCn(seconds) {
+  const s = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (s <= 0) return '0秒';
+  const hrs = Math.floor(s / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  const secs = s % 60;
+  if (hrs > 0) return `${hrs}小时${String(mins).padStart(2, '0')}分`;
+  if (mins > 0) return `${mins}分${String(secs).padStart(2, '0')}秒`;
+  return `${secs}秒`;
 }
 
 // ==================== 1. AUTH LOGIN / REGISTER MODAL ====================
@@ -234,17 +250,89 @@ export function MembershipCenterView({
   const [newPassword, setNewPassword] = useState('');
   const [pwdSaving, setPwdSaving] = useState(false);
 
+  // User Feedback / Question Message Board State
+  const [feedbackData, setFeedbackData] = useState({
+    messages: [],
+    can_submit: true,
+    cooldown_remaining_sec: 0,
+    next_submit_at_ts: 0,
+    total_count: 0,
+    replied_count: 0,
+  });
+  const [feedbackFetchedAtMs, setFeedbackFetchedAtMs] = useState(() => Date.now());
+  const [feedbackNowMs, setFeedbackNowMs] = useState(() => Date.now());
+  const [feedbackLoading, setFeedbackLoading] = useState(false);
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
+  const [feedbackDeletingId, setFeedbackDeletingId] = useState(null);
+  const [confirmDeleteFeedbackId, setConfirmDeleteFeedbackId] = useState(null);
+  const [feedbackCategory, setFeedbackCategory] = useState('策略问题');
+  const [feedbackTitle, setFeedbackTitle] = useState('');
+  const [feedbackContent, setFeedbackContent] = useState('');
+
   const onUserUpdatedRef = useRef(onUserUpdated);
   onUserUpdatedRef.current = onUserUpdated;
   const showToastRef = useRef(showToast);
   showToastRef.current = showToast;
 
-  // Clear stale pending order immediately on account switch or logout
+  // Clear stale pending order & feedback immediately on account switch or logout
   useEffect(() => {
     setActiveOrder(null);
     setRemainingSeconds(0);
     setOrders([]);
+    setConfirmDeleteFeedbackId(null);
+    setFeedbackData({
+      messages: [],
+      can_submit: true,
+      cooldown_remaining_sec: 0,
+      next_submit_at_ts: 0,
+      total_count: 0,
+      replied_count: 0,
+    });
   }, [authToken]);
+
+  const fetchMyFeedback = useCallback(async () => {
+    if (!authToken) return;
+    setFeedbackLoading(true);
+    try {
+      const res = await fetch('/api/feedback/my', {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const nowTs = Date.now();
+        setFeedbackData({
+          messages: data.messages || [],
+          can_submit: Boolean(data.can_submit),
+          cooldown_remaining_sec: Number(data.cooldown_remaining_sec || 0),
+          next_submit_at_ts: Number(data.next_submit_at_ts || 0),
+          total_count: Number(data.total_count || 0),
+          replied_count: Number(data.replied_count || 0),
+        });
+        setFeedbackFetchedAtMs(nowTs);
+        setFeedbackNowMs(nowTs);
+      }
+    } catch (e) {
+      // ignore
+    } finally {
+      setFeedbackLoading(false);
+    }
+  }, [authToken]);
+
+  useEffect(() => {
+    fetchMyFeedback();
+  }, [fetchMyFeedback]);
+
+  const hasActiveFeedbackTimers =
+    Number(feedbackData.cooldown_remaining_sec || 0) > 0 ||
+    (feedbackData.messages || []).some((m) => Number(m.delete_unlock_remaining_sec || 0) > 0);
+
+  useEffect(() => {
+    if (!authToken || !hasActiveFeedbackTimers) return undefined;
+    const timer = setInterval(() => {
+      setFeedbackNowMs(Date.now());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [authToken, hasActiveFeedbackTimers]);
 
   const fetchMembershipData = useCallback(async () => {
     try {
@@ -487,6 +575,87 @@ export function MembershipCenterView({
     }
   };
 
+  const handleSubmitFeedback = async (e) => {
+    e.preventDefault();
+    if (!currentUser || !authToken) {
+      showToast('请先登录账号后再提交问题留言', 'error');
+      onOpenAuthModal('login');
+      return;
+    }
+    const trimmedContent = feedbackContent.trim();
+    if (trimmedContent.length < 2) {
+      showToast('请详细描述您的问题（至少 2 个字符）', 'error');
+      return;
+    }
+    setFeedbackSubmitting(true);
+    try {
+      const res = await fetch('/api/feedback', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({
+          category: feedbackCategory,
+          title: feedbackTitle.trim(),
+          content: trimmedContent,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(data.detail || data.message || '提交留言失败', 'error');
+        fetchMyFeedback();
+      } else {
+        showToast(data.message || '问题留言已提交', 'success');
+        setFeedbackTitle('');
+        setFeedbackContent('');
+        if (data.feedback) {
+          const nowTs = Date.now();
+          setFeedbackData(data.feedback);
+          setFeedbackFetchedAtMs(nowTs);
+          setFeedbackNowMs(nowTs);
+        } else {
+          fetchMyFeedback();
+        }
+      }
+    } catch (err) {
+      showToast('网络请求异常，请稍后重试', 'error');
+    } finally {
+      setFeedbackSubmitting(false);
+    }
+  };
+
+  const handleDeleteMyFeedback = async (messageId) => {
+    if (!authToken) return;
+    setFeedbackDeletingId(messageId);
+    try {
+      const res = await fetch(`/api/feedback/${messageId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(data.detail || data.message || '删除失败', 'error');
+        fetchMyFeedback();
+      } else {
+        showToast(data.message || '已删除您侧的留言记录', 'info');
+        setConfirmDeleteFeedbackId(null);
+        if (data.feedback) {
+          const nowTs = Date.now();
+          setFeedbackData(data.feedback);
+          setFeedbackFetchedAtMs(nowTs);
+          setFeedbackNowMs(nowTs);
+        } else {
+          fetchMyFeedback();
+        }
+      }
+    } catch (err) {
+      showToast('网络请求异常，请稍后重试', 'error');
+    } finally {
+      setFeedbackDeletingId(null);
+    }
+  };
+
   const copyText = async (txt, label) => {
     try {
       if (navigator.clipboard && window.isSecureContext) {
@@ -520,6 +689,12 @@ export function MembershipCenterView({
   const progressPct = isOrderPending
     ? Math.min(100, Math.max(0, (remainingSeconds / (paymentInfo.timeout_seconds || 1800)) * 100))
     : 0;
+  const feedbackElapsedSec = Math.max(0, Math.floor((feedbackNowMs - feedbackFetchedAtMs) / 1000));
+  const submitCooldownRemaining = Math.max(
+    0,
+    Number(feedbackData.cooldown_remaining_sec || 0) - feedbackElapsedSec
+  );
+  const canSubmitFeedbackNow = Boolean(currentUser) && submitCooldownRemaining <= 0;
 
   return (
     <div className="space-y-4 sm:space-y-5">
@@ -528,10 +703,26 @@ export function MembershipCenterView({
         <div>
           <h2 className="text-lg sm:text-xl font-bold text-main">会员中心与 Web3 多链自动收银台</h2>
           <p className="text-xs text-dim mt-1">
-            注册用户可查看实盘系统实时行情，通过多链转账精确尾数金额或兑换激活码开通 VIP 后即可启动毫秒级实盘狙击
+            注册用户可查看实盘系统实时行情、提交问题留言，通过多链转账或激活码开通 VIP 后即可启动毫秒级实盘狙击
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:gap-2.5 w-full sm:w-auto">
+          <button
+            type="button"
+            onClick={() => {
+              const el = document.getElementById('user-feedback-board');
+              if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }}
+            className="btn-soft-pill px-4 py-2 sm:py-2.5 text-xs"
+          >
+            <MessageSquare className="w-3.5 h-3.5" strokeWidth={1.75} />
+            <span>问题留言</span>
+            {currentUser && feedbackData.replied_count > 0 && (
+              <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-mono font-bold bg-emerald-500/15 text-emerald-700 dark:text-emerald-300">
+                {feedbackData.replied_count} 已复
+              </span>
+            )}
+          </button>
           {!currentUser ? (
             <>
               <button onClick={() => onOpenAuthModal('login')} className="btn-soft-pill px-4 sm:px-5 py-2 sm:py-2.5 text-xs">
@@ -987,6 +1178,263 @@ export function MembershipCenterView({
         </div>
       </div>
 
+      {/* 5.5 User Issue / Feedback Message Board */}
+      <div id="user-feedback-board" className="surface-card p-4 sm:p-6 lg:p-7 space-y-5 scroll-mt-20">
+        <div className="flex flex-wrap items-start sm:items-center justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2.5">
+              <MessageSquare className="w-4 h-4 sm:w-5 sm:h-5 text-main shrink-0" strokeWidth={1.75} />
+              <h3 className="text-sm sm:text-base font-bold text-main">用户问题留言板</h3>
+              {currentUser && (
+                <span className="px-2.5 py-0.5 rounded-full text-[11px] font-mono font-semibold surface-subtle text-sub">
+                  共 {(feedbackData.messages || []).length} 条
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-dim mt-1">
+              提交使用问题或建议，管理员将在后台查看并回复 · 每 24 小时仅可提交一次 · 留言满 24 小时后可删除个人侧记录（管理员侧留存不受影响）
+            </p>
+          </div>
+          {currentUser && (
+            <button
+              type="button"
+              onClick={fetchMyFeedback}
+              disabled={feedbackLoading}
+              className="btn-soft-pill px-4 py-1.5 text-xs"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${feedbackLoading ? 'animate-spin' : ''}`} strokeWidth={1.75} />
+              <span>刷新留言</span>
+            </button>
+          )}
+        </div>
+
+        {!currentUser ? (
+          <div className="surface-subtle p-6 text-center space-y-3">
+            <p className="text-xs text-sub">登录后即可向管理员提交问题留言并查看专属回复记录</p>
+            <button
+              type="button"
+              onClick={() => onOpenAuthModal('login')}
+              className="btn-primary-pill px-5 py-2 text-xs"
+            >
+              登录账号提交留言
+            </button>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+            {/* Left 5 Cols: Submit Form */}
+            <form onSubmit={handleSubmitFeedback} className="lg:col-span-5 surface-subtle p-4 sm:p-5 space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-bold text-main">提交新问题留言</span>
+                <span
+                  className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${
+                    canSubmitFeedbackNow
+                      ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-400'
+                      : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                  }`}
+                >
+                  {canSubmitFeedbackNow ? '当前可提交' : '24h 冷却中'}
+                </span>
+              </div>
+
+              {!canSubmitFeedbackNow && (
+                <div className="p-3 rounded-2xl bg-amber-500/10 border border-amber-500/25 text-xs text-amber-800 dark:text-amber-200 flex items-start gap-2">
+                  <Clock className="w-4 h-4 shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" strokeWidth={1.75} />
+                  <div className="leading-relaxed">
+                    <div className="font-semibold">24 小时内仅允许提交一次留言</div>
+                    <div className="text-[11px] opacity-90 mt-0.5 font-mono">
+                      距离下次可提交还剩：{formatDurationCn(submitCooldownRemaining)}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-xs font-semibold text-main mb-2">问题分类</label>
+                <div className="flex flex-wrap gap-1.5">
+                  {FEEDBACK_CATEGORIES.map((cat) => (
+                    <button
+                      key={cat}
+                      type="button"
+                      disabled={!canSubmitFeedbackNow}
+                      onClick={() => setFeedbackCategory(cat)}
+                      className={`px-3 py-1.5 text-[11px] transition ${
+                        feedbackCategory === cat ? 'btn-primary-pill' : 'btn-soft-pill'
+                      } ${!canSubmitFeedbackNow ? 'opacity-60 cursor-not-allowed' : ''}`}
+                    >
+                      {cat}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-main mb-1.5">问题标题（选填）</label>
+                <input
+                  type="text"
+                  maxLength={120}
+                  disabled={!canSubmitFeedbackNow || feedbackSubmitting}
+                  value={feedbackTitle}
+                  onChange={(e) => setFeedbackTitle(e.target.value)}
+                  placeholder="简要概括您的问题，如：多空震荡止盈疑问"
+                  className="w-full input-field px-3.5 py-2.5 text-base sm:text-xs"
+                />
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-xs font-semibold text-main">问题描述（必填）</label>
+                  <span className="text-[11px] font-mono text-dim">{feedbackContent.length} / 2000</span>
+                </div>
+                <textarea
+                  rows={5}
+                  maxLength={2000}
+                  required
+                  disabled={!canSubmitFeedbackNow || feedbackSubmitting}
+                  value={feedbackContent}
+                  onChange={(e) => setFeedbackContent(e.target.value)}
+                  placeholder="请详细描述您遇到的问题、涉及的币种/时间点或改进建议，以便管理员快速定位与回复..."
+                  className="w-full input-field p-3.5 text-base sm:text-xs leading-relaxed resize-y"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={!canSubmitFeedbackNow || feedbackSubmitting}
+                className="btn-primary-pill w-full py-2.5 text-xs disabled:opacity-55 disabled:cursor-not-allowed"
+              >
+                <Send className="w-3.5 h-3.5" strokeWidth={1.75} />
+                <span>
+                  {feedbackSubmitting
+                    ? '正在提交...'
+                    : canSubmitFeedbackNow
+                      ? '提交问题留言'
+                      : `冷却中 · 还剩 ${formatDurationCn(submitCooldownRemaining)}`}
+                </span>
+              </button>
+            </form>
+
+            {/* Right 7 Cols: My Feedback History & Admin Replies */}
+            <div className="lg:col-span-7 space-y-3">
+              <div className="flex items-center justify-between text-xs px-1">
+                <span className="font-bold text-main">我的留言与管理员回复记录</span>
+                <span className="text-[11px] text-dim">
+                  已回复 {feedbackData.replied_count || 0} / {(feedbackData.messages || []).length}
+                </span>
+              </div>
+
+              {(feedbackData.messages || []).length === 0 ? (
+                <div className="surface-subtle p-8 text-center text-xs text-dim">
+                  暂无问题留言记录，如遇疑问可在左侧提交留言给管理员
+                </div>
+              ) : (
+                <div className="space-y-3 max-h-[540px] overflow-y-auto pr-0.5">
+                  {(feedbackData.messages || []).map((m) => {
+                    const delRem = Math.max(
+                      0,
+                      Number(m.delete_unlock_remaining_sec || 0) - feedbackElapsedSec
+                    );
+                    const canDelete = delRem <= 0;
+                    const isConfirming = confirmDeleteFeedbackId === m.id;
+                    return (
+                      <div key={m.id} className="surface-subtle p-4 space-y-3 text-xs">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold surface-card text-main">
+                              {m.category || '问题反馈'}
+                            </span>
+                            {m.title && (
+                              <span className="font-bold text-main break-all">{m.title}</span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span
+                              className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${
+                                m.status === 'REPLIED'
+                                  ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-400'
+                                  : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                              }`}
+                            >
+                              {m.status === 'REPLIED' ? '管理员已回复' : '待管理员回复'}
+                            </span>
+                            <span className="text-[11px] font-mono text-dim">{m.created_at}</span>
+                          </div>
+                        </div>
+
+                        <div className="text-main leading-relaxed whitespace-pre-wrap break-words">
+                          {m.content}
+                        </div>
+
+                        {m.admin_reply ? (
+                          <div className="surface-card p-3.5 border border-emerald-500/20 space-y-1.5">
+                            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                              <span className="inline-flex items-center gap-1.5 font-bold text-emerald-700 dark:text-emerald-400">
+                                <CheckCircle2 className="w-3.5 h-3.5" strokeWidth={2} />
+                                <span>管理员回复{m.replied_by ? ` (${m.replied_by})` : ''}</span>
+                              </span>
+                              <span className="font-mono text-dim">{m.replied_at}</span>
+                            </div>
+                            <div className="text-sub leading-relaxed whitespace-pre-wrap break-words">
+                              {m.admin_reply}
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="text-[11px] text-dim italic">
+                            您的留言已送达管理员后台，请耐心等待回复...
+                          </div>
+                        )}
+
+                        <div className="pt-2 border-t border-line flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                          <span className="text-dim font-mono">工单 #{m.id}</span>
+                          {!canDelete ? (
+                            <span
+                              className="inline-flex items-center gap-1 text-dim font-mono"
+                              title="留言提交满 24 小时后才允许用户删除本地记录"
+                            >
+                              <Clock className="w-3 h-3" strokeWidth={1.75} />
+                              <span>满 24 小时后可删（还剩 {formatDurationCn(delRem)}）</span>
+                            </span>
+                          ) : isConfirming ? (
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="text-rose-600 dark:text-rose-400">
+                                仅删除您侧记录（管理员仍留存），确认？
+                              </span>
+                              <button
+                                type="button"
+                                disabled={feedbackDeletingId === m.id}
+                                onClick={() => handleDeleteMyFeedback(m.id)}
+                                className="btn-primary-pill px-3 py-1 text-[11px]"
+                              >
+                                {feedbackDeletingId === m.id ? '删除中...' : '确认删除'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteFeedbackId(null)}
+                                className="btn-soft-pill px-2.5 py-1 text-[11px]"
+                              >
+                                取消
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteFeedbackId(m.id)}
+                              className="btn-soft-pill px-3 py-1 text-[11px] text-rose-600 dark:text-rose-400"
+                            >
+                              <Trash2 className="w-3 h-3" strokeWidth={1.75} />
+                              <span>删除我的记录</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* 6. Change Password Card */}
       <form onSubmit={handleChangePassword} className="surface-card p-4 sm:p-6 lg:p-7 space-y-4 sm:space-y-5">
         <div className="flex items-center gap-2.5">
@@ -1199,7 +1647,7 @@ export function MembershipCenterView({
 
 // ==================== 3. ADMIN USER & MEMBERSHIP MANAGEMENT VIEW ====================
 export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, onOpenAuthModal, showToast }) {
-  const [subTab, setSubTab] = useState('users'); // 'users' | 'orders' | 'plans' | 'codes'
+  const [subTab, setSubTab] = useState('users'); // 'users' | 'orders' | 'plans' | 'codes' | 'feedback'
   const [dashboard, setDashboard] = useState({
     stats: {
       total_users: 0,
@@ -1213,14 +1661,24 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
       total_revenue_usdt: 0,
       unused_codes_count: 0,
       total_codes_count: 0,
+      total_feedback_count: 0,
+      open_feedback_count: 0,
+      replied_feedback_count: 0,
     },
     users: [],
     orders: [],
     vip_codes: [],
     plans: [],
+    feedback_messages: [],
   });
   const [userSearch, setUserSearch] = useState('');
   const [orderFilter, setOrderFilter] = useState('ALL');
+  const [feedbackFilter, setFeedbackFilter] = useState('ALL');
+  const [feedbackSearch, setFeedbackSearch] = useState('');
+  const [replyDrafts, setReplyDrafts] = useState({});
+  const [editingReplyId, setEditingReplyId] = useState(null);
+  const [feedbackBusyId, setFeedbackBusyId] = useState(null);
+  const [confirmAdminDeleteFeedbackId, setConfirmAdminDeleteFeedbackId] = useState(null);
 
   const [newUser, setNewUser] = useState({
     username: '',
@@ -1488,6 +1946,60 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
     }
   };
 
+  const handleAdminReplyFeedback = async (messageId, fallbackReply = '') => {
+    const replyText = (replyDrafts[messageId] !== undefined ? replyDrafts[messageId] : fallbackReply).trim();
+    if (!replyText) {
+      showToast('请输入回复内容后再发送', 'error');
+      return;
+    }
+    setFeedbackBusyId(messageId);
+    try {
+      const res = await fetch(`/api/admin/feedback/${messageId}/reply`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ reply: replyText }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(data.detail || data.message || '回复失败', 'error');
+      } else {
+        showToast(data.message || '管理员回复已保存', 'success');
+        if (data.dashboard) setDashboard(data.dashboard);
+        setEditingReplyId(null);
+        setReplyDrafts((prev) => {
+          const next = { ...prev };
+          delete next[messageId];
+          return next;
+        });
+      }
+    } finally {
+      setFeedbackBusyId(null);
+    }
+  };
+
+  const handleAdminDeleteFeedback = async (messageId) => {
+    setFeedbackBusyId(messageId);
+    try {
+      const res = await fetch(`/api/admin/feedback/${messageId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(data.detail || data.message || '删除失败', 'error');
+      } else {
+        showToast(data.message || '已从后台删除该条留言记录', 'info');
+        if (data.dashboard) setDashboard(data.dashboard);
+        setConfirmAdminDeleteFeedbackId(null);
+      }
+    } finally {
+      setFeedbackBusyId(null);
+    }
+  };
+
   const st = dashboard.stats || {};
   const filteredUsers = (dashboard.users || []).filter((u) => {
     const q = userSearch.trim().toLowerCase();
@@ -1507,6 +2019,20 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
     return o.status === orderFilter;
   });
 
+  const filteredFeedback = (dashboard.feedback_messages || []).filter((m) => {
+    if (feedbackFilter === 'OPEN' && m.status !== 'OPEN') return false;
+    if (feedbackFilter === 'REPLIED' && m.status !== 'REPLIED') return false;
+    const q = feedbackSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      (m.username || '').toLowerCase().includes(q) ||
+      (m.category || '').toLowerCase().includes(q) ||
+      (m.title || '').toLowerCase().includes(q) ||
+      (m.content || '').toLowerCase().includes(q) ||
+      (m.admin_reply || '').toLowerCase().includes(q)
+    );
+  });
+
   return (
     <div className="space-y-4 sm:space-y-5">
       {/* 1. Top Header Banner Card */}
@@ -1514,7 +2040,7 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
         <div>
           <h2 className="text-lg sm:text-xl font-bold text-main">后台用户与会员管理系统</h2>
           <p className="text-xs text-dim mt-1">
-            管理注册用户账号、重置用户密码、手动开通/收回 VIP 会员资格、监控链上充值订单与批量生成会员激活码
+            管理注册用户账号、手动开通/收回 VIP、监控链上订单、批量制卡以及查看回复用户问题留言
           </p>
         </div>
         <button onClick={loadAdminDashboard} className="btn-primary-pill w-full sm:w-auto px-5 py-2.5 text-xs">
@@ -1588,10 +2114,16 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
       {/* 3. Sub-Navigation Pill Bar */}
       <div className="surface-card p-2.5 sm:p-3 flex items-center gap-1.5 sm:gap-2 overflow-x-auto no-scrollbar md:flex-wrap">
         {[
-          { id: 'users', label: `后台用户管理 (${(dashboard.users || []).length})`, icon: Users },
-          { id: 'orders', label: `链上订单与审核 (${(dashboard.orders || []).length})`, icon: CreditCard },
-          { id: 'plans', label: `会员套餐配置 (${(dashboard.plans || []).length})`, icon: Sliders },
-          { id: 'codes', label: `会员卡密生成 (${(dashboard.vip_codes || []).length})`, icon: Key },
+          { id: 'users', label: `后台用户管理 (${(dashboard.users || []).length})`, icon: Users, badge: 0 },
+          { id: 'orders', label: `链上订单与审核 (${(dashboard.orders || []).length})`, icon: CreditCard, badge: 0 },
+          { id: 'plans', label: `会员套餐配置 (${(dashboard.plans || []).length})`, icon: Sliders, badge: 0 },
+          { id: 'codes', label: `会员卡密生成 (${(dashboard.vip_codes || []).length})`, icon: Key, badge: 0 },
+          {
+            id: 'feedback',
+            label: `用户问题留言 (${st.total_feedback_count ?? (dashboard.feedback_messages || []).length})`,
+            icon: MessageSquare,
+            badge: Number(st.open_feedback_count || 0),
+          },
         ].map((t) => {
           const Icon = t.icon;
           const active = subTab === t.id;
@@ -1604,6 +2136,17 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
             >
               <Icon className="w-3.5 h-3.5" strokeWidth={1.75} />
               <span>{t.label}</span>
+              {t.badge > 0 && (
+                <span
+                  className={`ml-1 px-1.5 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+                    active
+                      ? 'bg-amber-400 text-slate-950'
+                      : 'bg-rose-500/15 text-rose-600 dark:text-rose-400'
+                  }`}
+                >
+                  {t.badge} 待复
+                </span>
+              )}
             </button>
           );
         })}
@@ -2392,6 +2935,218 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
               </table>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* ==================== SUB-TAB 5: USER FEEDBACK & ADMIN REPLIES ==================== */}
+      {subTab === 'feedback' && (
+        <div className="surface-card p-4 sm:p-6 lg:p-7 space-y-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2.5">
+                <MessageSquare className="w-4 h-4 sm:w-5 sm:h-5 text-main shrink-0" strokeWidth={1.75} />
+                <h3 className="text-sm sm:text-base font-bold text-main">用户问题留言箱与后台回复</h3>
+              </div>
+              <p className="text-xs text-dim mt-1">
+                用户提交的留言记录均会保留于此（即使用户满 24 小时后删除了个人侧记录，管理员后台仍完整保留直至管理员手动删除）
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 w-full lg:w-auto">
+              <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                {[
+                  { k: 'ALL', l: `全部 (${st.total_feedback_count ?? (dashboard.feedback_messages || []).length})` },
+                  { k: 'OPEN', l: `待回复 (${st.open_feedback_count || 0})` },
+                  { k: 'REPLIED', l: `已回复 (${st.replied_feedback_count || 0})` },
+                ].map((f) => (
+                  <button
+                    key={f.k}
+                    type="button"
+                    onClick={() => setFeedbackFilter(f.k)}
+                    className={`px-3 sm:px-4 py-1.5 sm:py-2 text-xs ${
+                      feedbackFilter === f.k ? 'btn-primary-pill' : 'btn-soft-pill'
+                    }`}
+                  >
+                    {f.l}
+                  </button>
+                ))}
+              </div>
+              <div className="relative w-full sm:w-64">
+                <Search className="w-4 h-4 text-dim absolute left-3.5 top-2.5" strokeWidth={1.75} />
+                <input
+                  type="text"
+                  value={feedbackSearch}
+                  onChange={(e) => setFeedbackSearch(e.target.value)}
+                  placeholder="搜索用户名 / 标题 / 留言内容..."
+                  className="w-full input-field rounded-full pl-10 pr-4 py-2 text-base sm:text-xs"
+                />
+              </div>
+            </div>
+          </div>
+
+          {filteredFeedback.length === 0 ? (
+            <div className="surface-subtle p-10 text-center text-xs text-dim">
+              暂无符合条件的用户问题留言记录
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {filteredFeedback.map((m) => {
+                const isEditingReply = m.status !== 'REPLIED' || editingReplyId === m.id;
+                const draftVal =
+                  replyDrafts[m.id] !== undefined ? replyDrafts[m.id] : m.admin_reply || '';
+                const isConfirmDelete = confirmAdminDeleteFeedbackId === m.id;
+                return (
+                  <div key={m.id} className="surface-subtle p-4 sm:p-5 space-y-3.5 text-xs">
+                    {/* Meta Header */}
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono text-dim">#{m.id}</span>
+                        <span className="px-2.5 py-0.5 rounded-full surface-card font-mono font-bold text-main">
+                          {m.username}
+                        </span>
+                        <span className="px-2.5 py-0.5 rounded-full surface-card text-sub font-medium">
+                          {m.category || '问题反馈'}
+                        </span>
+                        <span
+                          className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${
+                            m.status === 'REPLIED'
+                              ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-400'
+                              : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                          }`}
+                        >
+                          {m.status === 'REPLIED' ? '已回复' : '待回复'}
+                        </span>
+                        {m.user_deleted && (
+                          <span className="px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-slate-500/15 text-sub">
+                            用户侧已删除
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-[11px] font-mono text-dim">{m.created_at}</span>
+                    </div>
+
+                    {/* Title & Content */}
+                    <div className="space-y-1.5">
+                      {m.title && (
+                        <div className="text-sm font-bold text-main break-words">{m.title}</div>
+                      )}
+                      <div className="surface-card p-3.5 text-main leading-relaxed whitespace-pre-wrap break-words">
+                        {m.content}
+                      </div>
+                    </div>
+
+                    {/* Existing Reply Display OR Inline Reply Form */}
+                    {!isEditingReply ? (
+                      <div className="surface-card p-3.5 border border-emerald-500/25 space-y-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                          <span className="inline-flex items-center gap-1.5 font-bold text-emerald-700 dark:text-emerald-400">
+                            <CheckCircle2 className="w-3.5 h-3.5" strokeWidth={2} />
+                            <span>已回复 · {m.replied_by || 'admin'}</span>
+                          </span>
+                          <div className="flex items-center gap-2.5">
+                            <span className="font-mono text-dim">{m.replied_at}</span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEditingReplyId(m.id);
+                                setReplyDrafts((prev) => ({ ...prev, [m.id]: m.admin_reply || '' }));
+                              }}
+                              className="btn-soft-pill px-2.5 py-1 text-[11px]"
+                            >
+                              <Edit3 className="w-3 h-3" strokeWidth={1.75} />
+                              <span>修改回复</span>
+                            </button>
+                          </div>
+                        </div>
+                        <div className="text-sub leading-relaxed whitespace-pre-wrap break-words">
+                          {m.admin_reply}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="space-y-2.5">
+                        <textarea
+                          rows={3}
+                          maxLength={2000}
+                          value={draftVal}
+                          onChange={(e) =>
+                            setReplyDrafts((prev) => ({ ...prev, [m.id]: e.target.value }))
+                          }
+                          placeholder={`回复用户 ${m.username} 的问题留言，提交后用户端将实时可见...`}
+                          className="w-full input-field p-3.5 text-base sm:text-xs leading-relaxed resize-y"
+                        />
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-[11px] font-mono text-dim">
+                            {draftVal.length} / 2000
+                          </span>
+                          <div className="flex flex-wrap items-center gap-2">
+                            {m.status === 'REPLIED' && (
+                              <button
+                                type="button"
+                                onClick={() => setEditingReplyId(null)}
+                                className="btn-soft-pill px-3.5 py-1.5 text-[11px]"
+                              >
+                                取消编辑
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              disabled={feedbackBusyId === m.id}
+                              onClick={() => handleAdminReplyFeedback(m.id, m.admin_reply || '')}
+                              className="btn-primary-pill px-4 py-1.5 text-[11px]"
+                            >
+                              <Send className="w-3 h-3" strokeWidth={1.75} />
+                              <span>
+                                {feedbackBusyId === m.id
+                                  ? '提交中...'
+                                  : m.status === 'REPLIED'
+                                    ? '保存更新回复'
+                                    : '发送回复'}
+                              </span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Admin Delete Footer */}
+                    <div className="pt-2 border-t border-line flex flex-wrap items-center justify-end gap-2 text-[11px]">
+                      {isConfirmDelete ? (
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-rose-600 dark:text-rose-400">
+                            确认从管理员后台删除此条留言记录？
+                          </span>
+                          <button
+                            type="button"
+                            disabled={feedbackBusyId === m.id}
+                            onClick={() => handleAdminDeleteFeedback(m.id)}
+                            className="btn-primary-pill px-3 py-1 text-[11px]"
+                          >
+                            {feedbackBusyId === m.id ? '删除中...' : '确认删除'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmAdminDeleteFeedbackId(null)}
+                            className="btn-soft-pill px-2.5 py-1 text-[11px]"
+                          >
+                            取消
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmAdminDeleteFeedbackId(m.id)}
+                          className="btn-soft-pill px-3 py-1 text-[11px] text-rose-600 dark:text-rose-400"
+                        >
+                          <Trash2 className="w-3 h-3" strokeWidth={1.75} />
+                          <span>管理员删除记录</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
     </div>

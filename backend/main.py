@@ -34,6 +34,7 @@ from backend.models import (
     TRADITIONAL_BROKER_IDS,
     AdminAuditOrderRequest,
     AdminCreateUserRequest,
+    AdminFeedbackReplyRequest,
     AdminGenerateVipCodesRequest,
     AdminGrantVipRequest,
     AdminMembershipPlanModel,
@@ -49,6 +50,7 @@ from backend.models import (
     RedeemVipCodeRequest,
     RegisterRequest,
     SymbolStrategy,
+    UserFeedbackCreateRequest,
     is_grid_strategy,
     is_traditional_broker,
 )
@@ -1020,6 +1022,40 @@ async def redeem_vip_code(req: RedeemVipCodeRequest, authorization: str = Header
     return res
 
 
+# ==================== 4.5 User Question / Feedback Message Board APIs ====================
+@app.get("/api/feedback/my")
+async def get_my_feedback_messages(authorization: str = Header(default="")):
+    user = _require_user(authorization)
+    return await asyncio.to_thread(user_manager.list_user_feedback, user["id"])
+
+
+@app.post("/api/feedback")
+async def submit_user_feedback(req: UserFeedbackCreateRequest, authorization: str = Header(default="")):
+    user = _require_user(authorization)
+    allowed, retry = rate_limiter.check_and_record(f"fb_sub:{user['id']}", max_hits=10, window_sec=60.0)
+    if not allowed:
+        raise HTTPException(status_code=429, detail=f"操作过于频繁，请在 {retry} 秒后重试")
+    res = await asyncio.to_thread(
+        user_manager.submit_user_feedback,
+        user["id"],
+        req.title,
+        req.content,
+        req.category,
+    )
+    if not res["ok"]:
+        raise HTTPException(status_code=400, detail=res["message"])
+    return res
+
+
+@app.delete("/api/feedback/{message_id}")
+async def delete_my_feedback_message(message_id: int, authorization: str = Header(default="")):
+    user = _require_user(authorization)
+    res = await asyncio.to_thread(user_manager.delete_user_feedback, user["id"], message_id)
+    if not res["ok"]:
+        raise HTTPException(status_code=400, detail=res["message"])
+    return res
+
+
 # ==================== 5. Admin User & Membership Management APIs ====================
 def _admin_summary() -> Dict[str, Any]:
     return user_manager.admin_get_dashboard_summary(runtime_status_map=engine_manager.get_runtime_status_map())
@@ -1123,6 +1159,51 @@ async def admin_delete_vip_code(code_id: int, authorization: str = Header(defaul
     _require_admin(authorization)
     res = user_manager.admin_delete_vip_code(code_id)
     return {**res, "dashboard": _admin_summary()}
+
+
+@app.get("/api/admin/feedback")
+async def admin_list_feedback(
+    status: str = Query(default="ALL"),
+    search: str = Query(default=""),
+    authorization: str = Header(default=""),
+):
+    _require_admin(authorization)
+    return await asyncio.to_thread(user_manager.admin_list_feedback, status, search)
+
+
+@app.post("/api/admin/feedback/{message_id}/reply")
+async def admin_reply_feedback(
+    message_id: int,
+    req: AdminFeedbackReplyRequest,
+    authorization: str = Header(default=""),
+):
+    admin_user = _require_admin(authorization)
+    res = await asyncio.to_thread(
+        user_manager.admin_reply_feedback,
+        admin_user["username"],
+        message_id,
+        req.reply,
+    )
+    if not res["ok"]:
+        raise HTTPException(status_code=400, detail=res["message"])
+    return {
+        **res,
+        "feedback": await asyncio.to_thread(user_manager.admin_list_feedback),
+        "dashboard": await _admin_summary_async(),
+    }
+
+
+@app.delete("/api/admin/feedback/{message_id}")
+async def admin_delete_feedback(message_id: int, authorization: str = Header(default="")):
+    _require_admin(authorization)
+    res = await asyncio.to_thread(user_manager.admin_delete_feedback, message_id)
+    if not res["ok"]:
+        raise HTTPException(status_code=400, detail=res["message"])
+    return {
+        **res,
+        "feedback": await asyncio.to_thread(user_manager.admin_list_feedback),
+        "dashboard": await _admin_summary_async(),
+    }
 
 
 @app.get("/api/market/sentiment")

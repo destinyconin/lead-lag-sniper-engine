@@ -5287,6 +5287,176 @@ def test_audit_p0_p1_trading_and_execution_fixes(tmp_path):
     asyncio.run(_run_async_checks())
 
 
+def test_user_feedback_24h_limit_reply_and_independent_soft_delete():
+    """
+    Verifies end-to-end user feedback message board rules:
+    1. Non-VIP logged-in users can submit feedback; guests get 401; non-admin gets 403 on admin routes.
+    2. Strict 24-hour submission cooldown (at most 1 submission per 24h per user; deleting never bypasses it).
+    3. Strict 24-hour user soft-delete lock (blocked before 24h, allowed at >= 24h).
+    4. Independent soft-delete isolation: user delete hides ONLY from user; admin still sees it (user_deleted=True)
+       until admin explicitly deletes it.
+    5. Admin can view, reply, update reply, and delete records at any time.
+    """
+    import backend.main as main_mod
+    from backend.main import app
+
+    rate_limiter._buckets.clear()
+
+    with TestClient(app) as client:
+        # 1. Guest blocked
+        assert client.get("/api/feedback/my").status_code == 401
+        assert client.post("/api/feedback", json={"content": "guest test"}).status_code == 401
+        assert client.get("/api/admin/feedback").status_code == 401
+
+        # 2. Register two ordinary (non-VIP) users & login admin
+        r_a = client.post(
+            "/api/auth/register",
+            json={"username": "fb_user_a", "password": "password123", "email": "a@test.io"},
+            headers={"X-Forwarded-For": "203.0.113.11"},
+        )
+        assert r_a.status_code == 200
+        tok_a = r_a.json()["token"]
+        hdr_a = {"Authorization": f"Bearer {tok_a}"}
+
+        r_b = client.post(
+            "/api/auth/register",
+            json={"username": "fb_user_b", "password": "password123", "email": "b@test.io"},
+            headers={"X-Forwarded-For": "203.0.113.12"},
+        )
+        assert r_b.status_code == 200
+        tok_b = r_b.json()["token"]
+        hdr_b = {"Authorization": f"Bearer {tok_b}"}
+
+        r_adm = client.post("/api/auth/login", json={"username": "admin", "password": "admin123456"})
+        assert r_adm.status_code == 200
+        hdr_adm = {"Authorization": f"Bearer {r_adm.json()['token']}"}
+
+        # Non-admin blocked from admin feedback endpoints
+        assert client.get("/api/admin/feedback", headers=hdr_a).status_code == 403
+        assert client.post("/api/admin/feedback/1/reply", json={"reply": "hi"}, headers=hdr_a).status_code == 403
+        assert client.delete("/api/admin/feedback/1", headers=hdr_a).status_code == 403
+
+        # 3. User A submits first feedback message
+        sub1 = client.post(
+            "/api/feedback",
+            json={"category": "策略问题", "title": "多空震荡咨询", "content": "请问移动止盈保底价是如何计算的？"},
+            headers=hdr_a,
+        )
+        assert sub1.status_code == 200
+        d1 = sub1.json()
+        assert d1["ok"] is True
+        msg1_id = d1["item"]["id"]
+        assert d1["feedback"]["can_submit"] is False
+        assert d1["feedback"]["cooldown_remaining_sec"] > 86000
+        assert d1["feedback"]["messages"][0]["can_user_delete"] is False
+
+        # 4. Second submission within 24h MUST be rejected
+        sub_dup = client.post(
+            "/api/feedback",
+            json={"category": "Bug反馈", "title": "重复提交", "content": "24小时内再次提交"},
+            headers=hdr_a,
+        )
+        assert sub_dup.status_code == 400
+        assert "24 小时" in sub_dup.json()["detail"]
+
+        # 5. User A deleting before 24h MUST be rejected
+        del_early = client.delete(f"/api/feedback/{msg1_id}", headers=hdr_a)
+        assert del_early.status_code == 400
+        assert "24 小时" in del_early.json()["detail"]
+
+        # 6. User B cannot delete User A's message
+        del_other = client.delete(f"/api/feedback/{msg1_id}", headers=hdr_b)
+        assert del_other.status_code == 400
+
+        # 7. Admin sees message in both /api/admin/feedback and /api/admin/dashboard, then replies
+        adm_list = client.get("/api/admin/feedback", headers=hdr_adm).json()
+        assert adm_list["total_count"] == 1
+        assert adm_list["open_count"] == 1
+        assert adm_list["messages"][0]["id"] == msg1_id
+        assert adm_list["messages"][0]["user_deleted"] is False
+
+        adm_dash = client.get("/api/admin/dashboard", headers=hdr_adm).json()
+        assert adm_dash["stats"]["open_feedback_count"] == 1
+        assert len(adm_dash["feedback_messages"]) == 1
+
+        rep = client.post(
+            f"/api/admin/feedback/{msg1_id}/reply",
+            json={"reply": "保底价按加权均价叠加双边手续费和滑点垫层计算，确保止盈为正。"},
+            headers=hdr_adm,
+        )
+        assert rep.status_code == 200
+        assert rep.json()["item"]["status"] == "REPLIED"
+        assert rep.json()["dashboard"]["stats"]["open_feedback_count"] == 0
+
+        # User A sees admin reply immediately
+        my_list = client.get("/api/feedback/my", headers=hdr_a).json()
+        assert len(my_list["messages"]) == 1
+        assert my_list["messages"][0]["status"] == "REPLIED"
+        assert my_list["messages"][0]["replied_by"] == "admin"
+        assert "保底价" in my_list["messages"][0]["admin_reply"]
+
+        # 8. Simulate > 24 hours elapsed by backdating created_at_ts by 86405s
+        conn = sqlite3.connect(main_mod.user_manager.db_path)
+        conn.execute(
+            "UPDATE user_feedback_messages SET created_at_ts = created_at_ts - 86405 WHERE id = ?",
+            (msg1_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        my_after_24h = client.get("/api/feedback/my", headers=hdr_a).json()
+        assert my_after_24h["can_submit"] is True
+        assert my_after_24h["cooldown_remaining_sec"] == 0
+        assert my_after_24h["messages"][0]["can_user_delete"] is True
+        assert my_after_24h["messages"][0]["delete_unlock_remaining_sec"] == 0
+
+        # 9. User A deletes their record after 24h -> hidden from user ONLY, admin STILL sees it!
+        del_user_ok = client.delete(f"/api/feedback/{msg1_id}", headers=hdr_a)
+        assert del_user_ok.status_code == 200
+        assert len(del_user_ok.json()["feedback"]["messages"]) == 0
+
+        my_after_del = client.get("/api/feedback/my", headers=hdr_a).json()
+        assert len(my_after_del["messages"]) == 0
+
+        adm_after_user_del = client.get("/api/admin/feedback", headers=hdr_adm).json()
+        assert adm_after_user_del["total_count"] == 1
+        assert adm_after_user_del["messages"][0]["id"] == msg1_id
+        assert adm_after_user_del["messages"][0]["user_deleted"] is True
+
+        # 10. User A submits a new message after 24h; even if admin deletes msg2 immediately,
+        #     User A still cannot bypass the 24h submit limit!
+        sub2 = client.post(
+            "/api/feedback",
+            json={"category": "功能建议", "title": "24小时后新留言", "content": "希望支持更多提示音"},
+            headers=hdr_a,
+        )
+        assert sub2.status_code == 200
+        msg2_id = sub2.json()["item"]["id"]
+
+        adm_del2 = client.delete(f"/api/admin/feedback/{msg2_id}", headers=hdr_adm)
+        assert adm_del2.status_code == 200
+
+        # Still blocked within 24h even after admin deleted msg2
+        sub3_blocked = client.post(
+            "/api/feedback",
+            json={"category": "其他", "title": "绕过测试", "content": "测试删除后是否能绕过24h限制"},
+            headers=hdr_a,
+        )
+        assert sub3_blocked.status_code == 400
+
+        # User A still sees msg2 in their own view (admin deletion is independent of user side)
+        my_with_msg2 = client.get("/api/feedback/my", headers=hdr_a).json()
+        assert [m["id"] for m in my_with_msg2["messages"]] == [msg2_id]
+
+        # 11. Admin deletes original msg1 -> now admin inbox is empty
+        adm_del1 = client.delete(f"/api/admin/feedback/{msg1_id}", headers=hdr_adm)
+        assert adm_del1.status_code == 200
+        adm_final = client.get("/api/admin/feedback", headers=hdr_adm).json()
+        assert adm_final["total_count"] == 0
+        assert adm_final["messages"] == []
+
+
+
 
 
 

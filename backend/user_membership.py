@@ -101,7 +101,31 @@ CREATE TABLE IF NOT EXISTS vip_codes (
     used_at TEXT DEFAULT '',
     created_at TEXT NOT NULL
 );
+
+-- 11. 用户问题留言与管理员回复表
+CREATE TABLE IF NOT EXISTS user_feedback_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    username VARCHAR(64) NOT NULL,
+    category VARCHAR(32) DEFAULT '问题反馈',
+    title VARCHAR(128) DEFAULT '',
+    content TEXT NOT NULL,
+    status VARCHAR(16) DEFAULT 'OPEN',       -- 'OPEN' (待回复), 'REPLIED' (已回复)
+    admin_reply TEXT DEFAULT '',
+    replied_by VARCHAR(64) DEFAULT '',
+    replied_at TEXT DEFAULT '',
+    replied_at_ts INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    created_at_ts INTEGER NOT NULL,
+    user_deleted BOOLEAN DEFAULT 0,
+    user_deleted_at INTEGER DEFAULT 0,
+    admin_deleted BOOLEAN DEFAULT 0,
+    admin_deleted_at INTEGER DEFAULT 0
+);
 """
+
+FEEDBACK_SUBMIT_COOLDOWN_SECONDS = 86400
+FEEDBACK_USER_DELETE_MIN_AGE_SECONDS = 86400
 
 DEFAULT_PLANS = [
     (
@@ -195,6 +219,17 @@ def _fmt_ts(ts: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
+def _format_duration_cn(seconds: int) -> str:
+    s = max(1, int(seconds))
+    hours, rem = divmod(s, 3600)
+    mins, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}小时{mins}分" if mins > 0 else f"{hours}小时"
+    if mins > 0:
+        return f"{mins}分{secs}秒" if secs > 0 else f"{mins}分钟"
+    return f"{secs}秒"
+
+
 def hash_password(password: str, salt: Optional[str] = None) -> str:
     if not salt:
         salt = secrets.token_hex(16)
@@ -276,6 +311,11 @@ class UserMembershipManager:
                 pass
             try:
                 cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username))")
+            except Exception:
+                pass
+            try:
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_user_created ON user_feedback_messages(user_id, created_at_ts DESC)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_admin_status ON user_feedback_messages(admin_deleted, status, created_at_ts DESC)")
             except Exception:
                 pass
 
@@ -1363,6 +1403,320 @@ class UserMembershipManager:
         finally:
             conn.close()
 
+    # ==================== User Feedback / Question Message Board ====================
+    def _format_feedback_row(
+        self,
+        row: sqlite3.Row | Dict[str, Any],
+        now_ts: Optional[int] = None,
+        for_admin: bool = False,
+    ) -> Dict[str, Any]:
+        d = dict(row)
+        now_s = int(now_ts if now_ts is not None else time.time())
+        created_ts = int(d.get("created_at_ts") or 0)
+        age_sec = max(0, now_s - created_ts) if created_ts > 0 else FEEDBACK_USER_DELETE_MIN_AGE_SECONDS
+        unlock_rem = max(0, FEEDBACK_USER_DELETE_MIN_AGE_SECONDS - age_sec)
+        formatted = {
+            "id": int(d["id"]),
+            "user_id": int(d["user_id"]),
+            "username": d.get("username") or "",
+            "category": d.get("category") or "问题反馈",
+            "title": d.get("title") or "",
+            "content": d.get("content") or "",
+            "status": d.get("status") or ("REPLIED" if (d.get("admin_reply") or "").strip() else "OPEN"),
+            "admin_reply": d.get("admin_reply") or "",
+            "replied_by": d.get("replied_by") or "",
+            "replied_at": d.get("replied_at") or "",
+            "replied_at_ts": int(d.get("replied_at_ts") or 0),
+            "created_at": d.get("created_at") or "",
+            "created_at_ts": created_ts,
+            "age_seconds": age_sec,
+            "can_user_delete": unlock_rem == 0,
+            "delete_unlock_remaining_sec": unlock_rem,
+            "delete_unlock_at_ts": (created_ts + FEEDBACK_USER_DELETE_MIN_AGE_SECONDS) if created_ts > 0 else 0,
+        }
+        if for_admin:
+            formatted["user_deleted"] = bool(d.get("user_deleted", 0))
+            formatted["user_deleted_at"] = int(d.get("user_deleted_at") or 0)
+            formatted["admin_deleted"] = bool(d.get("admin_deleted", 0))
+            formatted["admin_deleted_at"] = int(d.get("admin_deleted_at") or 0)
+        return formatted
+
+    def list_user_feedback(self, user_id: int, now_ts: Optional[int] = None) -> Dict[str, Any]:
+        now_s = int(now_ts if now_ts is not None else time.time())
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            # 24h submit limit checks ALL submissions of this user (including soft-deleted rows)
+            last_row = conn.execute(
+                "SELECT MAX(created_at_ts) AS last_ts FROM user_feedback_messages WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            last_ts = int(last_row["last_ts"] or 0) if last_row else 0
+            elapsed = (now_s - last_ts) if last_ts > 0 else FEEDBACK_SUBMIT_COOLDOWN_SECONDS
+            cooldown_rem = max(0, FEEDBACK_SUBMIT_COOLDOWN_SECONDS - elapsed) if last_ts > 0 else 0
+            next_submit_at_ts = (last_ts + FEEDBACK_SUBMIT_COOLDOWN_SECONDS) if cooldown_rem > 0 else 0
+
+            rows = conn.execute(
+                """SELECT * FROM user_feedback_messages
+                   WHERE user_id = ? AND user_deleted = 0
+                   ORDER BY created_at_ts DESC, id DESC
+                   LIMIT 100""",
+                (user_id,),
+            ).fetchall()
+            messages = [self._format_feedback_row(r, now_ts=now_s, for_admin=False) for r in rows]
+            replied_count = sum(1 for m in messages if m["status"] == "REPLIED")
+            return {
+                "messages": messages,
+                "can_submit": cooldown_rem == 0,
+                "cooldown_remaining_sec": cooldown_rem,
+                "next_submit_at_ts": next_submit_at_ts,
+                "cooldown_seconds": FEEDBACK_SUBMIT_COOLDOWN_SECONDS,
+                "delete_min_age_seconds": FEEDBACK_USER_DELETE_MIN_AGE_SECONDS,
+                "total_count": len(messages),
+                "replied_count": replied_count,
+            }
+        finally:
+            conn.close()
+
+    def submit_user_feedback(
+        self,
+        user_id: int,
+        title: str,
+        content: str,
+        category: str = "问题反馈",
+        now_ts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        clean_content = (content or "").strip()
+        clean_title = (title or "").strip()[:120]
+        clean_category = (category or "问题反馈").strip()[:32] or "问题反馈"
+        if len(clean_content) < 2:
+            return {"ok": False, "message": "请详细描述您的问题（至少 2 个字符）"}
+        if len(clean_content) > 2000:
+            return {"ok": False, "message": "留言内容请控制在 2000 字以内"}
+
+        now_s = int(now_ts if now_ts is not None else time.time())
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_s))
+
+        conn = self._connect(isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            u_row = cur.execute("SELECT id, username, is_active FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not u_row or not bool(u_row["is_active"]):
+                conn.rollback()
+                return {"ok": False, "message": "用户不存在或已被禁用"}
+
+            # Atomic 24-hour rate-limit check across ALL submissions (cannot bypass by deleting)
+            last_row = cur.execute(
+                "SELECT MAX(created_at_ts) AS last_ts FROM user_feedback_messages WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            last_ts = int(last_row["last_ts"] or 0) if last_row else 0
+            if last_ts > 0 and (now_s - last_ts) < FEEDBACK_SUBMIT_COOLDOWN_SECONDS:
+                remaining = FEEDBACK_SUBMIT_COOLDOWN_SECONDS - (now_s - last_ts)
+                conn.rollback()
+                return {
+                    "ok": False,
+                    "message": f"每位用户 24 小时内仅可提交一次问题留言，距离下次提交还剩 {_format_duration_cn(remaining)}",
+                    "cooldown_remaining_sec": remaining,
+                }
+
+            cur.execute(
+                """INSERT INTO user_feedback_messages
+                   (user_id, username, category, title, content, status,
+                    admin_reply, replied_by, replied_at, replied_at_ts,
+                    created_at, created_at_ts, user_deleted, user_deleted_at, admin_deleted, admin_deleted_at)
+                   VALUES (?, ?, ?, ?, ?, 'OPEN', '', '', '', 0, ?, ?, 0, 0, 0, 0)""",
+                (user_id, u_row["username"], clean_category, clean_title, clean_content, now_str, now_s),
+            )
+            msg_id = cur.lastrowid
+            new_row = cur.execute("SELECT * FROM user_feedback_messages WHERE id = ?", (msg_id,)).fetchone()
+            conn.commit()
+            return {
+                "ok": True,
+                "message": "问题留言已提交成功！管理员将在后台查看并为您回复（24小时内仅可提交一次）",
+                "item": self._format_feedback_row(new_row, now_ts=now_s, for_admin=False),
+                "feedback": self.list_user_feedback(user_id, now_ts=now_s),
+            }
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def delete_user_feedback(
+        self,
+        user_id: int,
+        message_id: int,
+        now_ts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        now_s = int(now_ts if now_ts is not None else time.time())
+        conn = self._connect(isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            row = cur.execute(
+                "SELECT * FROM user_feedback_messages WHERE id = ? AND user_id = ? AND user_deleted = 0",
+                (message_id, user_id),
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                return {"ok": False, "message": "该条留言记录不存在或已被删除"}
+
+            created_ts = int(row["created_at_ts"] or 0)
+            age_sec = max(0, now_s - created_ts)
+            if age_sec < FEEDBACK_USER_DELETE_MIN_AGE_SECONDS:
+                remaining = FEEDBACK_USER_DELETE_MIN_AGE_SECONDS - age_sec
+                conn.rollback()
+                return {
+                    "ok": False,
+                    "message": f"留言提交满 24 小时后才可删除记录，还需等待 {_format_duration_cn(remaining)}",
+                    "delete_unlock_remaining_sec": remaining,
+                }
+
+            # Soft-delete ONLY on user side; admin copy remains intact until admin explicitly deletes it
+            cur.execute(
+                "UPDATE user_feedback_messages SET user_deleted = 1, user_deleted_at = ? WHERE id = ? AND user_id = ?",
+                (now_s, message_id, user_id),
+            )
+            conn.commit()
+            return {
+                "ok": True,
+                "message": "已删除您侧的该条留言记录（管理员后台留存记录需由管理员自行处理）",
+                "feedback": self.list_user_feedback(user_id, now_ts=now_s),
+            }
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def admin_list_feedback(
+        self,
+        status_filter: str = "ALL",
+        search: str = "",
+        limit: int = 200,
+        now_ts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        now_s = int(now_ts if now_ts is not None else time.time())
+        st = (status_filter or "ALL").strip().upper()
+        q = (search or "").strip()
+        lim = max(1, min(500, int(limit)))
+
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            agg = conn.execute(
+                """SELECT
+                       COUNT(*) AS total_cnt,
+                       SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_cnt,
+                       SUM(CASE WHEN status = 'REPLIED' THEN 1 ELSE 0 END) AS replied_cnt
+                   FROM user_feedback_messages
+                   WHERE admin_deleted = 0"""
+            ).fetchone()
+
+            clauses = ["admin_deleted = 0"]
+            params: List[Any] = []
+            if st in ("OPEN", "REPLIED"):
+                clauses.append("status = ?")
+                params.append(st)
+            if q:
+                like = f"%{q}%"
+                clauses.append("(username LIKE ? OR title LIKE ? OR content LIKE ? OR category LIKE ? OR admin_reply LIKE ?)")
+                params.extend([like, like, like, like, like])
+            params.append(lim)
+
+            sql = f"""SELECT * FROM user_feedback_messages
+                      WHERE {' AND '.join(clauses)}
+                      ORDER BY created_at_ts DESC, id DESC
+                      LIMIT ?"""
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return {
+                "messages": [self._format_feedback_row(r, now_ts=now_s, for_admin=True) for r in rows],
+                "total_count": int(agg["total_cnt"] or 0) if agg else 0,
+                "open_count": int(agg["open_cnt"] or 0) if agg else 0,
+                "replied_count": int(agg["replied_cnt"] or 0) if agg else 0,
+            }
+        finally:
+            conn.close()
+
+    def admin_reply_feedback(
+        self,
+        admin_username: str,
+        message_id: int,
+        reply: str,
+        now_ts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        clean_reply = (reply or "").strip()
+        if not clean_reply:
+            return {"ok": False, "message": "回复内容不能为空"}
+        if len(clean_reply) > 2000:
+            return {"ok": False, "message": "回复内容请控制在 2000 字以内"}
+
+        now_s = int(now_ts if now_ts is not None else time.time())
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_s))
+
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT * FROM user_feedback_messages WHERE id = ? AND admin_deleted = 0",
+                (message_id,),
+            ).fetchone()
+            if not row:
+                return {"ok": False, "message": "该条用户留言不存在或已被管理员删除"}
+
+            conn.execute(
+                """UPDATE user_feedback_messages
+                   SET status = 'REPLIED', admin_reply = ?, replied_by = ?, replied_at = ?, replied_at_ts = ?
+                   WHERE id = ? AND admin_deleted = 0""",
+                (clean_reply, admin_username or "admin", now_str, now_s, message_id),
+            )
+            conn.commit()
+            updated = conn.execute("SELECT * FROM user_feedback_messages WHERE id = ?", (message_id,)).fetchone()
+            return {
+                "ok": True,
+                "message": f"已回复用户【{row['username']}】的问题留言",
+                "item": self._format_feedback_row(updated, now_ts=now_s, for_admin=True),
+            }
+        finally:
+            conn.close()
+
+    def admin_delete_feedback(
+        self,
+        message_id: int,
+        now_ts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        now_s = int(now_ts if now_ts is not None else time.time())
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT id, username FROM user_feedback_messages WHERE id = ? AND admin_deleted = 0",
+                (message_id,),
+            ).fetchone()
+            if not row:
+                return {"ok": False, "message": "该条留言记录不存在或已被删除"}
+            conn.execute(
+                "UPDATE user_feedback_messages SET admin_deleted = 1, admin_deleted_at = ? WHERE id = ?",
+                (now_s, message_id),
+            )
+            conn.commit()
+            return {
+                "ok": True,
+                "message": f"已从后台删除用户【{row['username']}】的留言记录 #{message_id}",
+            }
+        finally:
+            conn.close()
+
     def _is_default_admin_password_in_use(self) -> bool:
         if self._default_admin_pwd_cached is not None:
             return self._default_admin_pwd_cached
@@ -1426,8 +1780,18 @@ class UserMembershipManager:
                        SUM(CASE WHEN status = 'UNUSED' THEN 1 ELSE 0 END) AS unused_codes
                    FROM vip_codes"""
             ).fetchone()
+            fb_agg = conn.execute(
+                """SELECT
+                       COUNT(*) AS total_fb,
+                       SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_fb,
+                       SUM(CASE WHEN status = 'REPLIED' THEN 1 ELSE 0 END) AS replied_fb
+                   FROM user_feedback_messages
+                   WHERE admin_deleted = 0"""
+            ).fetchone()
         finally:
             conn.close()
+
+        feedback_data = self.admin_list_feedback(limit=200)
 
         return {
             "stats": {
@@ -1443,6 +1807,9 @@ class UserMembershipManager:
                 "unused_codes_count": int(code_agg[1] or 0),
                 "total_codes_count": int(code_agg[0] or 0),
                 "active_live_engines_count": sum(1 for v in rt_map.values() if v.get("trading_active")),
+                "total_feedback_count": int(fb_agg[0] or 0) if fb_agg else 0,
+                "open_feedback_count": int(fb_agg[1] or 0) if fb_agg else 0,
+                "replied_feedback_count": int(fb_agg[2] or 0) if fb_agg else 0,
             },
             "security_warnings": {
                 "default_admin_password_in_use": self._is_default_admin_password_in_use(),
@@ -1451,6 +1818,7 @@ class UserMembershipManager:
             "orders": orders,
             "vip_codes": codes,
             "plans": plans,
+            "feedback_messages": feedback_data["messages"],
             "payment_info": self.get_payment_metadata(),
         }
 
