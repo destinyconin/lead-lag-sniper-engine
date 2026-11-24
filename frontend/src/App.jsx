@@ -325,6 +325,23 @@ const EXCHANGE_SELECT_OPTIONS = [
 
 const TRADITIONAL_BROKER_IDS = new Set(['futu', 'moomoo', 'ibkr', 'schwab']);
 
+const isUsdEquityItem = (symbol, exchangeId) => {
+  const ex = String(exchangeId || '').toLowerCase();
+  const s = String(symbol || '').toUpperCase();
+  return TRADITIONAL_BROKER_IDS.has(ex) || s.endsWith('/USD') || s.startsWith('US.');
+};
+
+const formatBrokerNativeSymbol = (symbol, exchangeId) => {
+  const ex = String(exchangeId || 'okx').toLowerCase();
+  const raw = String(symbol || '').toUpperCase();
+  const base = raw.replace(/^US\./, '').split(':')[0].split('/')[0];
+  const normBase = base === 'BRKB' ? 'BRK.B' : base;
+  if (ex === 'futu' || ex === 'moomoo') return `US.${normBase}`;
+  if (ex === 'ibkr' || ex === 'schwab') return normBase;
+  if (ex === 'okx') return `${base}-USDT-SWAP`;
+  return raw;
+};
+
 const isGridStrategyType = (st) =>
   st === 'LONG_SHORT_GRID' || st === 'REVERSE_GRID' || st === 'TREND_GRID' || st === 'ADAPTIVE_GRID';
 
@@ -1328,13 +1345,15 @@ export default function App() {
       const defaultStrat = vRes.recommended_strategy_type || 'LEAD_LAG';
       const defaultOrderUsdt = Number(vRes.recommended_order_usdt) > 0 ? Number(vRes.recommended_order_usdt) : 300;
       const targetExId = vRes.recommended_exchange_id || effExId || 'okx';
+      const defaultLeverage = Number(vRes.recommended_leverage) > 0 ? Number(vRes.recommended_leverage) : 5;
+      const defaultGridSide = vRes.recommended_grid_side_mode || 'LONG_SHORT';
       const newCfg = {
         symbol: vRes.symbol,
         exchange_id: targetExId,
         strategy_type: defaultStrat,
-        direction: 'BOTH',
+        direction: defaultGridSide === 'LONG_ONLY' ? 'LONG_ONLY' : 'BOTH',
         order_usdt: defaultOrderUsdt,
-        leverage: 5,
+        leverage: defaultLeverage,
         window_ms: 150,
         min_jump_pct: 0.006,
         adaptive_z_score: 3.0,
@@ -1357,7 +1376,7 @@ export default function App() {
         min_qty: vRes.recommended_precision?.min_qty ?? 0.1,
         qty_precision: Math.min(12, Math.max(0, Number(vRes.recommended_precision?.qty_precision ?? 2))),
         price_precision: Math.min(12, Math.max(0, Number(vRes.recommended_precision?.price_precision ?? 4))),
-        grid_side_mode: 'LONG_SHORT',
+        grid_side_mode: defaultGridSide,
         grid_levels: 3,
         grid_step_pct: 0.008,
         grid_take_profit_pct: 0.0085,
@@ -1836,10 +1855,12 @@ export default function App() {
         !Array.isArray(item.exchanges) ||
         item.exchanges.includes(selectedExchangeFilter);
       const q = searchQuery.trim().toUpperCase();
+      const brokerCodesStr = item.broker_codes ? Object.values(item.broker_codes).join(' ').toUpperCase() : '';
       const matchesQuery =
         !q ||
         item.symbol.includes(q) ||
         item.base.includes(q) ||
+        brokerCodesStr.includes(q) ||
         (item.name_cn && item.name_cn.toUpperCase().includes(q));
       return matchesSector && matchesExchange && matchesQuery && !monitoredSet.has(item.symbol);
     });
@@ -4602,7 +4623,7 @@ export default function App() {
                         onKeyDown={(e) => {
                           if (e.key === 'Enter') handleAddSymbolByCode(searchQuery);
                         }}
-                        placeholder="搜索加密或标普500标的 (如 SPY / SPX / AAPL / NVDA / SUI)..."
+                        placeholder="搜索加密(BTC/SUI)或美股(US.NVDA/SPY/BRK.B)..."
                         className="w-full rounded-full surface-subtle pl-10 pr-4 py-2.5 text-base sm:text-xs font-mono text-main outline-none"
                       />
                     </div>
@@ -4666,6 +4687,11 @@ export default function App() {
                           symPositions.length > 0 ||
                           gridOpenCnt > 0 ||
                           snapshot?.telemetry?.[item.symbol]?.state === 'HOLDING';
+                        const itemIsUsdEquity = isUsdEquityItem(item.symbol, item.exchange_id);
+                        const itemNativeSym = formatBrokerNativeSymbol(item.symbol, item.exchange_id);
+                        const itemAssetType =
+                          snapshot?.telemetry?.[item.symbol]?.asset_type ||
+                          (itemIsUsdEquity ? 'US_STOCK' : 'CRYPTO_PERP');
                         return (
                           <div
                             key={item.symbol}
@@ -4677,8 +4703,27 @@ export default function App() {
                             }`}
                           >
                             <div className="min-w-0">
-                              <div className="flex items-center gap-1.5">
-                                <span className="font-mono font-bold text-sm truncate">{item.symbol}</span>
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="font-mono font-bold text-sm truncate">
+                                  {itemIsUsdEquity ? itemNativeSym : item.symbol}
+                                </span>
+                                <span
+                                  className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
+                                    itemIsUsdEquity
+                                      ? active
+                                        ? 'bg-indigo-400/25 text-indigo-100'
+                                        : 'bg-indigo-500/15 text-indigo-700 dark:text-indigo-300'
+                                      : itemAssetType === 'STOCK_PERP'
+                                      ? active
+                                        ? 'bg-teal-400/25 text-teal-100'
+                                        : 'bg-teal-500/15 text-teal-700 dark:text-teal-300'
+                                      : active
+                                      ? 'bg-white/15 text-white/90'
+                                      : 'bg-slate-500/12 text-sub'
+                                  }`}
+                                >
+                                  {itemIsUsdEquity ? '美股·USD' : itemAssetType === 'STOCK_PERP' ? '美股永续·USDT' : '加密·USDT'}
+                                </span>
                                 <span
                                   className={`px-1.5 py-0.5 rounded-full text-[10px] font-semibold shrink-0 ${
                                     active
@@ -4701,8 +4746,12 @@ export default function App() {
                               </div>
                               <div className={`text-[11px] mt-0.5 truncate ${active ? 'text-white/75' : 'text-dim'}`}>
                                 {isGrid
-                                  ? `${GRID_MODE_LABEL_MAP[item.grid_side_mode || 'LONG_SHORT']} · ${item.grid_levels ?? 3}层 · ${item.order_usdt}U`
-                                  : `${DIRECTION_LABEL_MAP[item.direction]} · ${item.order_usdt}U · ${item.leverage}x`}
+                                  ? `${GRID_MODE_LABEL_MAP[item.grid_side_mode || 'LONG_SHORT']} · ${item.grid_levels ?? 3}层 · ${
+                                      itemIsUsdEquity ? `$${item.order_usdt} USD` : `${item.order_usdt}U`
+                                    }`
+                                  : `${DIRECTION_LABEL_MAP[item.direction]} · ${
+                                      itemIsUsdEquity ? `$${item.order_usdt} USD` : `${item.order_usdt}U`
+                                    } · ${item.leverage}x`}
                               </div>
                             </div>
                             <div className="flex items-center gap-1.5 shrink-0">
@@ -4768,26 +4817,45 @@ export default function App() {
                       </button>
                     </div>
                     <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
-                      {filteredCatalog.slice(0, 18).map((item) => (
-                        <button
-                          key={item.symbol}
-                          onClick={() => handleAddSymbolByCode(item.symbol)}
-                          title={item.name_cn ? `${item.base} (${item.name_cn})` : item.symbol}
-                          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full hover:opacity-80 text-xs font-mono transition ${
-                            item.sector === '标普500'
-                              ? 'bg-indigo-500/12 border border-indigo-500/25 text-indigo-700 dark:text-indigo-300'
-                              : 'surface-subtle text-main'
-                          }`}
-                        >
-                          <Plus className="w-3 h-3 shrink-0" strokeWidth={2} />
-                          <span className="font-bold">{item.base}</span>
-                          {item.name_cn && (
-                            <span className="text-[10px] font-sans opacity-80">
-                              {item.name_cn.split(' ')[0]}
+                      {filteredCatalog.slice(0, 18).map((item) => {
+                        const isUsStock = item.asset_type === 'US_STOCK';
+                        const isStockPerp = item.asset_type === 'STOCK_PERP';
+                        const chipCode =
+                          isUsStock && (selectedExchangeFilter === 'futu' || selectedExchangeFilter === 'moomoo')
+                            ? item.broker_codes?.[selectedExchangeFilter] || `US.${item.base}`
+                            : item.base;
+                        return (
+                          <button
+                            key={`${item.asset_type || 'c'}-${item.symbol}`}
+                            onClick={() => handleAddSymbolByCode(item.symbol)}
+                            title={
+                              isUsStock
+                                ? `美股正股 (USD) · ${chipCode} ${item.name_cn || ''}`
+                                : isStockPerp
+                                ? `美股永续合约 (USDT) · ${item.symbol} ${item.name_cn || ''}`
+                                : `加密永续合约 (USDT) · ${item.symbol}`
+                            }
+                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full hover:opacity-80 text-xs font-mono transition ${
+                              isUsStock
+                                ? 'bg-indigo-500/12 border border-indigo-500/25 text-indigo-700 dark:text-indigo-300'
+                                : isStockPerp
+                                ? 'bg-teal-500/12 border border-teal-500/25 text-teal-700 dark:text-teal-300'
+                                : 'surface-subtle text-main'
+                            }`}
+                          >
+                            <Plus className="w-3 h-3 shrink-0" strokeWidth={2} />
+                            <span className="font-bold">{chipCode}</span>
+                            {item.name_cn && (
+                              <span className="text-[10px] font-sans opacity-80">
+                                {item.name_cn.split(' ')[0]}
+                              </span>
+                            )}
+                            <span className="text-[9px] font-sans px-1 py-0.2 rounded bg-black/5 dark:bg-white/10">
+                              {isUsStock ? '美股·USD' : isStockPerp ? '永续·U' : '币·U'}
                             </span>
-                          )}
-                        </button>
-                      ))}
+                          </button>
+                        );
+                      })}
                     </div>
                   </div>
                 </div>
@@ -4795,17 +4863,46 @@ export default function App() {
 
               {/* Right Detail Area: Selected Contract Strategy & Parameter Editor */}
               <div className="lg:col-span-8 p-4 sm:p-6 lg:p-7 flex flex-col justify-between">
-                {currentStrategy && currentStrategy.symbol ? (
+                {currentStrategy && currentStrategy.symbol ? (() => {
+                  const curIsUsdEquity = isUsdEquityItem(currentStrategy.symbol, currentStrategy.exchange_id);
+                  const curNativeCode = formatBrokerNativeSymbol(currentStrategy.symbol, currentStrategy.exchange_id);
+                  const curQuoteCcy = curIsUsdEquity ? 'USD' : 'USDT';
+                  const curTelRef = snapshot?.telemetry?.[currentStrategy.symbol] || {};
+                  const curAssetType =
+                    curTelRef.asset_type || (curIsUsdEquity ? 'US_STOCK' : 'CRYPTO_PERP');
+                  const curRefMid = Number(curTelRef.follower_mid || 0);
+                  const estUsShares =
+                    curIsUsdEquity && curRefMid > 0
+                      ? Number(currentStrategy.order_usdt || 0) / curRefMid
+                      : 0;
+                  return (
                   <div className="space-y-5 sm:space-y-6">
                     <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center sm:justify-between gap-3.5 sm:gap-4 pb-4 sm:pb-5 border-b border-line">
                       <div className="flex items-center gap-3 sm:gap-3.5 min-w-0">
                         <div className="icon-box w-10 h-10 sm:w-12 sm:h-12 font-mono font-bold text-xs sm:text-sm text-main">
-                          {currentStrategy.symbol.split('/')[0]}
+                          {currentStrategy.symbol.replace(/^US\./, '').split('/')[0]}
                         </div>
                         <div className="min-w-0">
-                          <h3 className="text-base sm:text-lg font-bold font-mono text-main truncate">
-                            {currentStrategy.symbol}
-                          </h3>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <h3 className="text-base sm:text-lg font-bold font-mono text-main truncate">
+                              {curIsUsdEquity ? curNativeCode : currentStrategy.symbol}
+                            </h3>
+                            <span
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                curIsUsdEquity
+                                  ? 'bg-indigo-500/15 text-indigo-700 dark:text-indigo-300'
+                                  : curAssetType === 'STOCK_PERP'
+                                  ? 'bg-teal-500/15 text-teal-700 dark:text-teal-300'
+                                  : 'surface-subtle text-sub'
+                              }`}
+                            >
+                              {curIsUsdEquity
+                                ? `美股正股 · ${curQuoteCcy} (${currentStrategy.symbol})`
+                                : curAssetType === 'STOCK_PERP'
+                                ? `美股永续合约 · ${curQuoteCcy} (${curNativeCode})`
+                                : `加密永续合约 · ${curQuoteCcy}`}
+                            </span>
+                          </div>
                           <p className="text-xs text-dim mt-0.5 leading-snug">
                             {currentStrategy.strategy_type === 'TREND_GRID'
                               ? '顺势突破网格 · 涨破死区/布林带上轨追多、跌破下轨追空，递减金字塔重底仓 + 利弗莫尔保本上移止损 + 移动追踪止盈'
@@ -4881,6 +4978,33 @@ export default function App() {
                         </button>
                       </div>
                     </div>
+
+                    {/* Traditional Broker USD Equity Notice Banner */}
+                    {curIsUsdEquity && (
+                      <div className="surface-subtle p-3.5 rounded-2xl border border-indigo-500/25 text-xs space-y-1.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="font-bold text-indigo-700 dark:text-indigo-300">
+                            传统美股券商通道 · {EXCHANGE_SHORT_LABEL_MAP[currentStrategy.exchange_id] || currentStrategy.exchange_id?.toUpperCase()} · 官方代码 <span className="font-mono">{curNativeCode}</span>（美元 USD 结算）
+                          </span>
+                          {curRefMid > 0 && (
+                            <span
+                              className={`font-mono font-semibold text-[11px] px-2 py-0.5 rounded-full ${
+                                estUsShares >= 1
+                                  ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-400'
+                                  : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                              }`}
+                            >
+                              单笔约 {estUsShares >= 1 ? `${Math.floor(estUsShares)} 股` : `${estUsShares.toFixed(2)} 股 (不足1股)`}
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-sub leading-relaxed">
+                          • 官方协议说明：富途/moomoo 使用 <span className="font-mono">US.{currentStrategy.symbol.split('/')[0]}</span>，IBKR 须按 <span className="font-mono">conid</span> 下单，Schwab 仅支持整数股（<span className="font-mono">EQUITY</span>）；现金账户建议设 1x 与「仅做多网格」。
+                          <br />
+                          • 实盘通道隔离：当前传统券商通道支持<strong>影子模拟回测与网关连通验证</strong>；实盘模式下引擎会严格隔离拦截，<strong>绝不会误发往 OKX 执行</strong>。
+                        </div>
+                      </div>
+                    )}
 
                     {/* Per-Symbol Strategy Type Selector (5 Strategies incl. Reverse Oscillating Grid, Trend & Adaptive Dual-Mode) */}
                     <div className="surface-subtle p-3.5 sm:p-4 flex flex-col gap-3">
@@ -5049,10 +5173,10 @@ export default function App() {
                           <div>
                             <label className="font-bold text-main block mb-2">
                               {isTrendGrid
-                                ? '单格基准名义金额 (USDT · 递减分配)'
+                                ? `单格基准名义金额 (${curQuoteCcy} · 递减分配)`
                                 : isAdaptiveGrid
-                                ? '单格基准名义金额 (USDT)'
-                                : '每格下单名义金额 (USDT)'}
+                                ? `单格基准名义金额 (${curQuoteCcy})`
+                                : `每格下单名义金额 (${curQuoteCcy})`}
                             </label>
                             <input
                               type="number"
@@ -5060,13 +5184,20 @@ export default function App() {
                               onChange={(e) => updateCurrentStrategyField({ order_usdt: Number(e.target.value) })}
                               className="input-field font-mono"
                             />
+                            {curIsUsdEquity && curRefMid > 0 && estUsShares < 1 && (
+                              <div className="text-[10px] text-amber-600 dark:text-amber-300 mt-1 leading-snug">
+                                当前金额不足 1 股（参考价 ${curRefMid.toFixed(2)} USD），建议设为 ≥ ${Math.ceil(curRefMid)} USD
+                              </div>
+                            )}
                           </div>
 
                           <div>
-                            <label className="font-bold text-main block mb-2">合约杠杆倍数</label>
+                            <label className="font-bold text-main block mb-2">
+                              {curIsUsdEquity ? '账户倍数 (美股现金默认 1x)' : '合约杠杆倍数'}
+                            </label>
                             <input
                               type="number"
-                              value={currentStrategy.leverage ?? 5}
+                              value={currentStrategy.leverage ?? (curIsUsdEquity ? 1 : 5)}
                               onChange={(e) => updateCurrentStrategyField({ leverage: Number(e.target.value) })}
                               className="input-field font-mono"
                             />
@@ -5679,7 +5810,7 @@ export default function App() {
                         {/* Lead-Lag 9 Numeric Parameters Grid */}
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 text-xs">
                           <div>
-                            <label className="font-bold text-main block mb-2">单笔名义金额 (USDT)</label>
+                            <label className="font-bold text-main block mb-2">单笔名义金额 ({curQuoteCcy})</label>
                             <input
                               type="number"
                               value={currentStrategy.order_usdt ?? 300}
@@ -5689,10 +5820,12 @@ export default function App() {
                           </div>
 
                           <div>
-                            <label className="font-bold text-main block mb-2">合约杠杆倍数</label>
+                            <label className="font-bold text-main block mb-2">
+                              {curIsUsdEquity ? '账户倍数 (美股现金默认 1x)' : '合约杠杆倍数'}
+                            </label>
                             <input
                               type="number"
-                              value={currentStrategy.leverage ?? 5}
+                              value={currentStrategy.leverage ?? (curIsUsdEquity ? 1 : 5)}
                               onChange={(e) => updateCurrentStrategyField({ leverage: Number(e.target.value) })}
                               className="input-field font-mono"
                             />
@@ -5837,7 +5970,8 @@ export default function App() {
                       </>
                     )}
                   </div>
-                ) : (
+                  );
+                })() : (
                   <div className="h-full flex flex-col items-center justify-center text-center py-20">
                     <div className="icon-box w-16 h-16 mb-3">
                       <Sliders className="w-7 h-7" strokeWidth={1.6} />
@@ -6019,11 +6153,15 @@ export default function App() {
                         <div className="min-w-0">
                           <div className="flex flex-wrap items-center gap-2">
                             <span className="font-bold text-base text-main">{ex.display_name}</span>
-                            {isTradBroker && (
+                            {isTradBroker ? (
                               <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-500/15 text-indigo-600 dark:text-indigo-300">
-                                传统券商 · 标普500
+                                传统券商 · USD 美股（仅验证/模拟）
                               </span>
-                            )}
+                            ) : ex.exchange_id === 'okx' ? (
+                              <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-700 dark:text-emerald-400">
+                                支持实盘执行 · USDT
+                              </span>
+                            ) : null}
                             <span
                               className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${
                                 isVerified

@@ -21,13 +21,15 @@ import orjson
 import websockets
 from backend.market_gateway import (
     get_binance_instrument_spec,
+    get_default_base_price,
     get_okx_instrument_spec,
     get_system_proxy,
     okx_inst_id_to_unified,
+    to_broker_native_symbol,
     to_okx_inst_id,
 )
 from backend.math_engine import SymbolMathState, mono_ms
-from backend.models import GlobalRiskConfig, SymbolStrategy
+from backend.models import GlobalRiskConfig, SymbolStrategy, is_traditional_broker, is_usd_equity_symbol
 
 
 OKX_ERROR_MAP = {
@@ -1055,7 +1057,7 @@ class ExecutionAdapter:
                             return {
                                 "ok": True,
                                 "auth_status": "VERIFIED",
-                                "auth_message": f"已连通 {b_label} OpenD 守护进程 ({api_key}) · pwdMD5={pwd_md5[:6] if pwd_md5 else '已就绪'}***",
+                                "auth_message": f"已连通 {b_label} OpenD 守护进程 ({api_key}) · pwdMD5={pwd_md5[:6] if pwd_md5 else '已就绪'}***（USD 美股 · 仅验证与影子模拟）",
                                 "account_equity_usdt": 0.0,
                             }
                         except Exception as e:
@@ -1192,7 +1194,7 @@ class ExecutionAdapter:
             return {
                 "ok": True,
                 "auth_status": "VERIFIED",
-                "auth_message": f"已配置且验证通过 ({b_label}{acct_tag} · 支持标普500指数/ETF及美股成分股交易)",
+                "auth_message": f"凭证格式已校验 ({b_label}{acct_tag} · USD 美股/标普500 · 当前支持影子模拟与网关校验，实盘发单自动隔离防误发 OKX)",
                 "account_equity_usdt": 0.0,
             }
 
@@ -2726,12 +2728,20 @@ class ExecutionAdapter:
         m_state = self._get_math_state(cfg.symbol)
         f_book = m_state.latest_follower if m_state else None
         risk = self._get_risk_cfg()
-        creds = self._extract_okx_creds(eff_ex_cfg) if risk.trading_mode == "LIVE" else None
+        sym_ex_id = str(getattr(cfg, "exchange_id", "okx") or "okx").strip().lower()
+        ex_id_eff = str((eff_ex_cfg or {}).get("exchange_id", sym_ex_id) or sym_ex_id).strip().lower()
+        is_non_okx_route = is_usd_equity_symbol(cfg.symbol, sym_ex_id) or sym_ex_id != "okx" or ex_id_eff != "okx"
+        creds = (
+            self._extract_okx_creds(eff_ex_cfg)
+            if (risk.trading_mode == "LIVE" and not is_non_okx_route)
+            else None
+        )
 
-        # Never fabricate fake LIVE fills for non-OKX exchanges
+        # Never fabricate fake LIVE fills or mis-route non-OKX / US equity orders to OKX
         if risk.trading_mode == "LIVE" and not creds:
             fallback_px = (f_book.bid if side == "LONG" else f_book.ask) if f_book else tp_price
-            ex_id = (eff_ex_cfg or {}).get("exchange_id", "unknown")
+            target_ex = sym_ex_id if sym_ex_id != "okx" else ex_id_eff
+            native_sym = to_broker_native_symbol(cfg.symbol, target_ex)
             return OrderResult(
                 order_id=f"exit-unsupported-{uuid.uuid4().hex[:8]}",
                 status="UNCERTAIN",
@@ -2739,7 +2749,7 @@ class ExecutionAdapter:
                 avg_price=fallback_px,
                 latency_ms=round(mono_ms() - t0, 2),
                 is_maker=False,
-                raw_msg=f"实盘平仓拦截：交易所 {ex_id} 未配置有效 OKX 实盘执行通道",
+                raw_msg=f"实盘通道隔离拦截：{cfg.symbol} 绑定至 {target_ex.upper()} ({native_sym})，未对接该券商实盘平仓接口（严禁误发 OKX）",
             )
 
         # LIVE OKX real exit orchestration
@@ -3483,7 +3493,21 @@ class ExecutionAdapter:
         """
         Real OKX V5 signed REST IOC order placement + dynamic ctVal/tickSz quantization + fill reconciliation.
         """
-        ex_id = exchange_cfg.get("exchange_id", "okx")
+        ex_id = str(exchange_cfg.get("exchange_id", "okx") or "okx").strip().lower()
+        sym_ex_id = str(getattr(cfg, "exchange_id", ex_id) or ex_id).strip().lower()
+        if is_usd_equity_symbol(cfg.symbol, sym_ex_id) or sym_ex_id != "okx" or ex_id != "okx":
+            target_ex = sym_ex_id if sym_ex_id != "okx" else ex_id
+            native_sym = to_broker_native_symbol(cfg.symbol, target_ex)
+            return OrderResult(
+                order_id=order_id,
+                status="MISSED",
+                filled_qty=0.0,
+                avg_price=0.0,
+                latency_ms=round(mono_ms() - t0, 2),
+                is_maker=False,
+                raw_msg=f"实盘通道隔离拦截：{cfg.symbol} 绑定至 {target_ex.upper()} ({native_sym})，暂未对接真实实盘下单接口（严禁误发往 OKX）",
+            )
+
         creds = self._extract_okx_creds(exchange_cfg) if ex_id == "okx" else None
 
         if ex_id == "okx":
@@ -3730,6 +3754,7 @@ class ExecutionAdapter:
         strategies: List[SymbolStrategy],
         math_states: Dict[str, SymbolMathState],
         gateway: Optional[Any] = None,
+        all_exchanges: Optional[Dict[str, dict]] = None,
     ) -> dict:
         """
         Read-only pre-flight feasibility check for OKX LIVE trading.
@@ -3799,8 +3824,8 @@ class ExecutionAdapter:
             if not cfg.is_running:
                 continue
             sym_ex_id = str(getattr(cfg, "exchange_id", "okx") or "okx").lower()
-            is_trad_broker = sym_ex_id in ("futu", "moomoo", "ibkr", "schwab")
-            inst_id = cfg.symbol.split("/")[0] if is_trad_broker else to_okx_inst_id(cfg.symbol)
+            is_trad_broker = is_usd_equity_symbol(cfg.symbol, sym_ex_id)
+            inst_id = to_broker_native_symbol(cfg.symbol, sym_ex_id) if is_trad_broker else to_okx_inst_id(cfg.symbol)
             okx_spec = get_okx_instrument_spec(cfg.symbol) or resolve_okx_spec(cfg.symbol)
             bn_spec = get_binance_instrument_spec(cfg.symbol)
             m_state = math_states.get(cfg.symbol)
@@ -3824,15 +3849,32 @@ class ExecutionAdapter:
                 lot_sz = 1.0
                 min_sz = 1.0
                 tick_sz = 0.01
-                okx_state = f"{sym_ex_id.upper()}_READY"
-                bn_status = "US_EQUITY"
-                min_notional = round(f_px * 0.01, 2) if f_px > 0 else 1.0
-                est_shares = round(cfg.order_usdt / max(1e-9, f_px), max(2, int(cfg.qty_precision))) if f_px > 0 else 0.0
+                broker_cfg = (all_exchanges or {}).get(sym_ex_id) or {}
+                broker_verified = broker_cfg.get("auth_status") == "VERIFIED"
+                okx_state = f"{sym_ex_id.upper()}_{'VERIFIED' if broker_verified else 'SHADOW_ONLY'}"
+                bn_status = "US_EQUITY_USD"
+                min_notional = round(f_px, 2) if f_px > 0 else 1.0
+                raw_shares = (cfg.order_usdt / max(1e-9, f_px)) if f_px > 0 else 0.0
+                est_int_shares = int(math.floor(raw_shares)) if raw_shares > 0 else 0
+                trad_warns: List[str] = [
+                    f"美股通道隔离（{sym_ex_id.upper()} 官方代码: {inst_id} · USD 计价）：当前支持影子模拟与网关验证，实盘发单已自动拦截防误发 OKX"
+                ]
+                if f_px > 0 and cfg.order_usdt < f_px:
+                    trad_warns.append(
+                        f"单笔金额 ${cfg.order_usdt:.2f} USD 不足 1 股（参考价 ${f_px:.2f} USD），官方整数股接口建议 ≥ ${math.ceil(f_px)} USD"
+                    )
+                if getattr(cfg, "grid_side_mode", "LONG_ONLY") != "LONG_ONLY":
+                    trad_warns.append("美股做空需融资融券账户与可借券源，现金账户建议设为「仅做多网格」")
+                if all_exchanges is not None and not broker_verified:
+                    trad_warns.append(f"{sym_ex_id.upper()} 尚未完成网关验证（当前状态: {broker_cfg.get('auth_status', 'UNCONFIGURED')}）")
                 symbol_reports.append({
                     "symbol": cfg.symbol,
                     "exchange_id": sym_ex_id,
+                    "asset_type": "US_STOCK",
+                    "quote_ccy": "USD",
                     "instId": inst_id,
                     "is_running": bool(cfg.is_running),
+                    "live_execution_supported": False,
                     "okx_state": okx_state,
                     "binance_status": bn_status,
                     "has_leader_bbo": True,
@@ -3842,11 +3884,11 @@ class ExecutionAdapter:
                     "minSz": min_sz,
                     "tickSz": tick_sz,
                     "min_notional_usdt": min_notional,
-                    "planned_sz": f"{est_shares:g}",
-                    "planned_base_qty": est_shares,
+                    "planned_sz": f"{est_int_shares} 股" if est_int_shares >= 1 else f"{raw_shares:.2f} 股(不足1股)",
+                    "planned_base_qty": float(est_int_shares),
                     "ready": True,
                     "issues": [],
-                    "warnings": [],
+                    "warnings": trad_warns,
                 })
                 continue
 

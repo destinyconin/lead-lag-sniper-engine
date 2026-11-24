@@ -42,6 +42,13 @@ def is_traditional_broker(exchange_id: Optional[str]) -> bool:
     return str(exchange_id or "").lower() in TRADITIONAL_BROKER_IDS
 
 
+def is_usd_equity_symbol(symbol: Optional[str], exchange_id: Optional[str] = None) -> bool:
+    if is_traditional_broker(exchange_id):
+        return True
+    s = str(symbol or "").strip().upper()
+    return s.endswith("/USD") or s.startswith("US.")
+
+
 class ExchangeConfigModel(BaseModel):
     id: Optional[int] = None
     exchange_id: Literal[

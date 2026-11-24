@@ -21,13 +21,18 @@ from backend.engine_manager import EngineManager
 from backend.market_gateway import (
     BASE_PRICES,
     BINANCE_1000X_BASES,
+    CRYPTO_ONLY_SP500_BASES,
+    SP500_NON_STOCK_BASES,
     SP500_SYMBOL_NAMES,
     _BINANCE_INSTRUMENT_CACHE,
     _OKX_INSTRUMENT_CACHE,
     get_binance_instrument_spec,
     get_default_base_price,
     get_okx_instrument_spec,
+    to_broker_native_symbol,
+    to_futu_moomoo_code,
     to_okx_inst_id,
+    to_us_equity_symbol,
 )
 from backend.models import (
     ALL_EXCHANGE_IDS,
@@ -53,6 +58,7 @@ from backend.models import (
     UserFeedbackCreateRequest,
     is_grid_strategy,
     is_traditional_broker,
+    is_usd_equity_symbol,
 )
 from backend.payment_monitor import OnChainPaymentMonitor
 from backend.market_sentiment import market_sentiment_service
@@ -65,7 +71,7 @@ engine_manager = EngineManager(db_manager, get_user_fn=user_manager.get_user_by_
 payment_monitor = OnChainPaymentMonitor(user_manager)
 
 TRUSTED_PROXY_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
-SYMBOL_FORMAT_RE = re.compile(r"^[A-Z0-9]{1,20}/USDT:USDT$")
+SYMBOL_FORMAT_RE = re.compile(r"^(?:[A-Z0-9]{1,20}/USDT:USDT|[A-Z0-9]{1,12}(?:\.[A-Z0-9]{1,4})?/USD)$")
 
 
 @asynccontextmanager
@@ -209,6 +215,18 @@ SP500_ALIASES: Dict[str, str] = {
 }
 
 
+OKX_STOCK_PERP_BASES = {
+    "NVDA", "TSLA", "SNDK", "SPCX", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "COIN", "MSTR", "SP500"
+}
+
+TRADITIONAL_BROKER_LABEL_MAP: Dict[str, str] = {
+    "futu": "富途牛牛 (Futu OpenD)",
+    "moomoo": "moomoo (Moomoo OpenD)",
+    "ibkr": "IBKR 盈透证券",
+    "schwab": "Charles Schwab 嘉信理财",
+}
+
+
 def build_perp_catalog():
     catalog = []
     for sym, px in BASE_PRICES.items():
@@ -217,26 +235,71 @@ def build_perp_catalog():
         sector = SECTOR_MAP.get(base, "高弹性Meme与中小市值")
         is_sp500 = sector == "标普500"
         if is_sp500:
-            ex_list = ["futu", "moomoo", "ibkr", "schwab", "okx"]
-            if base in ("NVDA", "TSLA", "SNDK", "SPCX", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "COIN", "MSTR"):
-                ex_list = ["okx", "futu", "moomoo", "ibkr", "schwab", "bybit", "gate", "bitget"]
-        elif base in ("BTC", "ETH", "SOL"):
-            ex_list = ["binanceusdm", "okx", "bybit", "gate", "bitget", "krakenfutures", "futu", "moomoo", "ibkr", "schwab"]
+            # 1) Traditional Broker US Equity entry (USD-settled, e.g. NVDA/USD -> US.NVDA / NVDA)
+            if base not in CRYPTO_ONLY_SP500_BASES:
+                eq_ticker = "BRK.B" if base == "BRKB" else base
+                eq_sym = f"{eq_ticker}/USD"
+                catalog.append(
+                    {
+                        "symbol": eq_sym,
+                        "base": eq_ticker,
+                        "name_cn": SP500_SYMBOL_NAMES.get(base, ""),
+                        "sector": "标普500",
+                        "asset_type": "US_STOCK",
+                        "quote_ccy": "USD",
+                        "ref_price": px,
+                        "price_prec": 2,
+                        "qty_prec": 0,
+                        "min_qty": 1.0,
+                        "exchanges": ["futu", "moomoo", "ibkr", "schwab"],
+                        "broker_codes": {
+                            "futu": to_futu_moomoo_code(eq_sym),
+                            "moomoo": to_futu_moomoo_code(eq_sym),
+                            "ibkr": to_us_equity_symbol(eq_sym),
+                            "schwab": to_us_equity_symbol(eq_sym),
+                        },
+                        "is_index_or_futures": base in SP500_NON_STOCK_BASES,
+                    }
+                )
+            # 2) Crypto Exchange Stock Perpetual entry (USDT-settled, e.g. NVDA/USDT:USDT on OKX)
+            if base in OKX_STOCK_PERP_BASES:
+                crypto_ex = ["okx"] if base == "SP500" else ["okx", "bybit", "gate", "bitget"]
+                catalog.append(
+                    {
+                        "symbol": sym,
+                        "base": base,
+                        "name_cn": SP500_SYMBOL_NAMES.get(base, ""),
+                        "sector": "标普500",
+                        "asset_type": "STOCK_PERP",
+                        "quote_ccy": "USDT",
+                        "ref_price": px,
+                        "price_prec": p_prec,
+                        "qty_prec": q_prec,
+                        "min_qty": min_q,
+                        "exchanges": crypto_ex,
+                        "broker_codes": {"okx": to_okx_inst_id(sym)},
+                        "is_index_or_futures": False,
+                    }
+                )
         else:
             ex_list = ["binanceusdm", "okx", "bybit", "gate", "bitget", "krakenfutures"]
-        catalog.append(
-            {
-                "symbol": sym,
-                "base": base,
-                "name_cn": SP500_SYMBOL_NAMES.get(base, ""),
-                "sector": sector,
-                "ref_price": px,
-                "price_prec": p_prec,
-                "qty_prec": q_prec,
-                "min_qty": min_q,
-                "exchanges": ex_list,
-            }
-        )
+            catalog.append(
+                {
+                    "symbol": sym,
+                    "base": base,
+                    "name_cn": "",
+                    "sector": sector,
+                    "asset_type": "CRYPTO_PERP",
+                    "quote_ccy": "USDT",
+                    "ref_price": px,
+                    "price_prec": p_prec,
+                    "qty_prec": q_prec,
+                    "min_qty": min_q,
+                    "exchanges": ex_list,
+                    "broker_codes": {"okx": to_okx_inst_id(sym)},
+                    "is_index_or_futures": False,
+                }
+            )
     return catalog
 
 
@@ -433,7 +496,14 @@ async def verify_symbol(
     req_ex_id = (exchange_id or "").strip().lower()
     if req_ex_id in ("all", ""):
         req_ex_id = ""
-    raw = (symbol or "").strip().upper()
+    raw_orig = (symbol or "").strip().upper()
+    explicit_usd_or_us = (
+        raw_orig.startswith("US.")
+        or raw_orig.endswith("/USD")
+        or raw_orig.endswith(":USD")
+    )
+    explicit_usdt = "/USDT" in raw_orig or ":USDT" in raw_orig or raw_orig.endswith("-USDT-SWAP")
+    raw = raw_orig
     for prefix in ("US.", "HK.", "$", "^"):
         if raw.startswith(prefix):
             raw = raw[len(prefix) :]
@@ -455,23 +525,122 @@ async def verify_symbol(
     if base_clean.startswith("1000") and base_clean[4:] in BINANCE_1000X_BASES:
         base_clean = base_clean[4:]
 
-    if not base_clean or base_clean == "USDT" or not re.match(r"^[A-Z0-9]{1,20}$", base_clean):
+    if not base_clean or base_clean in ("USDT", "USD") or not re.match(r"^[A-Z0-9]{1,20}$", base_clean):
         return {
             "symbol": symbol.strip().upper() or "--",
             "verified": False,
             "in_catalog": False,
-            "error": "标的代号格式无效，请输入有效的合约或标普500股票代号（如 SPY、SPX、AAPL、NVDA、SUI、ARB）",
+            "error": "标的代号格式无效，请输入有效的合约或美股/标普500代号（如 SPY、US.NVDA、AAPL、BRK.B、BTC、SUI）",
         }
 
+    is_trad_req = is_traditional_broker(req_ex_id)
+    is_crypto_req = bool(req_ex_id) and req_ex_id in ALL_EXCHANGE_IDS and not is_trad_req
+    is_known_crypto = (f"{base_clean}/USDT:USDT" in BASE_PRICES) and (base_clean not in SP500_SYMBOL_NAMES)
+    is_sp500_sym = base_clean in SP500_SYMBOL_NAMES
+    okx_spec_probe = get_okx_instrument_spec(f"{base_clean}/USDT:USDT")
+
+    # Guard 1: Reject crypto-only coins & crypto-only SP500 alias when a traditional US broker is selected
+    if is_trad_req and base_clean in CRYPTO_ONLY_SP500_BASES:
+        broker_lbl = TRADITIONAL_BROKER_LABEL_MAP.get(req_ex_id, req_ex_id.upper())
+        return {
+            "symbol": f"{base_clean}/USD",
+            "verified": False,
+            "in_catalog": False,
+            "error": f"添加失败：{base_clean} 为加密货币交易所指数代号，{broker_lbl} 不存在该股票代码；交易标普500请改搜 ETF（SPY、VOO、IVV）或成分股（NVDA、AAPL）",
+        }
+    if is_trad_req and is_known_crypto:
+        broker_lbl = TRADITIONAL_BROKER_LABEL_MAP.get(req_ex_id, req_ex_id.upper())
+        return {
+            "symbol": f"{base_clean}/USD",
+            "verified": False,
+            "in_catalog": False,
+            "error": f"添加失败：{base_clean} 为加密货币合约标的，{broker_lbl} 仅支持美元 (USD) 美股与标普500 ETF；交易加密货币请将上方通道切换为 OKX / 币安",
+        }
+
+    # Decide asset class: US Equity (USD) vs Crypto/Stock Perpetual (USDT)
+    use_us_equity = (
+        is_trad_req
+        or (explicit_usd_or_us and not is_crypto_req and not is_known_crypto and base_clean not in CRYPTO_ONLY_SP500_BASES)
+        or (
+            not req_ex_id
+            and not explicit_usdt
+            and is_sp500_sym
+            and base_clean not in CRYPTO_ONLY_SP500_BASES
+            and not okx_spec_probe
+            and base_clean not in OKX_STOCK_PERP_BASES
+        )
+    )
+
+    if use_us_equity:
+        target_exchange_id = req_ex_id if is_trad_req else "futu"
+        equity_ticker = "BRK.B" if base_clean == "BRKB" else base_clean
+        norm_sym = f"{equity_ticker}/USD"
+        native_sym = to_broker_native_symbol(norm_sym, target_exchange_id)
+        already_monitored = norm_sym in eng.strategies
+        match = next(
+            (item for item in SUPPORTED_PERP_CATALOG if item["symbol"] == norm_sym and item.get("asset_type") == "US_STOCK"),
+            None,
+        )
+        ref_px = match["ref_price"] if match else get_default_base_price(norm_sym)
+        if norm_sym in eng.math_states and eng.math_states[norm_sym].latest_follower:
+            f_mid = eng.math_states[norm_sym].latest_follower.mid
+            if f_mid > 0:
+                ref_px = f_mid
+
+        rec_order_usd = float(max(100, math.ceil(ref_px)))
+        sp_title = SP500_SYMBOL_NAMES.get(base_clean, equity_ticker)
+        broker_lbl = TRADITIONAL_BROKER_LABEL_MAP.get(target_exchange_id, target_exchange_id.upper())
+        warnings = [
+            f"美股标的 {sp_title} 已绑定 {broker_lbl}（官方代码: {native_sym} · 美元 USD 计价 · 默认 1x 整数股仅做多；当前支持影子模拟与网关验证，实盘发单自动隔离防误发 OKX）"
+        ]
+        if base_clean == "SPX":
+            warnings.append("提示：SPX 为标普500现货指数，券商正股账户不可直接买卖指数，建议改用 SPY 或 VOO ETF")
+        elif base_clean == "ES":
+            warnings.append("提示：ES 为 CME 标普500迷你期货，需开通期货交易权限，正股账户建议改用 SPY ETF")
+
+        return {
+            "symbol": norm_sym,
+            "base": equity_ticker,
+            "native_symbol": native_sym,
+            "asset_type": "US_STOCK",
+            "quote_ccy": "USD",
+            "live_execution_supported": False,
+            "name_cn": SP500_SYMBOL_NAMES.get(base_clean, ""),
+            "sector": "标普500" if is_sp500_sym else "美股/ETF",
+            "verified": True,
+            "already_monitored": already_monitored,
+            "in_catalog": match is not None or is_trad_req,
+            "ref_price": ref_px,
+            "min_notional_usdt": round(ref_px, 2),
+            "leader_supported": True,
+            "follower_supported": True,
+            "leader_exchange": leader["exchange_id"],
+            "follower_exchange": target_exchange_id,
+            "recommended_exchange_id": target_exchange_id,
+            "okx_spec": None,
+            "recommended_strategy_type": "TREND_GRID",
+            "recommended_order_usdt": rec_order_usd,
+            "recommended_leverage": 1,
+            "recommended_grid_side_mode": "LONG_ONLY",
+            "warning": "；".join(warnings),
+            "recommended_precision": {
+                "price_precision": 2,
+                "qty_precision": 0,
+                "min_qty": 1.0,
+            },
+        }
+
+    # Crypto Exchange / Crypto-Margined Stock Perpetual branch (USDT-settled)
     norm_sym = f"{base_clean}/USDT:USDT"
     already_monitored = norm_sym in eng.strategies
-    match = next((item for item in SUPPORTED_PERP_CATALOG if item["symbol"] == norm_sym), None)
-    okx_spec = get_okx_instrument_spec(norm_sym)
+    match = next(
+        (item for item in SUPPORTED_PERP_CATALOG if item["symbol"] == norm_sym and item.get("asset_type") != "US_STOCK"),
+        None,
+    )
+    okx_spec = okx_spec_probe
     bn_spec = get_binance_instrument_spec(norm_sym)
-    is_sp500_sym = base_clean in SP500_SYMBOL_NAMES or (match and match.get("sector") == "标普500")
-    is_trad_req = is_traditional_broker(req_ex_id)
 
-    if _OKX_INSTRUMENT_CACHE and not okx_spec and match is None and not is_trad_req:
+    if _OKX_INSTRUMENT_CACHE and not okx_spec and match is None:
         return {
             "symbol": norm_sym,
             "verified": False,
@@ -479,10 +648,10 @@ async def verify_symbol(
             "already_monitored": already_monitored,
             "leader_supported": bool(bn_spec and bn_spec.get("status") == "TRADING"),
             "follower_supported": False,
-            "error": f"添加失败：执行端 OKX 未上线 {to_okx_inst_id(norm_sym)} 永续合约（若添加美股/标普500标的，请先在上方切换至富途/moomoo/IBKR/Schwab券商通道）",
+            "error": f"添加失败：执行端 OKX 未上线 {to_okx_inst_id(norm_sym)} 永续合约（若添加美股/标普500正股，请先在上方切换至富途/moomoo/IBKR/Schwab 传统券商通道）",
         }
 
-    if not is_trad_req and okx_spec and okx_spec.get("state") not in (None, "live"):
+    if okx_spec and okx_spec.get("state") not in (None, "live"):
         return {
             "symbol": norm_sym,
             "verified": False,
@@ -493,9 +662,10 @@ async def verify_symbol(
             "error": f"添加失败：OKX 合约 {to_okx_inst_id(norm_sym)} 当前状态为 {okx_spec.get('state')}，暂不可交易",
         }
 
-    target_exchange_id = req_ex_id if req_ex_id in ALL_EXCHANGE_IDS else (
-        "futu" if (is_sp500_sym and not okx_spec) else follower["exchange_id"]
+    target_exchange_id = req_ex_id if is_crypto_req else (
+        follower["exchange_id"] if not is_traditional_broker(follower["exchange_id"]) else "okx"
     )
+    native_sym = to_broker_native_symbol(norm_sym, target_exchange_id)
 
     ref_px = match["ref_price"] if match else get_default_base_price(norm_sym)
     f_bbo = eng.gateway.real_follower_bbo.get(norm_sym)
@@ -508,7 +678,7 @@ async def verify_symbol(
 
     p_prec, q_prec, min_q = _infer_precision(ref_px)
     min_notional_usdt = 0.0
-    if okx_spec and not is_traditional_broker(target_exchange_id):
+    if okx_spec:
         tick_str = str(okx_spec.get("tickSz_str") or "")
         if "." in tick_str:
             p_prec = min(12, max(p_prec, len(tick_str.rstrip("0").split(".")[1])))
@@ -516,27 +686,23 @@ async def verify_symbol(
         if min_base > 0:
             min_q = round(min_base, 8)
             min_notional_usdt = round(min_base * ref_px, 4)
-    elif is_traditional_broker(target_exchange_id) or is_sp500_sym:
-        p_prec = 2
-        q_prec = 2
-        min_q = 0.01
 
     leader_supported = (
         bool(bn_spec and bn_spec.get("status") == "TRADING")
-        if (_BINANCE_INSTRUMENT_CACHE and not is_traditional_broker(target_exchange_id))
+        if _BINANCE_INSTRUMENT_CACHE
         else True
     )
-    follower_supported = is_traditional_broker(target_exchange_id) or is_sp500_sym or okx_spec is None or okx_spec.get("state") == "live"
+    follower_supported = okx_spec is None or okx_spec.get("state") == "live"
 
     # Infer sensible strategy & order_usdt defaults from the user's current portfolio
     existing = list(eng.strategies.values())
-    grid_configs = [s for s in existing if is_grid_strategy(s.strategy_type)]
+    grid_configs = [s for s in existing if is_grid_strategy(s.strategy_type) and not is_usd_equity_symbol(s.symbol, s.exchange_id)]
     if grid_configs and len(grid_configs) >= len(existing) / 2:
         rec_strategy = grid_configs[0].strategy_type
         base_order_usdt = float(grid_configs[0].order_usdt or 20.0)
-    elif is_traditional_broker(target_exchange_id) or is_sp500_sym or not leader_supported:
-        rec_strategy = "TREND_GRID" if (is_sp500_sym or is_traditional_broker(target_exchange_id)) else "LONG_SHORT_GRID"
-        base_order_usdt = 20.0 if (is_sp500_sym or is_traditional_broker(target_exchange_id)) else 10.0
+    elif is_sp500_sym or not leader_supported:
+        rec_strategy = "TREND_GRID" if is_sp500_sym else "LONG_SHORT_GRID"
+        base_order_usdt = 20.0 if is_sp500_sym else 10.0
     else:
         rec_strategy = "LEAD_LAG"
         base_order_usdt = float(existing[0].order_usdt if existing else 300.0)
@@ -547,9 +713,9 @@ async def verify_symbol(
         rec_order_usdt = base_order_usdt
 
     warnings = []
-    if is_sp500_sym or is_traditional_broker(target_exchange_id):
+    if is_sp500_sym:
         sp_title = SP500_SYMBOL_NAMES.get(base_clean, base_clean)
-        warnings.append(f"标普500/美股标的 {sp_title} 已绑定执行通道 [{target_exchange_id.upper()}]")
+        warnings.append(f"美股永续合约 {sp_title} 已绑定加密交易所 [{target_exchange_id.upper()}]（{native_sym} · USDT 计价）")
     elif _BINANCE_INSTRUMENT_CACHE and not leader_supported:
         warnings.append(f"{norm_sym} 在主所 Binance 未上线，已自动设为 OKX「多空动态网格」策略")
     if min_notional_usdt > base_order_usdt * 1.35:
@@ -560,11 +726,15 @@ async def verify_symbol(
     return {
         "symbol": norm_sym,
         "base": base_clean,
+        "native_symbol": native_sym,
+        "asset_type": "STOCK_PERP" if is_sp500_sym else "CRYPTO_PERP",
+        "quote_ccy": "USDT",
+        "live_execution_supported": target_exchange_id == "okx",
         "name_cn": SP500_SYMBOL_NAMES.get(base_clean, ""),
         "sector": "标普500" if is_sp500_sym else (match["sector"] if match else "自定义标的"),
         "verified": True,
         "already_monitored": already_monitored,
-        "in_catalog": match is not None or okx_spec is not None or is_trad_req,
+        "in_catalog": match is not None or okx_spec is not None,
         "ref_price": ref_px,
         "min_notional_usdt": min_notional_usdt,
         "leader_supported": leader_supported,
@@ -575,6 +745,8 @@ async def verify_symbol(
         "okx_spec": okx_spec,
         "recommended_strategy_type": rec_strategy,
         "recommended_order_usdt": rec_order_usdt,
+        "recommended_leverage": 5,
+        "recommended_grid_side_mode": "LONG_SHORT",
         "warning": "；".join(warnings) if warnings else "",
         "recommended_precision": {
             "price_precision": min(12, match["price_prec"] if (match and not okx_spec) else p_prec),
@@ -589,7 +761,7 @@ async def update_symbol(cfg: SymbolStrategy, authorization: str = Header(default
     _, eng = await _require_vip_engine(authorization)
     cfg.symbol = cfg.symbol.strip().upper()
     if not SYMBOL_FORMAT_RE.match(cfg.symbol):
-        raise HTTPException(status_code=400, detail="合约代号格式无效，应为例如 BTC/USDT:USDT")
+        raise HTTPException(status_code=400, detail="标的代号格式无效，加密合约应如 BTC/USDT:USDT，美股标的应如 NVDA/USD 或 BRK.B/USD")
     cfg.price_precision = min(12, max(0, int(cfg.price_precision)))
     cfg.qty_precision = min(12, max(0, int(cfg.qty_precision)))
     try:

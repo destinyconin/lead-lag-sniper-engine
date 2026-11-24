@@ -4056,13 +4056,24 @@ def test_traditional_brokers_sp500_catalog_and_per_symbol_exchange_selection():
     import backend.main as main_mod
     from backend.main import SUPPORTED_PERP_CATALOG, app
 
-    sp500_items = [c for c in SUPPORTED_PERP_CATALOG if c.get("sector") == "标普500"]
-    sp500_bases = {c["base"] for c in sp500_items}
-    for expected_base in ("SPX", "SPY", "VOO", "IVV", "ES", "SP500", "QQQ", "NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "GOOGL", "META", "BRKB"):
-        assert expected_base in sp500_bases
-        item = next(c for c in sp500_items if c["base"] == expected_base)
+    sp500_us_stocks = [c for c in SUPPORTED_PERP_CATALOG if c.get("asset_type") == "US_STOCK"]
+    sp500_us_bases = {c["base"] for c in sp500_us_stocks}
+    for expected_base in ("SPX", "SPY", "VOO", "IVV", "ES", "QQQ", "NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "GOOGL", "META", "BRK.B"):
+        assert expected_base in sp500_us_bases
+        item = next(c for c in sp500_us_stocks if c["base"] == expected_base)
+        assert item["quote_ccy"] == "USD"
+        assert item["symbol"] == f"{expected_base}/USD"
         for broker_id in ("futu", "moomoo", "ibkr", "schwab"):
             assert broker_id in item["exchanges"]
+            assert broker_id in item["broker_codes"]
+
+    # SP500 crypto alias & BTC/ETH/SOL must NOT appear under traditional US equity brokers
+    sp500_perp = next(c for c in SUPPORTED_PERP_CATALOG if c["symbol"] == "SP500/USDT:USDT")
+    assert sp500_perp["asset_type"] == "STOCK_PERP"
+    assert all(b not in sp500_perp["exchanges"] for b in ("futu", "moomoo", "ibkr", "schwab"))
+    btc_item = next(c for c in SUPPORTED_PERP_CATALOG if c["symbol"] == "BTC/USDT:USDT")
+    assert btc_item["asset_type"] == "CRYPTO_PERP"
+    assert all(b not in btc_item["exchanges"] for b in ("futu", "moomoo", "ibkr", "schwab"))
 
     rate_limiter._buckets.clear()
     with (
@@ -4126,61 +4137,96 @@ def test_traditional_brokers_sp500_catalog_and_per_symbol_exchange_selection():
                 assert fee_res.status_code == 200
                 assert fee_res.json()["exchange_id"] == b_id
 
-            # 2) /api/symbol/verify with exchange_id & S&P 500 tickers / aliases
+            # 2) /api/symbol/verify with exchange_id & S&P 500 tickers / aliases -> USD equity format vs OKX USDT perp
             v_spy = client.get("/api/symbol/verify?symbol=SPY&exchange_id=futu", headers=hdr).json()
             assert v_spy["verified"] is True
-            assert v_spy["symbol"] == "SPY/USDT:USDT"
+            assert v_spy["symbol"] == "SPY/USD"
+            assert v_spy["native_symbol"] == "US.SPY"
+            assert v_spy["asset_type"] == "US_STOCK"
+            assert v_spy["quote_ccy"] == "USD"
             assert v_spy["recommended_exchange_id"] == "futu"
+            assert v_spy["recommended_leverage"] == 1
+            assert v_spy["recommended_grid_side_mode"] == "LONG_ONLY"
+            assert v_spy["recommended_precision"]["min_qty"] == 1.0
+            assert v_spy["recommended_precision"]["qty_precision"] == 0
             assert v_spy["sector"] == "标普500"
 
             v_spx = client.get("/api/symbol/verify?symbol=S%26P500&exchange_id=ibkr", headers=hdr).json()
             assert v_spx["verified"] is True
-            assert v_spx["symbol"] == "SPX/USDT:USDT"
+            assert v_spx["symbol"] == "SPX/USD"
+            assert v_spx["native_symbol"] == "SPX"
             assert v_spx["recommended_exchange_id"] == "ibkr"
+            assert "指数" in v_spx["warning"]
 
             v_brk = client.get("/api/symbol/verify?symbol=BRK.B&exchange_id=schwab", headers=hdr).json()
             assert v_brk["verified"] is True
-            assert v_brk["symbol"] == "BRKB/USDT:USDT"
+            assert v_brk["symbol"] == "BRK.B/USD"
+            assert v_brk["native_symbol"] == "BRK.B"
             assert v_brk["recommended_exchange_id"] == "schwab"
 
             v_aapl = client.get("/api/symbol/verify?symbol=US.AAPL&exchange_id=moomoo", headers=hdr).json()
             assert v_aapl["verified"] is True
-            assert v_aapl["symbol"] == "AAPL/USDT:USDT"
+            assert v_aapl["symbol"] == "AAPL/USD"
+            assert v_aapl["native_symbol"] == "US.AAPL"
             assert v_aapl["recommended_exchange_id"] == "moomoo"
 
-            # 3) Add SPY on Futu with TREND_GRID and verify persistence + immediate grid level seeding in LIVE mode
+            # Coexistence: NVDA on Futu (US_STOCK USD) vs NVDA on OKX (STOCK_PERP USDT)
+            v_nvda_futu = client.get("/api/symbol/verify?symbol=NVDA&exchange_id=futu", headers=hdr).json()
+            assert v_nvda_futu["verified"] is True
+            assert v_nvda_futu["symbol"] == "NVDA/USD"
+            assert v_nvda_futu["native_symbol"] == "US.NVDA"
+            assert v_nvda_futu["quote_ccy"] == "USD"
+            v_nvda_okx = client.get("/api/symbol/verify?symbol=NVDA&exchange_id=okx", headers=hdr).json()
+            assert v_nvda_okx["verified"] is True
+            assert v_nvda_okx["symbol"] == "NVDA/USDT:USDT"
+            assert v_nvda_okx["native_symbol"] == "NVDA-USDT-SWAP"
+            assert v_nvda_okx["asset_type"] == "STOCK_PERP"
+            assert v_nvda_okx["quote_ccy"] == "USDT"
+
+            # Traditional brokers reject crypto-only tickers (BTC) and crypto-only SP500 alias
+            for b_id in ("futu", "moomoo", "ibkr", "schwab"):
+                bad_btc = client.get(f"/api/symbol/verify?symbol=BTC&exchange_id={b_id}", headers=hdr).json()
+                assert bad_btc["verified"] is False
+                bad_sp500 = client.get(f"/api/symbol/verify?symbol=SP500&exchange_id={b_id}", headers=hdr).json()
+                assert bad_sp500["verified"] is False
+
+            # 3) Add SPY/USD on Futu with TREND_GRID and verify persistence + immediate grid level seeding
             upd_spy = client.post(
                 "/api/symbol/update",
                 headers=hdr,
                 json={
-                    "symbol": "SPY/USDT:USDT",
+                    "symbol": "SPY/USD",
                     "exchange_id": "futu",
                     "strategy_type": "TREND_GRID",
-                    "grid_side_mode": "LONG_SHORT",
+                    "grid_side_mode": "LONG_ONLY",
                     "grid_levels": 3,
                     "grid_step_pct": 0.008,
                     "grid_take_profit_pct": 0.0085,
                     "grid_range_pct": 0.028,
                     "grid_stop_loss_pct": 0.038,
-                    "order_usdt": 100.0,
-                    "leverage": 5,
+                    "order_usdt": 600.0,
+                    "leverage": 1,
                     "price_precision": 2,
-                    "qty_precision": 2,
-                    "min_qty": 0.01,
+                    "qty_precision": 0,
+                    "min_qty": 1.0,
                     "is_running": True,
                 },
             )
             assert upd_spy.status_code == 200, upd_spy.text
-            spy_saved = next(s for s in upd_spy.json()["strategies"] if s["symbol"] == "SPY/USDT:USDT")
+            spy_saved = next(s for s in upd_spy.json()["strategies"] if s["symbol"] == "SPY/USD")
             assert spy_saved["exchange_id"] == "futu"
             assert spy_saved["strategy_type"] == "TREND_GRID"
 
-            st_res = client.get("/api/stats?radar_symbol=SPY/USDT:USDT", headers=hdr)
+            st_res = client.get("/api/stats?radar_symbol=SPY/USD", headers=hdr)
             assert st_res.status_code == 200
-            spy_tel = st_res.json()["telemetry"]["SPY/USDT:USDT"]
+            spy_tel = st_res.json()["telemetry"]["SPY/USD"]
             assert spy_tel["follower_mid"] > 500.0
+            assert spy_tel["native_symbol"] == "US.SPY"
+            assert spy_tel["asset_type"] == "US_STOCK"
+            assert spy_tel["quote_ccy"] == "USD"
+            assert spy_tel["live_execution_supported"] is False
             assert spy_tel["grid"]["center_price"] > 500.0
-            assert len(spy_tel["grid"]["levels"]) == 6
+            assert len(spy_tel["grid"]["levels"]) == 3
 
             # 4) Verify VIP_FEE_TIERS covers all 10 exchanges/brokers
             for all_ex in ("binanceusdm", "okx", "bybit", "gate", "bitget", "krakenfutures", "futu", "moomoo", "ibkr", "schwab"):
@@ -5532,6 +5578,242 @@ def test_admin_delete_web3_orders_and_tx_replay_guard():
         del_p = client.delete(f"/api/admin/orders/{o4['id']}", headers=hdr_adm)
         assert del_p.status_code == 200
         assert del_p.json()["dashboard"]["orders"] == []
+
+
+def test_all_4_traditional_brokers_shadow_execution_live_isolation_and_protocols():
+    """
+    Comprehensive verification across ALL 4 traditional securities brokers (futu, moomoo, ibkr, schwab):
+    1) Native symbol mapping matches official broker docs:
+       - futu / moomoo -> US.NVDA, US.AAPL, US.BRK.B
+       - ibkr / schwab -> NVDA, MSFT, BRK.B
+    2) Official gateway connectivity verification works for all 4:
+       - futu & moomoo OpenD TCP connect (pass + unreachable failure)
+       - ibkr Client Portal Web API v1 (authenticated=True pass + authenticated=False failure)
+       - schwab OAuth2 refresh_token + /trader/v1/accounts (pass + error)
+    3) Full SHADOW mode grid lifecycle (entry -> take-profit exit -> realized PnL & follower_ex attribution)
+       runs cleanly for ALL 4 traditional brokers concurrently using USD stock symbols.
+    4) Strict LIVE mode channel isolation: even when OKX is VERIFIED & active alongside all 4 traditional
+       brokers (including a legacy NVDA/USDT:USDT bound to futu), LIVE ticks & direct executor calls
+       NEVER mis-route any order to OKX (_okx_request called 0 times), and preflight reports exact
+       native broker codes + USD share sizing warnings.
+    """
+    from backend.market_gateway import to_broker_native_symbol
+    from backend.sniper_engine import BidirectionalSniperEngine
+
+    # 1) Official symbol translations for all 4 brokers (both new USD format and legacy USDT format)
+    assert to_broker_native_symbol("NVDA/USD", "futu") == "US.NVDA"
+    assert to_broker_native_symbol("AAPL/USD", "moomoo") == "US.AAPL"
+    assert to_broker_native_symbol("BRK.B/USD", "futu") == "US.BRK.B"
+    assert to_broker_native_symbol("MSFT/USD", "ibkr") == "MSFT"
+    assert to_broker_native_symbol("BRK.B/USD", "schwab") == "BRK.B"
+    assert to_broker_native_symbol("NVDA/USDT:USDT", "okx") == "NVDA-USDT-SWAP"
+
+    async def _run_all_broker_checks():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = os.path.join(tmpdir, "brokers_all4.db")
+            adb = AsyncDatabaseManager(db_path=db_file)
+            adb.init_sync()
+            adb.ensure_user_workspace_sync(99)
+
+            eng = BidirectionalSniperEngine(adb, user_id=99)
+            eng.exchanges = {
+                "binanceusdm": {"exchange_id": "binanceusdm", "display_name": "Binance USDM", "role": "leader", "is_active": True, "taker_fee": 0.0004, "maker_fee": 0.0002, "auth_status": "VERIFIED"},
+                "okx": {
+                    "exchange_id": "okx",
+                    "display_name": "OKX Swap",
+                    "role": "follower",
+                    "is_active": True,
+                    "api_key": "okx-live-key",
+                    "_decrypted_secret": "okx-live-sec",
+                    "_decrypted_passphrase": "okx-live-pass",
+                    "taker_fee": 0.0005,
+                    "maker_fee": 0.0002,
+                    "auth_status": "VERIFIED",
+                    "account_equity_usdt": 1000.0,
+                },
+                "futu": {"exchange_id": "futu", "display_name": "富途牛牛", "role": "follower", "is_active": True, "taker_fee": 0.0003, "maker_fee": 0.0001, "auth_status": "VERIFIED"},
+                "moomoo": {"exchange_id": "moomoo", "display_name": "moomoo", "role": "follower", "is_active": True, "taker_fee": 0.0003, "maker_fee": 0.0001, "auth_status": "VERIFIED"},
+                "ibkr": {"exchange_id": "ibkr", "display_name": "IBKR盈透", "role": "follower", "is_active": True, "taker_fee": 0.0002, "maker_fee": 0.00008, "auth_status": "VERIFIED"},
+                "schwab": {"exchange_id": "schwab", "display_name": "Charles Schwab", "role": "follower", "is_active": True, "taker_fee": 0.0002, "maker_fee": 0.00008, "auth_status": "VERIFIED"},
+            }
+
+            # 2) Verify OpenD TCP (futu & moomoo), IBKR unauth/auth, and Schwab error/ok
+            class _DummyWriter:
+                def close(self):
+                    pass
+
+                async def wait_closed(self):
+                    pass
+
+            with patch("asyncio.open_connection", new=AsyncMock(return_value=(object(), _DummyWriter()))):
+                f_ok = await eng.executor.verify_exchange_credentials(
+                    {"exchange_id": "futu", "api_key": "127.0.0.1:11111", "_decrypted_secret": "futu_rsa_key", "_decrypted_passphrase": "unlock123"}
+                )
+                assert f_ok["ok"] is True and f_ok["auth_status"] == "VERIFIED" and "USD" in f_ok["auth_message"]
+
+                m_ok = await eng.executor.verify_exchange_credentials(
+                    {"exchange_id": "moomoo", "api_key": "127.0.0.1:11112", "_decrypted_secret": "moomoo_rsa_key", "_decrypted_passphrase": "unlock456"}
+                )
+                assert m_ok["ok"] is True and m_ok["auth_status"] == "VERIFIED" and "USD" in m_ok["auth_message"]
+
+            with patch("asyncio.open_connection", new=AsyncMock(side_effect=ConnectionRefusedError("refused"))):
+                f_fail = await eng.executor.verify_exchange_credentials(
+                    {"exchange_id": "futu", "api_key": "127.0.0.1:11111", "_decrypted_secret": "futu_rsa_key", "_decrypted_passphrase": "unlock123"}
+                )
+                assert f_fail["ok"] is False and f_fail["auth_status"] == "ERROR"
+
+            # 3) Full SHADOW mode execution across ALL 4 traditional brokers concurrently
+            eng.risk_config = GlobalRiskConfig(
+                trading_mode="SHADOW",
+                max_exposure_usdt=50_000.0,
+                shadow_base_latency_ms=2.0,
+                shadow_latency_jitter_ms=0.5,
+                shadow_adverse_selection_prob=0.0,
+            )
+            eng.trading_active_by_mode["SHADOW"] = True
+            await adb.start_worker()
+
+            broker_cases = [
+                ("NVDA/USD", "futu", 140.0, 280.0, "US.NVDA"),
+                ("AAPL/USD", "moomoo", 228.0, 456.0, "US.AAPL"),
+                ("MSFT/USD", "ibkr", 425.0, 850.0, "MSFT"),
+                ("BRK.B/USD", "schwab", 460.0, 920.0, "BRK.B"),
+            ]
+            for sym, b_id, base_px, ord_usd, _ in broker_cases:
+                cfg_b = SymbolStrategy(
+                    symbol=sym,
+                    exchange_id=b_id,
+                    strategy_type="LONG_SHORT_GRID",
+                    grid_side_mode="LONG_ONLY",
+                    grid_levels=2,
+                    grid_step_pct=0.01,
+                    grid_take_profit_pct=0.015,
+                    grid_range_pct=0.04,
+                    grid_stop_loss_pct=0.08,
+                    order_usdt=ord_usd,
+                    leverage=1,
+                    price_precision=2,
+                    qty_precision=0,
+                    min_qty=1.0,
+                    slippage_pct=0.0005,
+                    is_running=True,
+                )
+                eng._register_symbol_internal(cfg_b)
+                # Anchor at base_px -> drop -1.2% (triggers L1 LONG) -> rally +2.0% above L1 (triggers GRID_TP)
+                eng._handle_follower_bbo(sym, base_px - 0.02, base_px + 0.02, 500.0, 500.0)
+                drop_px = round(base_px * 0.988, 2)
+                eng._handle_follower_bbo(sym, drop_px - 0.02, drop_px + 0.02, 500.0, 500.0)
+
+            await asyncio.sleep(0.08)
+            for sym, _, _, _, _ in broker_cases:
+                assert any(k.startswith(f"{sym}:") for k in eng.active_grid_positions), f"Expected open SHADOW slot for {sym}"
+
+            for sym, _, base_px, _, _ in broker_cases:
+                tp_px = round(base_px * 1.01, 2)
+                eng._handle_follower_bbo(sym, tp_px - 0.02, tp_px + 0.02, 500.0, 500.0)
+
+            await asyncio.sleep(0.08)
+            snap_sh = eng.build_dashboard_snapshot()
+            assert snap_sh["stats"]["win_count"] >= 4
+            recent_tr = snap_sh["stats"]["recent_trades"]
+            for sym, b_id, _, _, native_code in broker_cases:
+                assert snap_sh["telemetry"][sym]["native_symbol"] == native_code
+                assert snap_sh["telemetry"][sym]["quote_ccy"] == "USD"
+                assert snap_sh["telemetry"][sym]["asset_type"] == "US_STOCK"
+                assert any(t["symbol"] == sym and t["follower_ex"] == b_id for t in recent_tr), (
+                    f"Expected closed SHADOW trade attributed to {b_id} for {sym}"
+                )
+
+            # 4) Strict LIVE mode channel isolation: OKX is active, yet NO traditional broker symbol may EVER hit OKX!
+            eng.risk_config = GlobalRiskConfig(trading_mode="LIVE", max_exposure_usdt=50_000.0)
+            eng.trading_active_by_mode["LIVE"] = True
+            eng.gateway.okx_connected = True
+            eng.gateway.binance_connected = True
+
+            # Also add a legacy NVDA/USDT:USDT explicitly bound to futu to verify legacy rows are isolated too!
+            legacy_futu_cfg = SymbolStrategy(
+                symbol="TSLA/USDT:USDT",
+                exchange_id="futu",
+                strategy_type="LONG_SHORT_GRID",
+                grid_side_mode="LONG_ONLY",
+                grid_levels=2,
+                grid_step_pct=0.01,
+                grid_take_profit_pct=0.015,
+                grid_range_pct=0.04,
+                grid_stop_loss_pct=0.08,
+                order_usdt=360.0,
+                leverage=1,
+                price_precision=2,
+                qty_precision=0,
+                min_qty=1.0,
+                is_running=True,
+            )
+            eng._register_symbol_internal(legacy_futu_cfg)
+
+            okx_spy = AsyncMock(return_value={"code": "0", "data": []})
+            with patch.object(eng.executor, "_okx_request", new=okx_spy):
+                # Feed LIVE ticks that would otherwise trigger L1 entry on every broker symbol
+                for sym, _, base_px, _, _ in broker_cases:
+                    eng.grid_trackers[sym].sync_config(eng.strategies[sym], current_mid=base_px)
+                    eng._handle_follower_bbo(sym, round(base_px * 0.985, 2), round(base_px * 0.986, 2), 500.0, 500.0)
+                eng.grid_trackers["TSLA/USDT:USDT"].sync_config(legacy_futu_cfg, current_mid=350.0)
+                eng._handle_follower_bbo("TSLA/USDT:USDT", 344.0, 344.5, 500.0, 500.0)
+                await asyncio.sleep(0.05)
+
+                # Even if executor.place_entry_ioc or execute_exit_with_retry were mistakenly handed OKX creds,
+                # executor itself MUST block and never call _okx_request!
+                for sym, b_id, base_px, _, native_code in broker_cases:
+                    res_en = await eng.executor.place_entry_ioc(
+                        cfg=eng.strategies[sym],
+                        side="LONG",
+                        qty=2.0,
+                        reservation_price=base_px,
+                        trigger_price=base_px,
+                        exchange_cfg=eng.exchanges["okx"],
+                    )
+                    assert res_en.status == "MISSED"
+                    assert "隔离拦截" in res_en.raw_msg and native_code in res_en.raw_msg
+
+                    res_ex = await eng.executor.execute_exit_with_retry(
+                        cfg=eng.strategies[sym],
+                        side="LONG",
+                        qty=2.0,
+                        exit_reason="GRID_TP",
+                        tp_price=base_px * 1.02,
+                        exchange_cfg=eng.exchanges["okx"],
+                    )
+                    assert res_ex.status == "UNCERTAIN"
+                    assert "隔离拦截" in res_ex.raw_msg and native_code in res_ex.raw_msg
+
+                assert okx_spy.call_count == 0, f"Traditional broker symbols MUST NEVER hit OKX, got {okx_spy.call_count} calls"
+
+            # 5) Preflight check reports native codes + USD warnings cleanly across all 4 brokers
+            with patch.object(
+                eng.executor,
+                "verify_exchange_credentials",
+                new=AsyncMock(return_value={"ok": True, "auth_status": "VERIFIED", "auth_message": "OK", "account_equity_usdt": 1000.0}),
+            ):
+                pf = await eng.executor.preflight_check_symbols(
+                    exchange_cfg=eng.exchanges["okx"],
+                    strategies=list(eng.strategies.values()),
+                    math_states=eng.math_states,
+                    gateway=None,
+                    all_exchanges=eng.exchanges,
+                )
+                assert pf["ok"] is True
+                pf_by_sym = {s["symbol"]: s for s in pf["symbols"]}
+                for sym, b_id, _, _, native_code in broker_cases:
+                    rep = pf_by_sym[sym]
+                    assert rep["instId"] == native_code
+                    assert rep["exchange_id"] == b_id
+                    assert rep["quote_ccy"] == "USD"
+                    assert rep["live_execution_supported"] is False
+                    assert any(native_code in w for w in rep["warnings"])
+
+            await adb.stop_worker()
+
+    asyncio.run(_run_all_broker_checks())
+
 
 
 

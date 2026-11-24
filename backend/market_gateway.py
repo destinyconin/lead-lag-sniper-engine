@@ -185,10 +185,35 @@ SP500_SYMBOL_NAMES: Dict[str, str] = {
     "GS": "高盛 (Goldman Sachs)",
 }
 
+# Crypto-only index perpetual aliases that do NOT exist as US stock tickers on Futu/moomoo/IBKR/Schwab
+CRYPTO_ONLY_SP500_BASES = {"SP500"}
+# Cash index / futures tickers where US equity accounts require ETFs (e.g. SPY/VOO) or futures permissions
+SP500_NON_STOCK_BASES = {"SPX", "ES"}
+
+
+def _extract_symbol_base(symbol: str) -> str:
+    """Extracts ticker base from 'NVDA/USDT:USDT', 'NVDA/USD', 'BRK.B/USD', or 'US.NVDA'."""
+    s = str(symbol or "").strip().upper()
+    for pfx in ("US.", "HK."):
+        if s.startswith(pfx):
+            s = s[len(pfx) :]
+    base_quote = s.split(":")[0]
+    return base_quote.split("/")[0].strip()
+
+
+def is_usd_equity_sym(symbol: str) -> bool:
+    s = str(symbol or "").strip().upper()
+    return s.endswith("/USD") or s.startswith("US.")
+
 
 def get_default_base_price(symbol: str) -> float:
     if symbol in BASE_PRICES:
         return BASE_PRICES[symbol]
+    base = _extract_symbol_base(symbol)
+    base_nodot = base.replace(".", "")
+    cand_usdt = f"{base_nodot}/USDT:USDT"
+    if cand_usdt in BASE_PRICES:
+        return BASE_PRICES[cand_usdt]
     h = int(hashlib.md5(symbol.encode("utf-8")).hexdigest()[:6], 16)
     return round(0.5 + (h % 5000) / 100.0, 4)
 
@@ -257,9 +282,9 @@ def to_kraken_futures_symbol(unified_sym: str) -> str:
 
 
 def to_futu_moomoo_code(unified_sym: str) -> str:
-    """Converts 'SPY/USDT:USDT' -> 'US.SPY', 'BRKB/USDT:USDT' -> 'US.BRK.B' per Futu/Moomoo OpenD Security code spec."""
-    base = unified_sym.split("/")[0].upper()
-    if base == "BRKB":
+    """Converts 'SPY/USD', 'SPY/USDT:USDT', 'BRK.B/USD', 'BRKB/USDT:USDT' -> 'US.SPY' / 'US.BRK.B' per Futu/Moomoo OpenD spec."""
+    base = _extract_symbol_base(unified_sym)
+    if base in ("BRKB", "BRK.B"):
         base = "BRK.B"
     elif base == "SPX":
         return "US.SPX"
@@ -267,11 +292,33 @@ def to_futu_moomoo_code(unified_sym: str) -> str:
 
 
 def to_us_equity_symbol(unified_sym: str) -> str:
-    """Converts 'SPY/USDT:USDT' -> 'SPY', 'BRKB/USDT:USDT' -> 'BRK.B' per IBKR / Charles Schwab Trader API spec."""
-    base = unified_sym.split("/")[0].upper()
-    if base == "BRKB":
+    """Converts 'SPY/USD', 'SPY/USDT:USDT', 'BRK.B/USD', 'BRKB/USDT:USDT' -> 'SPY' / 'BRK.B' per IBKR / Charles Schwab spec."""
+    base = _extract_symbol_base(unified_sym)
+    if base in ("BRKB", "BRK.B"):
         return "BRK.B"
     return base
+
+
+def to_broker_native_symbol(unified_sym: str, exchange_id: str = "okx") -> str:
+    """Translates an internal symbol to the exact official venue symbol code."""
+    ex = str(exchange_id or "okx").strip().lower()
+    if ex in ("futu", "moomoo"):
+        return to_futu_moomoo_code(unified_sym)
+    if ex in ("ibkr", "schwab"):
+        return to_us_equity_symbol(unified_sym)
+    if ex == "okx":
+        return to_okx_inst_id(unified_sym)
+    if ex == "binanceusdm":
+        return to_binance_stream_sym(unified_sym).upper()
+    if ex == "bybit":
+        return to_bybit_symbol(unified_sym)
+    if ex == "bitget":
+        return to_bitget_symbol(unified_sym)
+    if ex == "gate":
+        return to_gate_contract(unified_sym)
+    if ex == "krakenfutures":
+        return to_kraken_futures_symbol(unified_sym)
+    return unified_sym
 
 
 # Shared module-level instrument caches (refreshed by MarketDataGateway & preflight)
@@ -621,7 +668,7 @@ class MarketDataGateway:
         Fetches genuine real-time BBO tickers from Binance USDM and OKX V5 REST APIs via detected proxy.
         Used both to warm up real prices in <200ms on mode switch and as a continuous 1s heartbeat in LIVE mode.
         """
-        syms = target_symbols or list(self.symbols)
+        syms = [s for s in (target_symbols or list(self.symbols)) if not is_usd_equity_sym(s)]
         if not syms:
             return False
 
@@ -830,6 +877,8 @@ class MarketDataGateway:
         force: bool = False,
     ) -> Optional[dict]:
         """Fetches 200 closed 15m/1H public candles (OKX primary with 50011/429 retry, Binance fallback only if listed)."""
+        if is_usd_equity_sym(symbol):
+            return None
         tf = "1H" if str(timeframe or "15m").upper() == "1H" else "15m"
         cache_key = (symbol, tf)
         now_ms = int(time.time() * 1000)
@@ -1005,9 +1054,10 @@ class MarketDataGateway:
             self._resubscribe_flag = False
             sym_ver = self._symbols_version
             self.proxy_url = get_system_proxy()
-            sym_map = {to_binance_stream_sym(s).upper(): s for s in self.symbols}
+            crypto_syms = [s for s in self.symbols if not is_usd_equity_sym(s)]
+            sym_map = {to_binance_stream_sym(s).upper(): s for s in crypto_syms}
             streams = []
-            for s in self.symbols:
+            for s in crypto_syms:
                 raw = to_binance_stream_sym(s)
                 if _BINANCE_INSTRUMENT_CACHE and raw.upper() not in _BINANCE_INSTRUMENT_CACHE:
                     continue
@@ -1082,7 +1132,10 @@ class MarketDataGateway:
 
             sym_ver = self._symbols_version
             self.proxy_url = get_system_proxy()
-            inst_map = {to_okx_inst_id(s): s for s in self.symbols}
+            inst_map = {to_okx_inst_id(s): s for s in self.symbols if not is_usd_equity_sym(s)}
+            if not inst_map:
+                await asyncio.sleep(1.0)
+                continue
             url = "wss://ws.okx.com/ws/v5/public"
             try:
                 t_conn = mono_ms()

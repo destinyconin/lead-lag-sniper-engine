@@ -16,9 +16,11 @@ from backend.executor import ExecutionAdapter, OkxPrivateWsClient, resolve_okx_s
 from backend.grid_engine import LongShortGridTracker, calc_pyramid_weights
 from backend.market_gateway import (
     MarketDataGateway,
+    SP500_SYMBOL_NAMES,
     get_default_base_price,
     get_okx_instrument_spec,
     okx_inst_id_to_unified,
+    to_broker_native_symbol,
 )
 from backend.math_engine import SignalCandidate, SymbolMathState, mono_ms, wall_ms
 from backend.models import (
@@ -28,6 +30,8 @@ from backend.models import (
     SniperState,
     SymbolStrategy,
     is_grid_strategy,
+    is_traditional_broker,
+    is_usd_equity_symbol,
 )
 
 
@@ -1167,7 +1171,7 @@ class BidirectionalSniperEngine:
                 }
                 next_ex_map[key] = pos_summary
 
-                if not cfg:
+                if not cfg or str(getattr(cfg, "exchange_id", "okx") or "okx").lower() != "okx":
                     continue
 
                 async with self._get_symbol_exec_lock(sym):
@@ -1485,7 +1489,8 @@ class BidirectionalSniperEngine:
         if self.is_guest_preview:
             return {"ok": False, "message": "游客预览模式不可操作实盘持仓"}
 
-        leader_ex, follower_ex = self.get_leader_And_follower_cfg()
+        leader_ex, _ = self.get_leader_And_follower_cfg()
+        follower_ex = self.get_execution_exchange_cfg(self.strategies.get(symbol))
         cur_mode = self.risk_config.trading_mode
         manual_cd_ms = 180_000.0  # 3-minute anti-reopen cooldown after manual close
 
@@ -1895,8 +1900,8 @@ class BidirectionalSniperEngine:
                 if tracker is not None and m_state.latest_follower:
                     tracker.sync_config(cfg, current_mid=m_state.latest_follower.mid)
                 return
-            # Traditional brokers / S&P 500 symbols without an OKX swap WS feed still seed reference ticks & grid levels
-            if str(getattr(cfg, "exchange_id", "okx") or "okx").lower() not in ("futu", "moomoo", "ibkr", "schwab") and get_okx_instrument_spec(sym) is not None:
+            # Traditional brokers / USD equities / S&P 500 symbols without an OKX swap WS feed still seed reference ticks & grid levels
+            if not is_usd_equity_symbol(sym, getattr(cfg, "exchange_id", "okx")) and get_okx_instrument_spec(sym) is not None:
                 return
 
         base_px = get_default_base_price(sym)
@@ -2104,7 +2109,7 @@ class BidirectionalSniperEngine:
                         thinnest_leg_usdt = round(float(new_cfg.order_usdt) * int(new_cfg.grid_levels) * min(w_list), 2)
 
                 # 2. Check OKX contract spec / minimum notional / precision (skip OKX swap checks for traditional brokers)
-                is_trad_broker = str(getattr(new_cfg, "exchange_id", "okx") or "okx").lower() in ("futu", "moomoo", "ibkr", "schwab")
+                is_trad_broker = is_usd_equity_symbol(sym, getattr(new_cfg, "exchange_id", "okx"))
                 if spec and not is_trad_broker:
                     min_notional = float(spec.get("minSz") or 0.0) * float(spec.get("ctVal") or 1.0) * ref_px
                     if ref_px > 0 and min_notional > new_cfg.order_usdt * 1.35:
@@ -2339,6 +2344,28 @@ class BidirectionalSniperEngine:
                 or self.exchanges.get("okx", {"exchange_id": "okx", "display_name": "OKX Swap", "taker_fee": 0.0005, "maker_fee": 0.00020})
             )
         return leader, follower
+
+    def get_execution_exchange_cfg(self, cfg: Optional[SymbolStrategy] = None) -> Dict[str, Any]:
+        """Resolves per-symbol execution venue so traditional-broker symbols NEVER mis-route to OKX."""
+        _, default_follower = self.get_leader_And_follower_cfg()
+        if cfg is None:
+            return default_follower
+        sym_ex_id = str(getattr(cfg, "exchange_id", "") or "").strip().lower()
+        if not sym_ex_id:
+            return default_follower
+        if sym_ex_id in self.exchanges:
+            return self.exchanges[sym_ex_id]
+        return {
+            "exchange_id": sym_ex_id,
+            "display_name": sym_ex_id.upper(),
+            "role": "follower",
+            "is_active": False,
+            "taker_fee": 0.0003 if is_traditional_broker(sym_ex_id) else 0.0005,
+            "maker_fee": 0.0001 if is_traditional_broker(sym_ex_id) else 0.0002,
+            "auth_status": "UNCONFIGURED",
+            "auth_message": f"{sym_ex_id.upper()} 未配置 API 凭证",
+            "account_equity_usdt": 0.0,
+        }
 
     async def verify_and_update_exchange(self, exchange_id: str, auto_upgrade_okx_mode: bool = False) -> Dict[str, Any]:
         if self.is_guest_preview:
@@ -2621,7 +2648,9 @@ class BidirectionalSniperEngine:
             self.scan_ticks_by_mode[cur_mode] = self.scan_ticks_by_mode.get(cur_mode, 0) + 1
 
         # Update live mark price & real-time unrealized PnL on all open grid positions
-        _, follower_ex = self.get_leader_And_follower_cfg()
+        follower_ex = self.get_execution_exchange_cfg(cfg)
+        sym_ex_id = str(follower_ex.get("exchange_id", "okx") or "okx").lower()
+        is_trad_or_non_okx = is_usd_equity_symbol(sym, sym_ex_id) or sym_ex_id != "okx"
         grid_rt_fee = self._get_grid_rt_fee(cfg, tracker.active_grid_mode, follower_ex)
         for gk, gpos in list(self.active_grid_positions.items()):
             if gpos.get("symbol") == sym:
@@ -2652,12 +2681,24 @@ class BidirectionalSniperEngine:
         )
         allow_entries = allow_recenter and self._passes_grid_risk_checks(cfg)
         if cur_mode == "LIVE":
-            if follower_ex.get("auth_status") != "VERIFIED" or not self.gateway.okx_connected:
+            if is_trad_or_non_okx:
+                allow_entries = False
+                now_blk_m = mono_ms()
+                if now_blk_m - self._grid_block_log_ts.get(sym, 0.0) >= 60_000.0:
+                    self._grid_block_log_ts[sym] = now_blk_m
+                    native_code = to_broker_native_symbol(sym, sym_ex_id)
+                    self.append_log(
+                        "WARN",
+                        sym,
+                        f"[实盘通道隔离] {sym} 已绑定 {follower_ex.get('display_name', sym_ex_id.upper())} ({native_code})，该券商暂未开放实盘发单，已隔离拦截防止误发 OKX",
+                        mode="LIVE",
+                    )
+            elif follower_ex.get("auth_status") != "VERIFIED" or not self.gateway.okx_connected:
                 allow_entries = False
 
-        api_key = (follower_ex.get("api_key") or "").strip()
+        api_key = (follower_ex.get("api_key") or "").strip() if not is_trad_or_non_okx else ""
         okx_meta = self.executor._get_okx_meta(api_key) if api_key else {"posMode": "net_mode"}
-        is_net_mode = (cur_mode == "LIVE") and (okx_meta.get("posMode", "net_mode") == "net_mode")
+        is_net_mode = (cur_mode == "LIVE") and (not is_trad_or_non_okx) and (okx_meta.get("posMode", "net_mode") == "net_mode")
 
         entries, exits = tracker.evaluate_tick(
             bid=bid,
@@ -2794,10 +2835,13 @@ class BidirectionalSniperEngine:
         if not self.trading_active_by_mode.get(cur_mode, False):
             return
 
-        _, follower_ex = self.get_leader_And_follower_cfg()
+        follower_ex = self.get_execution_exchange_cfg(cfg)
+        sym_ex_id = str(follower_ex.get("exchange_id", "okx") or "okx").lower()
 
-        # In LIVE mode, strictly require verified Follower API credentials!
+        # In LIVE mode, strictly isolate non-OKX / traditional broker symbols and require verified OKX credentials
         if cur_mode == "LIVE":
+            if is_usd_equity_symbol(sym, sym_ex_id) or sym_ex_id != "okx":
+                return
             if follower_ex.get("auth_status") != "VERIFIED":
                 now_m = mono_ms()
                 if now_m - self._last_live_cred_warn_mono > 15000.0:
@@ -2944,7 +2988,8 @@ class BidirectionalSniperEngine:
         side = slot_info["side"]
         res_px = float(slot_info["reservation_price"])
         trig_px = float(slot_info["trigger_exec_price"])
-        leader_ex, follower_ex = self.get_leader_And_follower_cfg()
+        leader_ex, _ = self.get_leader_And_follower_cfg()
+        follower_ex = self.get_execution_exchange_cfg(cfg)
         grid_rt_fee = self._get_grid_rt_fee(cfg, tracker.active_grid_mode, follower_ex)
         mode_stats = self.stats_by_mode[exec_mode]
 
@@ -3303,7 +3348,7 @@ class BidirectionalSniperEngine:
         exec_mode: str,
     ):
         sym = cfg.symbol
-        _, follower_ex = self.get_leader_And_follower_cfg()
+        follower_ex = self.get_execution_exchange_cfg(cfg)
         try:
             async with self._get_symbol_exec_lock(sym):
                 lv = tracker.levels.get(slot_id)
@@ -3390,7 +3435,7 @@ class BidirectionalSniperEngine:
         if any residual exists, cancels all orders, market-closes residual, and re-verifies zero.
         """
         sym = cfg.symbol
-        _, follower_ex = self.get_leader_And_follower_cfg()
+        follower_ex = self.get_execution_exchange_cfg(cfg)
         try:
             async with self._get_symbol_exec_lock(sym):
                 if not tracker.needs_post_cycle_flat_reconcile():
@@ -3453,7 +3498,8 @@ class BidirectionalSniperEngine:
         slot_tp = float(lv.get("tp_price") or lv.get("target_price") or entry_avg)
         gk = f"{sym}:{slot_id}"
 
-        leader_ex, follower_ex = self.get_leader_And_follower_cfg()
+        leader_ex, _ = self.get_leader_And_follower_cfg()
+        follower_ex = self.get_execution_exchange_cfg(cfg)
         taker_fee = float(follower_ex.get("taker_fee", 0.0005))
         maker_fee = float(follower_ex.get("maker_fee", 0.0002))
 
@@ -3566,7 +3612,7 @@ class BidirectionalSniperEngine:
             return
         sym = cfg.symbol
         side = exit_items[0]["side"]
-        _, follower_ex = self.get_leader_And_follower_cfg()
+        follower_ex = self.get_execution_exchange_cfg(cfg)
         remaining_items: Optional[List[dict]] = None
 
         try:
@@ -3876,7 +3922,8 @@ class BidirectionalSniperEngine:
     # ==================== 8-Stage State Machine ====================
     async def _run_state_machine(self, cfg: SymbolStrategy, sig: SignalCandidate, exec_mode: str):
         sym = cfg.symbol
-        leader_ex, follower_ex = self.get_leader_And_follower_cfg()
+        leader_ex, _ = self.get_leader_And_follower_cfg()
+        follower_ex = self.get_execution_exchange_cfg(cfg)
         taker_fee = float(follower_ex.get("taker_fee", 0.0005))
         maker_fee = float(follower_ex.get("maker_fee", 0.0002))
         mode_Stats = self.stats_by_mode[exec_mode]
@@ -4675,8 +4722,21 @@ class BidirectionalSniperEngine:
                     else "GRID_WATCH"
                 )
 
+            sym_ex_id = str(getattr(cfg, "exchange_id", "okx") or "okx").lower()
+            is_equity_sym = is_usd_equity_symbol(sym, sym_ex_id)
+            sym_base = sym.split("/")[0].replace(".", "").upper()
+            asset_type = (
+                "US_STOCK"
+                if is_equity_sym
+                else ("STOCK_PERP" if sym_base in SP500_SYMBOL_NAMES else "CRYPTO_PERP")
+            )
             symbols_telemetry[sym] = {
                 "symbol": sym,
+                "exchange_id": sym_ex_id,
+                "native_symbol": to_broker_native_symbol(sym, sym_ex_id),
+                "asset_type": asset_type,
+                "quote_ccy": "USD" if is_equity_sym else "USDT",
+                "live_execution_supported": (not is_equity_sym) and sym_ex_id == "okx",
                 "strategy_type": cfg.strategy_type,
                 "grid_side_mode": cfg.grid_side_mode,
                 "grid": grid_snap,
@@ -5022,4 +5082,5 @@ class BidirectionalSniperEngine:
             strategies=list(self.strategies.values()),
             math_states=self.math_states,
             gateway=self.gateway,
+            all_exchanges=self.exchanges,
         )
