@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS users (
     vip_expires_at INTEGER DEFAULT 0,        -- Unix秒级时间戳, > now 即为有效会员
     register_ip VARCHAR(64) DEFAULT '',      -- 注册绑定 IP (一IP一号限制)
     last_login_ip VARCHAR(64) DEFAULT '',    -- 最近登录 IP
+    invite_code VARCHAR(32) DEFAULT '',      -- 用户专属邀请码
+    invited_by_user_id INTEGER DEFAULT 0,    -- 邀请人 user_id
+    invited_by_username VARCHAR(64) DEFAULT '', -- 邀请人用户名
+    points_balance INTEGER DEFAULT 0,        -- 当前可用积分余额
+    total_points_earned INTEGER DEFAULT 0,   -- 历史累计获得积分
+    total_invites_count INTEGER DEFAULT 0,   -- 成功邀请人数
     created_at TEXT DEFAULT '',
     last_login_at TEXT DEFAULT ''
 );
@@ -129,7 +135,37 @@ CREATE TABLE IF NOT EXISTS consumed_tx_hashes (
     order_no VARCHAR(64) DEFAULT '',
     archived_at TEXT DEFAULT ''
 );
+
+-- 13. 邀请积分明细流水表
+CREATE TABLE IF NOT EXISTS points_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    username VARCHAR(64) NOT NULL,
+    change_points INTEGER NOT NULL,
+    balance_after INTEGER NOT NULL,
+    action_type VARCHAR(32) NOT NULL,        -- 'INVITE_REWARD_INVITER' | 'INVITE_REWARD_INVITEE' | 'REDEEM_VIP' | 'ADMIN_ADJUST'
+    related_user_id INTEGER DEFAULT 0,
+    related_username VARCHAR(64) DEFAULT '',
+    note TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    created_at_ts INTEGER NOT NULL
+);
+
+-- 14. 邀请奖励与积分兑换全局规则表（管理员后台可配置）
+CREATE TABLE IF NOT EXISTS referral_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    invite_enabled BOOLEAN DEFAULT 1,
+    inviter_reward_points INTEGER DEFAULT 100,
+    invitee_reward_points INTEGER DEFAULT 100,
+    redeem_enabled BOOLEAN DEFAULT 1,
+    points_per_vip_hour INTEGER DEFAULT 100,
+    max_redeem_hours_per_tx INTEGER DEFAULT 720,
+    updated_at TEXT DEFAULT ''
+);
 """
+
+INVITE_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+LOOPBACK_IPS = {"127.0.0.1", "::1", "localhost", "testclient"}
 
 FEEDBACK_SUBMIT_COOLDOWN_SECONDS = 86400
 FEEDBACK_USER_DELETE_MIN_AGE_SECONDS = 86400
@@ -221,9 +257,36 @@ def _now_str() -> str:
 def _fmt_ts(ts: int) -> str:
     if not ts or ts <= 0:
         return "未开通"
-    if ts > int(time.time()) + 3650 * 86400:
+    now_s = int(time.time())
+    if ts > now_s + 3650 * 86400:
         return "永久有效"
+    if 0 < (ts - now_s) < 86400:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def _format_vip_remaining_label(remaining_sec: int, role: str = "user", exp: int = 0) -> str:
+    if role == "admin":
+        return "永久有效"
+    if remaining_sec <= 0:
+        return "已过期" if exp > 0 else "未开通"
+    if remaining_sec > 3650 * 86400:
+        return "永久有效"
+    days, rem = divmod(remaining_sec, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    if days > 0:
+        return f"{days}天{hours}小时" if hours > 0 else f"{days}天"
+    if hours > 0:
+        return f"{hours}小时{mins}分" if mins > 0 else f"{hours}小时"
+    if mins > 0:
+        return f"{mins}分{secs}秒" if secs > 0 else f"{mins}分钟"
+    return f"{secs}秒"
+
+
+def _gen_invite_code() -> str:
+    suffix = "".join(secrets.choice(INVITE_CODE_ALPHABET) for _ in range(8))
+    return f"INV-{suffix}"
 
 
 def _format_duration_cn(seconds: int) -> str:
@@ -323,6 +386,7 @@ class UserMembershipManager:
             try:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_user_created ON user_feedback_messages(user_id, created_at_ts DESC)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_admin_status ON user_feedback_messages(admin_deleted, status, created_at_ts DESC)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_points_ledger_user ON points_ledger(user_id, created_at_ts DESC, id DESC)")
             except Exception:
                 pass
 
@@ -342,17 +406,37 @@ class UserMembershipManager:
                 if col_name not in existing_cols:
                     cur.execute(ddl)
 
-            # Safe schema migration for users IP tracking columns
+            # Safe schema migration for users IP, invite code & points columns
             user_cols = {
                 row[1] for row in cur.execute("PRAGMA table_info(users)").fetchall()
             }
-            if "register_ip" not in user_cols:
-                cur.execute("ALTER TABLE users ADD COLUMN register_ip VARCHAR(64) DEFAULT ''")
-            if "last_login_ip" not in user_cols:
-                cur.execute("ALTER TABLE users ADD COLUMN last_login_ip VARCHAR(64) DEFAULT ''")
+            user_migrations = [
+                ("register_ip", "ALTER TABLE users ADD COLUMN register_ip VARCHAR(64) DEFAULT ''"),
+                ("last_login_ip", "ALTER TABLE users ADD COLUMN last_login_ip VARCHAR(64) DEFAULT ''"),
+                ("invite_code", "ALTER TABLE users ADD COLUMN invite_code VARCHAR(32) DEFAULT ''"),
+                ("invited_by_user_id", "ALTER TABLE users ADD COLUMN invited_by_user_id INTEGER DEFAULT 0"),
+                ("invited_by_username", "ALTER TABLE users ADD COLUMN invited_by_username VARCHAR(64) DEFAULT ''"),
+                ("points_balance", "ALTER TABLE users ADD COLUMN points_balance INTEGER DEFAULT 0"),
+                ("total_points_earned", "ALTER TABLE users ADD COLUMN total_points_earned INTEGER DEFAULT 0"),
+                ("total_invites_count", "ALTER TABLE users ADD COLUMN total_invites_count INTEGER DEFAULT 0"),
+            ]
+            for col_name, ddl in user_migrations:
+                if col_name not in user_cols:
+                    cur.execute(ddl)
 
             now_s = int(time.time())
             now_str = _now_str()
+
+            # 0. Seed Default Referral & Points Settings if empty
+            cur.execute("SELECT COUNT(*) FROM referral_settings WHERE id = 1")
+            if cur.fetchone()[0] == 0:
+                cur.execute(
+                    """INSERT INTO referral_settings
+                       (id, invite_enabled, inviter_reward_points, invitee_reward_points,
+                        redeem_enabled, points_per_vip_hour, max_redeem_hours_per_tx, updated_at)
+                       VALUES (1, 1, 100, 100, 1, 100, 720, ?)""",
+                    (now_str,),
+                )
 
             # 1. Seed Default Membership Plans if empty
             cur.execute("SELECT COUNT(*) FROM membership_plans")
@@ -375,14 +459,75 @@ class UserMembershipManager:
             cur.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'")
             if cur.fetchone()[0] == 0:
                 cur.execute(
-                    """INSERT INTO users (username, email, password_hash, role, is_active, vip_tier, vip_expires_at, created_at, last_login_at)
-                       VALUES (?, ?, ?, 'admin', 1, '终身至尊版会员', ?, ?, ?)""",
-                    ("admin", "admin@sniper-engine.io", hash_password("admin123456"), now_s + 36500 * 86400, now_str, now_str),
+                    """INSERT INTO users (username, email, password_hash, role, is_active, vip_tier, vip_expires_at, invite_code, created_at, last_login_at)
+                       VALUES (?, ?, ?, 'admin', 1, '终身至尊版会员', ?, ?, ?, ?)""",
+                    ("admin", "admin@sniper-engine.io", hash_password("admin123456"), now_s + 36500 * 86400, self._allocate_unique_invite_code_in_tx(cur), now_str, now_str),
                 )
+
+            # 4. Backfill unique personal invite_code for every existing user missing one
+            missing_inv = cur.execute(
+                "SELECT id FROM users WHERE invite_code IS NULL OR TRIM(invite_code) = ''"
+            ).fetchall()
+            for r_uid in missing_inv:
+                code_val = self._allocate_unique_invite_code_in_tx(cur)
+                cur.execute("UPDATE users SET invite_code = ? WHERE id = ?", (code_val, int(r_uid[0])))
+
+            try:
+                cur.execute(
+                    """CREATE UNIQUE INDEX IF NOT EXISTS idx_users_invite_code_upper
+                       ON users(UPPER(invite_code))
+                       WHERE invite_code != ''"""
+                )
+            except Exception:
+                pass
 
             conn.commit()
         finally:
             conn.close()
+
+    @staticmethod
+    def _allocate_unique_invite_code_in_tx(cur: sqlite3.Cursor) -> str:
+        for _ in range(32):
+            cand = _gen_invite_code()
+            exists = cur.execute("SELECT id FROM users WHERE UPPER(invite_code) = ?", (cand,)).fetchone()
+            if not exists:
+                return cand
+        return f"INV-{secrets.token_hex(5).upper()}"
+
+    def _get_referral_settings_in_tx(self, cur: sqlite3.Cursor) -> Dict[str, Any]:
+        row = cur.execute("SELECT * FROM referral_settings WHERE id = 1").fetchone()
+        if not row:
+            return {
+                "invite_enabled": True,
+                "inviter_reward_points": 100,
+                "invitee_reward_points": 100,
+                "redeem_enabled": True,
+                "points_per_vip_hour": 100,
+                "max_redeem_hours_per_tx": 720,
+                "updated_at": "",
+            }
+        # Support both sqlite3.Row and tuple cursors safely
+        if isinstance(row, sqlite3.Row):
+            d = dict(row)
+        else:
+            d = {
+                "invite_enabled": row[1],
+                "inviter_reward_points": row[2],
+                "invitee_reward_points": row[3],
+                "redeem_enabled": row[4],
+                "points_per_vip_hour": row[5],
+                "max_redeem_hours_per_tx": row[6],
+                "updated_at": row[7] if len(row) > 7 else "",
+            }
+        return {
+            "invite_enabled": bool(d.get("invite_enabled", 1)),
+            "inviter_reward_points": max(0, int(d.get("inviter_reward_points", 100) or 0)),
+            "invitee_reward_points": max(0, int(d.get("invitee_reward_points", 100) or 0)),
+            "redeem_enabled": bool(d.get("redeem_enabled", 1)),
+            "points_per_vip_hour": max(1, int(d.get("points_per_vip_hour", 100) or 100)),
+            "max_redeem_hours_per_tx": max(1, int(d.get("max_redeem_hours_per_tx", 720) or 720)),
+            "updated_at": str(d.get("updated_at") or ""),
+        }
 
     def _format_user_row(self, row: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
         d = dict(row)
@@ -392,7 +537,8 @@ class UserMembershipManager:
         role = d.get("role", "user")
         is_active = bool(d.get("is_active", 1))
         is_vip = (role == "admin") or (exp > now_s)
-        remaining_days = max(0, int((exp - now_s) / 86400)) if exp > now_s else (36500 if role == "admin" else 0)
+        remaining_sec = (36500 * 86400) if role == "admin" else max(0, exp - now_s)
+        remaining_days = remaining_sec // 86400 if remaining_sec > 0 else 0
 
         if role == "admin":
             vip_status = "ACTIVE"
@@ -413,9 +559,17 @@ class UserMembershipManager:
         d["vip_status"] = vip_status
         d["vip_label"] = vip_label
         d["vip_remaining_days"] = remaining_days
+        d["vip_remaining_seconds"] = remaining_sec
+        d["vip_remaining_label"] = _format_vip_remaining_label(remaining_sec, role=role, exp=exp)
         d["vip_expires_str"] = "永久有效" if role == "admin" else _fmt_ts(exp)
         d["register_ip"] = d.get("register_ip") or ""
         d["last_login_ip"] = d.get("last_login_ip") or ""
+        d["invite_code"] = d.get("invite_code") or ""
+        d["invited_by_user_id"] = int(d.get("invited_by_user_id") or 0)
+        d["invited_by_username"] = d.get("invited_by_username") or ""
+        d["points_balance"] = max(0, int(d.get("points_balance") or 0))
+        d["total_points_earned"] = max(0, int(d.get("total_points_earned") or 0))
+        d["total_invites_count"] = max(0, int(d.get("total_invites_count") or 0))
         d["can_see_live"] = is_active
         d["can_use_live"] = is_active and is_vip
         return d
@@ -478,7 +632,14 @@ class UserMembershipManager:
             conn.close()
 
     # ==================== Auth Endpoints Logic ====================
-    def register_user(self, username: str, password: str, email: str = "", client_ip: str = "") -> Dict[str, Any]:
+    def register_user(
+        self,
+        username: str,
+        password: str,
+        email: str = "",
+        client_ip: str = "",
+        invite_code: str = "",
+    ) -> Dict[str, Any]:
         uname = username.strip()
         if len(uname) < 3 or len(uname) > 32:
             return {"ok": False, "message": "用户名长度需在 3 ~ 32 个字符之间"}
@@ -490,11 +651,13 @@ class UserMembershipManager:
         if clean_email and ("@" not in clean_email or len(clean_email) > 120):
             return {"ok": False, "message": "请输入格式有效的邮箱地址"}
         clean_ip = (client_ip or "").strip()
+        clean_invite = (invite_code or "").strip().upper()
 
-        conn = self._connect()
+        conn = self._connect(isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:
             cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
             # Enforce 1 account per IP address restriction
             if clean_ip:
                 ip_row = cur.execute(
@@ -502,6 +665,7 @@ class UserMembershipManager:
                     (clean_ip,),
                 ).fetchone()
                 if ip_row:
+                    conn.rollback()
                     return {
                         "ok": False,
                         "message": f"当前 IP ({clean_ip}) 已注册过账号，系统限制每个 IP 仅允许注册一个账户，请直接登录已有账号",
@@ -509,29 +673,144 @@ class UserMembershipManager:
 
             existing = cur.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (uname,)).fetchone()
             if existing:
+                conn.rollback()
                 return {"ok": False, "message": f"用户名 '{uname}' 已被注册，请更换其他用户名"}
+
+            ref_cfg = self._get_referral_settings_in_tx(cur)
+            inviter_row = None
+            inviter_bonus = 0
+            invitee_bonus = 0
+            if clean_invite:
+                inviter_row = cur.execute(
+                    "SELECT * FROM users WHERE UPPER(invite_code) = ? LIMIT 1",
+                    (clean_invite,),
+                ).fetchone()
+                if not inviter_row:
+                    conn.rollback()
+                    return {"ok": False, "message": f"邀请码「{clean_invite}」不存在，请核对后重试（如无邀请码请留空）"}
+                if not bool(inviter_row["is_active"]):
+                    conn.rollback()
+                    return {"ok": False, "message": "该邀请码所属账号状态异常，暂不可使用"}
+                # Block non-loopback same-IP self-referral abuse
+                if clean_ip and clean_ip.lower() not in LOOPBACK_IPS:
+                    inv_reg_ip = str(inviter_row["register_ip"] or "").strip()
+                    inv_log_ip = str(inviter_row["last_login_ip"] or "").strip()
+                    if clean_ip == inv_reg_ip or clean_ip == inv_log_ip:
+                        conn.rollback()
+                        return {"ok": False, "message": "检测到与邀请人同网络 IP，不能使用本人或同 IP 账号的邀请码注册"}
+                if ref_cfg["invite_enabled"]:
+                    inviter_bonus = int(ref_cfg["inviter_reward_points"])
+                    invitee_bonus = int(ref_cfg["invitee_reward_points"])
+
+            now_s = int(time.time())
             now_str = _now_str()
             pwd_hash = hash_password(password)
+            personal_invite_code = self._allocate_unique_invite_code_in_tx(cur)
+            inviter_uid = int(inviter_row["id"]) if inviter_row else 0
+            inviter_uname = str(inviter_row["username"]) if inviter_row else ""
+
             cur.execute(
                 """INSERT INTO users
-                   (username, email, password_hash, role, is_active, vip_tier, vip_expires_at, register_ip, last_login_ip, created_at, last_login_at)
-                   VALUES (?, ?, ?, 'user', 1, 'NONE', 0, ?, ?, ?, ?)""",
-                (uname, clean_email, pwd_hash, clean_ip, clean_ip, now_str, now_str),
+                   (username, email, password_hash, role, is_active, vip_tier, vip_expires_at,
+                    register_ip, last_login_ip, invite_code, invited_by_user_id, invited_by_username,
+                    points_balance, total_points_earned, total_invites_count, created_at, last_login_at)
+                   VALUES (?, ?, ?, 'user', 1, 'NONE', 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+                (
+                    uname,
+                    clean_email,
+                    pwd_hash,
+                    clean_ip,
+                    clean_ip,
+                    personal_invite_code,
+                    inviter_uid,
+                    inviter_uname,
+                    invitee_bonus,
+                    invitee_bonus,
+                    now_str,
+                    now_str,
+                ),
             )
-            uid = cur.lastrowid
+            uid = int(cur.lastrowid)
+
+            if inviter_row:
+                new_inviter_bal = int(inviter_row["points_balance"] or 0) + inviter_bonus
+                new_inviter_earned = int(inviter_row["total_points_earned"] or 0) + inviter_bonus
+                new_inviter_cnt = int(inviter_row["total_invites_count"] or 0) + 1
+                cur.execute(
+                    """UPDATE users
+                       SET points_balance = ?, total_points_earned = ?, total_invites_count = ?
+                       WHERE id = ?""",
+                    (new_inviter_bal, new_inviter_earned, new_inviter_cnt, inviter_uid),
+                )
+                if inviter_bonus > 0:
+                    cur.execute(
+                        """INSERT INTO points_ledger
+                           (user_id, username, change_points, balance_after, action_type,
+                            related_user_id, related_username, note, created_at, created_at_ts)
+                           VALUES (?, ?, ?, ?, 'INVITE_REWARD_INVITER', ?, ?, ?, ?, ?)""",
+                        (
+                            inviter_uid,
+                            inviter_uname,
+                            inviter_bonus,
+                            new_inviter_bal,
+                            uid,
+                            uname,
+                            f"邀请好友 {uname} 注册成功奖励 +{inviter_bonus} 积分",
+                            now_str,
+                            now_s,
+                        ),
+                    )
+                if invitee_bonus > 0:
+                    cur.execute(
+                        """INSERT INTO points_ledger
+                           (user_id, username, change_points, balance_after, action_type,
+                            related_user_id, related_username, note, created_at, created_at_ts)
+                           VALUES (?, ?, ?, ?, 'INVITE_REWARD_INVITEE', ?, ?, ?, ?, ?)""",
+                        (
+                            uid,
+                            uname,
+                            invitee_bonus,
+                            invitee_bonus,
+                            inviter_uid,
+                            inviter_uname,
+                            f"使用 {inviter_uname} 邀请码 ({clean_invite}) 注册奖励 +{invitee_bonus} 积分",
+                            now_str,
+                            now_s,
+                        ),
+                    )
+
             conn.commit()
             try:
-                AsyncDatabaseManager(self.db_path).ensure_user_workspace_sync(int(uid))
+                AsyncDatabaseManager(self.db_path).ensure_user_workspace_sync(uid)
             except Exception:
                 pass
             user = self.get_user_by_id(uid)
             token = create_auth_token(uid, uname, "user", pwd_hash)
+            if inviter_row and (invitee_bonus > 0 or inviter_bonus > 0):
+                if invitee_bonus == inviter_bonus:
+                    bonus_desc = f"您与邀请人【{inviter_uname}】各获得 +{invitee_bonus} 积分"
+                else:
+                    bonus_desc = f"您获得 +{invitee_bonus} 积分，邀请人【{inviter_uname}】获得 +{inviter_bonus} 积分"
+                msg = (
+                    f"注册成功！受邀福利已到账：{bonus_desc}"
+                    f"（满 {ref_cfg['points_per_vip_hour']} 积分即可在会员中心兑换 1 小时实盘 VIP 会员）"
+                )
+            elif inviter_row and not ref_cfg["invite_enabled"]:
+                msg = "注册成功！（当前管理员暂未开启邀请积分奖励，开通会员后即可启动 24h 实盘交易）"
+            else:
+                msg = "注册成功！您已解锁「实盘通道」与专属邀请码，邀请好友或开通会员后即可启动 24h 实盘自动交易"
             return {
                 "ok": True,
-                "message": "注册成功！您已解锁「实盘通道」与独立账户配置空间，开通会员后即可启动 24h 实盘自动交易",
+                "message": msg,
                 "token": token,
                 "user": user,
             }
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
 
@@ -626,17 +905,33 @@ class UserMembershipManager:
         finally:
             conn.close()
 
-    def _extend_user_vip_in_tx(self, cur: sqlite3.Cursor, user_id: int, add_days: int, tier_name: str) -> int:
-        row = cur.execute("SELECT vip_expires_at FROM users WHERE id = ?", (user_id,)).fetchone()
+    def _extend_user_vip_seconds_in_tx(
+        self,
+        cur: sqlite3.Cursor,
+        user_id: int,
+        add_seconds: int,
+        tier_name: str,
+        preserve_active_tier: bool = False,
+    ) -> int:
+        row = cur.execute("SELECT vip_tier, vip_expires_at FROM users WHERE id = ?", (user_id,)).fetchone()
         now_s = int(time.time())
-        current_exp = int(row[0] or 0) if row else 0
+        current_exp = int(row[1] or 0) if row else 0
+        current_tier = str(row[0] or "NONE") if row else "NONE"
         base_ts = max(now_s, current_exp)
-        new_exp = base_ts + int(add_days) * 86400
+        new_exp = base_ts + int(add_seconds)
+        eff_tier = (
+            current_tier
+            if (preserve_active_tier and current_exp > now_s and current_tier and current_tier != "NONE")
+            else tier_name
+        )
         cur.execute(
             "UPDATE users SET vip_tier = ?, vip_expires_at = ? WHERE id = ?",
-            (tier_name, new_exp, user_id),
+            (eff_tier, new_exp, user_id),
         )
         return new_exp
+
+    def _extend_user_vip_in_tx(self, cur: sqlite3.Cursor, user_id: int, add_days: int, tier_name: str) -> int:
+        return self._extend_user_vip_seconds_in_tx(cur, user_id, int(add_days) * 86400, tier_name)
 
     def _expire_overdue_orders_in_tx(self, cur: sqlite3.Cursor) -> int:
         now_s = int(time.time())
@@ -1089,8 +1384,11 @@ class UserMembershipManager:
             if search.strip():
                 q = f"%{search.strip()}%"
                 rows = conn.execute(
-                    "SELECT * FROM users WHERE username LIKE ? OR email LIKE ? OR vip_tier LIKE ? ORDER BY id ASC",
-                    (q, q, q),
+                    """SELECT * FROM users
+                       WHERE username LIKE ? OR email LIKE ? OR vip_tier LIKE ?
+                          OR invite_code LIKE ? OR invited_by_username LIKE ?
+                       ORDER BY id ASC""",
+                    (q, q, q, q, q),
                 ).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM users ORDER BY id ASC").fetchall()
@@ -1119,9 +1417,9 @@ class UserMembershipManager:
                 else ("终身至尊版会员" if req.role == "admin" else ("专业版会员" if req.vip_days > 0 else "NONE"))
             )
             cur.execute(
-                """INSERT INTO users (username, email, password_hash, role, is_active, vip_tier, vip_expires_at, created_at, last_login_at)
-                   VALUES (?, ?, ?, ?, 1, ?, ?, ?, '')""",
-                (uname, req.email.strip(), hash_password(req.password), req.role, tier, exp, now_str),
+                """INSERT INTO users (username, email, password_hash, role, is_active, vip_tier, vip_expires_at, invite_code, created_at, last_login_at)
+                   VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, '')""",
+                (uname, req.email.strip(), hash_password(req.password), req.role, tier, exp, self._allocate_unique_invite_code_in_tx(cur), now_str),
             )
             uid = cur.lastrowid
             if req.vip_days > 0:
@@ -1181,39 +1479,71 @@ class UserMembershipManager:
             conn.close()
 
     def admin_grant_vip(self, req: AdminGrantVipRequest) -> Dict[str, Any]:
-        conn = self._connect()
+        conn = self._connect(isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:
             cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
             row = cur.execute("SELECT * FROM users WHERE id = ?", (req.user_id,)).fetchone()
             if not row:
+                conn.rollback()
                 return {"ok": False, "message": "用户不存在"}
 
             now_str = _now_str()
             now_s = int(time.time())
-            if req.revoke or req.add_days <= 0:
+            add_days = int(getattr(req, "add_days", 0) or 0)
+            add_hours = int(getattr(req, "add_hours", 0) or 0)
+            if req.revoke or add_days < 0:
                 if row["username"] == "admin":
+                    conn.rollback()
                     return {"ok": False, "message": "系统默认超级管理员不可收回实盘权限"}
                 cur.execute("UPDATE users SET vip_tier = 'NONE', vip_expires_at = 0 WHERE id = ?", (req.user_id,))
                 conn.commit()
                 return {"ok": True, "message": f"已取消用户 {row['username']} 的会员资格"}
 
-            self._extend_user_vip_in_tx(cur, req.user_id, req.add_days, req.vip_tier or "专业版会员")
+            total_add_sec = add_days * 86400 + add_hours * 3600
+            if total_add_sec <= 0:
+                conn.rollback()
+                return {"ok": False, "message": "请设置大于 0 的开通天数或小时数（如需收回会员请点击「收回会员资格」）"}
+
+            self._extend_user_vip_seconds_in_tx(cur, req.user_id, total_add_sec, req.vip_tier or "专业版会员")
             order_no = f"ADM{time.strftime('%Y%m%d%H%M%S')}{secrets.randbelow(900)+100}"
+            dur_desc = (
+                f"+{add_days}天{add_hours}小时"
+                if (add_days > 0 and add_hours > 0)
+                else (f"+{add_days}天" if add_days > 0 else f"+{add_hours}小时")
+            )
             cur.execute(
                 """INSERT INTO membership_orders
                    (order_no, user_id, username, plan_id, plan_name, duration_days,
                     amount_usdt, base_amount_usdt, pay_amount_usdt, pay_method,
                     chain_network, wallet_address, tx_hash, status, created_at, paid_at,
                     created_at_ts, expires_at_ts)
-                   VALUES (?, ?, ?, 0, ?, ?, 0.0, 0.0, 0.0, 'ADMIN_GRANT', 'ADMIN', '', '管理员后台手动开通/延期', 'PAID', ?, ?, ?, ?)""",
-                (order_no, req.user_id, row["username"], req.vip_tier, req.add_days, now_str, now_str, now_s, now_s),
+                   VALUES (?, ?, ?, 0, ?, ?, 0.0, 0.0, 0.0, 'ADMIN_GRANT', 'ADMIN', '', ?, 'PAID', ?, ?, ?, ?)""",
+                (
+                    order_no,
+                    req.user_id,
+                    row["username"],
+                    req.vip_tier,
+                    add_days,
+                    f"管理员后台手动开通/延期 ({dur_desc})",
+                    now_str,
+                    now_str,
+                    now_s,
+                    now_s,
+                ),
             )
             conn.commit()
             return {
                 "ok": True,
-                "message": f"已为用户 {row['username']} 开通/延期【{req.vip_tier}】 +{req.add_days} 天",
+                "message": f"已为用户 {row['username']} 开通/延期【{req.vip_tier}】 {dur_desc}",
             }
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
 
@@ -1358,6 +1688,7 @@ class UserMembershipManager:
                 conn.commit()
                 return {
                     "ok": True,
+                    "user_id": int(o_row["user_id"]),
                     "message": f"订单 {o_row['order_no']} 已审核通过，已为用户 {o_row['username']} 自动开通【{o_row['plan_name']}】",
                 }
             elif action == "EXPIRE":
@@ -1800,6 +2131,340 @@ class UserMembershipManager:
         finally:
             conn.close()
 
+    # ==================== Referral Invite & Points Redemption System ====================
+    def get_referral_settings(self) -> Dict[str, Any]:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            return self._get_referral_settings_in_tx(conn.cursor())
+        finally:
+            conn.close()
+
+    def get_user_referral_summary(self, user_id: int) -> Dict[str, Any]:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            u_row = cur.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not u_row:
+                return {"ok": False, "message": "用户不存在"}
+            u = self._format_user_row(u_row)
+            settings = self._get_referral_settings_in_tx(cur)
+
+            invited_rows = cur.execute(
+                """SELECT id, username, role, is_active, vip_tier, vip_expires_at, created_at
+                   FROM users
+                   WHERE invited_by_user_id = ?
+                   ORDER BY id DESC
+                   LIMIT 100""",
+                (user_id,),
+            ).fetchall()
+            invited_users = []
+            for r in invited_rows:
+                fu = self._format_user_row(r)
+                invited_users.append(
+                    {
+                        "id": fu["id"],
+                        "username": fu["username"],
+                        "created_at": fu["created_at"],
+                        "is_vip": fu["is_vip"],
+                        "vip_label": fu["vip_label"],
+                    }
+                )
+
+            ledger_rows = cur.execute(
+                """SELECT * FROM points_ledger
+                   WHERE user_id = ?
+                   ORDER BY created_at_ts DESC, id DESC
+                   LIMIT 100""",
+                (user_id,),
+            ).fetchall()
+            ledger = [dict(r) for r in ledger_rows]
+            return {
+                "ok": True,
+                "invite_code": u["invite_code"],
+                "invited_by_username": u["invited_by_username"],
+                "points_balance": u["points_balance"],
+                "total_points_earned": u["total_points_earned"],
+                "total_invites_count": u["total_invites_count"],
+                "settings": settings,
+                "invited_users": invited_users,
+                "ledger": ledger,
+                "user": u,
+            }
+        finally:
+            conn.close()
+
+    def redeem_points_for_vip(self, user_id: int, hours: int = 1) -> Dict[str, Any]:
+        req_hours = int(hours or 0)
+        if req_hours <= 0:
+            return {"ok": False, "message": "兑换时长至少为 1 小时"}
+
+        conn = self._connect(isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            settings = self._get_referral_settings_in_tx(cur)
+            if not settings["redeem_enabled"]:
+                conn.rollback()
+                return {"ok": False, "message": "管理员已暂时关闭积分兑换会员功能"}
+            max_h = int(settings["max_redeem_hours_per_tx"])
+            if req_hours > max_h:
+                conn.rollback()
+                return {"ok": False, "message": f"单次最多兑换 {max_h} 小时会员"}
+
+            u_row = cur.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not u_row or not bool(u_row["is_active"]):
+                conn.rollback()
+                return {"ok": False, "message": "用户不存在或已被封禁"}
+
+            rate = int(settings["points_per_vip_hour"])
+            cost_points = req_hours * rate
+            cur_bal = max(0, int(u_row["points_balance"] or 0))
+            if cur_bal < cost_points:
+                conn.rollback()
+                return {
+                    "ok": False,
+                    "message": f"积分余额不足：兑换 {req_hours} 小时会员需要 {cost_points} 积分，当前可用 {cur_bal} 积分",
+                }
+
+            new_bal = cur_bal - cost_points
+            cur.execute(
+                "UPDATE users SET points_balance = points_balance - ? WHERE id = ? AND points_balance >= ?",
+                (cost_points, user_id, cost_points),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return {"ok": False, "message": "积分余额不足或并发冲突，请重试"}
+
+            now_s = int(time.time())
+            now_str = _now_str()
+            tier_label = f"积分兑换会员 ({req_hours}小时)"
+            self._extend_user_vip_seconds_in_tx(
+                cur,
+                user_id,
+                req_hours * 3600,
+                tier_label,
+                preserve_active_tier=True,
+            )
+
+            note_str = f"消耗 {cost_points} 积分兑换 {req_hours} 小时 VIP 会员"
+            cur.execute(
+                """INSERT INTO points_ledger
+                   (user_id, username, change_points, balance_after, action_type,
+                    related_user_id, related_username, note, created_at, created_at_ts)
+                   VALUES (?, ?, ?, ?, 'REDEEM_VIP', 0, '', ?, ?, ?)""",
+                (user_id, u_row["username"], -cost_points, new_bal, note_str, now_str, now_s),
+            )
+
+            order_no = f"PTS{time.strftime('%Y%m%d%H%M%S')}{secrets.randbelow(900)+100}"
+            cur.execute(
+                """INSERT INTO membership_orders
+                   (order_no, user_id, username, plan_id, plan_name, duration_days,
+                    amount_usdt, base_amount_usdt, pay_amount_usdt, pay_method,
+                    chain_network, wallet_address, tx_hash, status, created_at, paid_at,
+                    created_at_ts, expires_at_ts)
+                   VALUES (?, ?, ?, 0, ?, 0, 0.0, 0.0, 0.0, 'POINTS_REDEEM', 'POINTS', '', ?, 'PAID', ?, ?, ?, ?)""",
+                (order_no, user_id, u_row["username"], tier_label, note_str, now_str, now_str, now_s, now_s),
+            )
+            conn.commit()
+            updated_u = self.get_user_by_id(user_id)
+            return {
+                "ok": True,
+                "message": f"积分兑换成功！已消耗 {cost_points} 积分，为您开通/延长 +{req_hours} 小时实盘 VIP 会员！",
+                "cost_points": cost_points,
+                "hours_added": req_hours,
+                "user": updated_u,
+                "referral": self.get_user_referral_summary(user_id),
+                "orders": self.list_user_orders(user_id),
+            }
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def admin_update_referral_settings(self, req: Any) -> Dict[str, Any]:
+        conn = self._connect()
+        try:
+            now_str = _now_str()
+            conn.execute(
+                """INSERT INTO referral_settings
+                   (id, invite_enabled, inviter_reward_points, invitee_reward_points,
+                    redeem_enabled, points_per_vip_hour, max_redeem_hours_per_tx, updated_at)
+                   VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       invite_enabled = excluded.invite_enabled,
+                       inviter_reward_points = excluded.inviter_reward_points,
+                       invitee_reward_points = excluded.invitee_reward_points,
+                       redeem_enabled = excluded.redeem_enabled,
+                       points_per_vip_hour = excluded.points_per_vip_hour,
+                       max_redeem_hours_per_tx = excluded.max_redeem_hours_per_tx,
+                       updated_at = excluded.updated_at""",
+                (
+                    1 if req.invite_enabled else 0,
+                    max(0, int(req.inviter_reward_points)),
+                    max(0, int(req.invitee_reward_points)),
+                    1 if req.redeem_enabled else 0,
+                    max(1, int(req.points_per_vip_hour)),
+                    max(1, int(req.max_redeem_hours_per_tx)),
+                    now_str,
+                ),
+            )
+            conn.commit()
+            return {
+                "ok": True,
+                "message": (
+                    f"邀请与积分规则已更新：邀请双方各得 +{req.inviter_reward_points}/{req.invitee_reward_points} 积分，"
+                    f"{req.points_per_vip_hour} 积分可兑换 1 小时会员"
+                ),
+                "settings": self.get_referral_settings(),
+            }
+        finally:
+            conn.close()
+
+    def admin_adjust_user_points(
+        self,
+        admin_username: str,
+        user_id: int,
+        delta_points: int,
+        note: str = "",
+    ) -> Dict[str, Any]:
+        delta = int(delta_points or 0)
+        if delta == 0:
+            return {"ok": False, "message": "调整积分数量不能为 0"}
+
+        conn = self._connect(isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            u_row = cur.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not u_row:
+                conn.rollback()
+                return {"ok": False, "message": "目标用户不存在"}
+
+            cur_bal = max(0, int(u_row["points_balance"] or 0))
+            new_bal = cur_bal + delta
+            if new_bal < 0:
+                conn.rollback()
+                return {
+                    "ok": False,
+                    "message": f"扣减失败：用户【{u_row['username']}】当前仅有 {cur_bal} 积分，无法扣减 {abs(delta)} 积分",
+                }
+
+            new_earned = max(0, int(u_row["total_points_earned"] or 0)) + (delta if delta > 0 else 0)
+            cur.execute(
+                "UPDATE users SET points_balance = ?, total_points_earned = ? WHERE id = ?",
+                (new_bal, new_earned, user_id),
+            )
+            now_s = int(time.time())
+            now_str = _now_str()
+            clean_note = (note or "").strip() or (
+                f"管理员 {admin_username} 手动发放 +{delta} 积分"
+                if delta > 0
+                else f"管理员 {admin_username} 手动扣减 {delta} 积分"
+            )
+            cur.execute(
+                """INSERT INTO points_ledger
+                   (user_id, username, change_points, balance_after, action_type,
+                    related_user_id, related_username, note, created_at, created_at_ts)
+                   VALUES (?, ?, ?, ?, 'ADMIN_ADJUST', 0, ?, ?, ?, ?)""",
+                (user_id, u_row["username"], delta, new_bal, admin_username or "admin", clean_note, now_str, now_s),
+            )
+            conn.commit()
+            sign_str = f"+{delta}" if delta > 0 else str(delta)
+            return {
+                "ok": True,
+                "message": f"已调整用户【{u_row['username']}】积分 {sign_str}（当前余额: {new_bal} 积分）",
+                "user": self.get_user_by_id(user_id),
+            }
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def admin_get_referral_overview(self, limit: int = 200) -> Dict[str, Any]:
+        lim = max(1, min(500, int(limit)))
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            settings = self._get_referral_settings_in_tx(cur)
+            ref_rows = cur.execute(
+                """SELECT u.id AS invitee_id, u.username AS invitee_username,
+                          u.invited_by_user_id AS inviter_id, u.invited_by_username AS inviter_username,
+                          u.created_at, u.vip_tier, u.vip_expires_at, u.role, u.is_active,
+                          inv.invite_code AS inviter_code
+                   FROM users u
+                   LEFT JOIN users inv ON inv.id = u.invited_by_user_id
+                   WHERE u.invited_by_user_id > 0
+                   ORDER BY u.id DESC
+                   LIMIT ?""",
+                (lim,),
+            ).fetchall()
+            referrals = []
+            for r in ref_rows:
+                now_s = int(time.time())
+                exp = int(r["vip_expires_at"] or 0)
+                is_vip = (r["role"] == "admin") or (exp > now_s)
+                referrals.append(
+                    {
+                        "invitee_id": int(r["invitee_id"]),
+                        "invitee_username": r["invitee_username"],
+                        "inviter_id": int(r["inviter_id"]),
+                        "inviter_username": r["inviter_username"],
+                        "inviter_code": r["inviter_code"] or "",
+                        "created_at": r["created_at"],
+                        "invitee_is_vip": is_vip,
+                    }
+                )
+
+            ledger_rows = cur.execute(
+                """SELECT * FROM points_ledger
+                   ORDER BY created_at_ts DESC, id DESC
+                   LIMIT ?""",
+                (lim,),
+            ).fetchall()
+            ledger = [dict(r) for r in ledger_rows]
+
+            pts_agg = cur.execute(
+                """SELECT
+                       COALESCE(SUM(points_balance), 0) AS total_bal,
+                       COALESCE(SUM(total_points_earned), 0) AS total_earned,
+                       COALESCE(SUM(total_invites_count), 0) AS total_invites
+                   FROM users"""
+            ).fetchone()
+            redeem_agg = cur.execute(
+                """SELECT
+                       COUNT(*) AS redeem_cnt,
+                       COALESCE(SUM(ABS(change_points)), 0) AS redeem_pts
+                   FROM points_ledger
+                   WHERE action_type = 'REDEEM_VIP'"""
+            ).fetchone()
+            return {
+                "settings": settings,
+                "referrals": referrals,
+                "ledger": ledger,
+                "stats": {
+                    "total_points_balance": int(pts_agg["total_bal"] or 0) if pts_agg else 0,
+                    "total_points_earned": int(pts_agg["total_earned"] or 0) if pts_agg else 0,
+                    "total_invites_count": int(pts_agg["total_invites"] or 0) if pts_agg else 0,
+                    "total_redeem_count": int(redeem_agg["redeem_cnt"] or 0) if redeem_agg else 0,
+                    "total_redeem_points": int(redeem_agg["redeem_pts"] or 0) if redeem_agg else 0,
+                },
+            }
+        finally:
+            conn.close()
+
     def _is_default_admin_password_in_use(self) -> bool:
         if self._default_admin_pwd_cached is not None:
             return self._default_admin_pwd_cached
@@ -1875,6 +2540,8 @@ class UserMembershipManager:
             conn.close()
 
         feedback_data = self.admin_list_feedback(limit=200)
+        referral_data = self.admin_get_referral_overview(limit=200)
+        ref_stats = referral_data["stats"]
 
         return {
             "stats": {
@@ -1893,6 +2560,10 @@ class UserMembershipManager:
                 "total_feedback_count": int(fb_agg[0] or 0) if fb_agg else 0,
                 "open_feedback_count": int(fb_agg[1] or 0) if fb_agg else 0,
                 "replied_feedback_count": int(fb_agg[2] or 0) if fb_agg else 0,
+                "total_points_balance": ref_stats["total_points_balance"],
+                "total_invites_count": ref_stats["total_invites_count"],
+                "total_redeem_count": ref_stats["total_redeem_count"],
+                "total_redeem_points": ref_stats["total_redeem_points"],
             },
             "security_warnings": {
                 "default_admin_password_in_use": self._is_default_admin_password_in_use(),
@@ -1902,6 +2573,9 @@ class UserMembershipManager:
             "vip_codes": codes,
             "plans": plans,
             "feedback_messages": feedback_data["messages"],
+            "referral_settings": referral_data["settings"],
+            "referral_records": referral_data["referrals"],
+            "points_ledger": referral_data["ledger"],
             "payment_info": self.get_payment_metadata(),
         }
 

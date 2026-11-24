@@ -1,13 +1,16 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   AlertCircle,
+  Award,
   BarChart2,
   Check,
   CheckCircle2,
   Clock,
+  Coins,
   Copy,
   CreditCard,
   Edit3,
+  Gift,
   Key,
   Lock,
   MessageSquare,
@@ -64,17 +67,48 @@ function formatDurationCn(seconds) {
   return `${secs}秒`;
 }
 
+function formatPointsActionLabel(actionType) {
+  switch (actionType) {
+    case 'INVITE_REWARD_INVITER':
+    case 'INVITE_INVITER':
+      return '邀请好友奖励';
+    case 'INVITE_REWARD_INVITEE':
+    case 'INVITE_INVITEE':
+      return '受邀注册奖励';
+    case 'REDEEM_VIP':
+      return '积分兑换会员';
+    case 'ADMIN_ADJUST':
+      return '管理员调整';
+    default:
+      return actionType || '积分变动';
+  }
+}
+
 // ==================== 1. AUTH LOGIN / REGISTER MODAL ====================
-export function AuthModal({ isOpen, onClose, initialMode = 'login', onAuthSuccess, showToast }) {
+export function AuthModal({
+  isOpen,
+  onClose,
+  initialMode = 'login',
+  defaultInviteCode = '',
+  onAuthSuccess,
+  showToast,
+}) {
   const [mode, setMode] = useState(initialMode);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [email, setEmail] = useState('');
+  const [inviteCode, setInviteCode] = useState(defaultInviteCode || '');
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     setMode(initialMode);
   }, [initialMode]);
+
+  useEffect(() => {
+    if (defaultInviteCode) {
+      setInviteCode(String(defaultInviteCode).trim().toUpperCase());
+    }
+  }, [defaultInviteCode]);
 
   if (!isOpen) return null;
 
@@ -90,7 +124,12 @@ export function AuthModal({ isOpen, onClose, initialMode = 'login', onAuthSucces
       const payload =
         mode === 'login'
           ? { username: username.trim(), password }
-          : { username: username.trim(), password, email: email.trim() };
+          : {
+              username: username.trim(),
+              password,
+              email: email.trim(),
+              invite_code: inviteCode.trim().toUpperCase(),
+            };
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -103,6 +142,7 @@ export function AuthModal({ isOpen, onClose, initialMode = 'login', onAuthSucces
         setUsername('');
         setPassword('');
         setEmail('');
+        if (mode === 'register') setInviteCode('');
         onAuthSuccess(data.token, data.user, data.message);
         onClose();
       }
@@ -200,6 +240,25 @@ export function AuthModal({ isOpen, onClose, initialMode = 'login', onAuthSucces
             />
           </div>
 
+          {mode === 'register' && (
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-main font-semibold">好友邀请码 (选填)</label>
+                <span className="text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
+                  填码注册双方各得 100 积分
+                </span>
+              </div>
+              <input
+                type="text"
+                maxLength={32}
+                value={inviteCode}
+                onChange={(e) => setInviteCode(e.target.value.toUpperCase())}
+                placeholder="输入专属邀请码，如 INV-A1B2C3D4"
+                className="w-full input-field px-4 py-3 text-base sm:text-xs font-mono uppercase"
+              />
+            </div>
+          )}
+
           <div className="pt-1">
             <button type="submit" disabled={loading} className="btn-primary-pill w-full py-3 text-xs">
               {loading ? '正在验证...' : mode === 'login' ? '立即登录系统' : '完成注册并登录'}
@@ -269,17 +328,25 @@ export function MembershipCenterView({
   const [feedbackTitle, setFeedbackTitle] = useState('');
   const [feedbackContent, setFeedbackContent] = useState('');
 
+  // Referral Invite & Points Redemption State
+  const [referralInfo, setReferralInfo] = useState(null);
+  const [referralLoading, setReferralLoading] = useState(false);
+  const [redeemHours, setRedeemHours] = useState(1);
+  const [redeemPointsBusy, setRedeemPointsBusy] = useState(false);
+
   const onUserUpdatedRef = useRef(onUserUpdated);
   onUserUpdatedRef.current = onUserUpdated;
   const showToastRef = useRef(showToast);
   showToastRef.current = showToast;
 
-  // Clear stale pending order & feedback immediately on account switch or logout
+  // Clear stale pending order, feedback & referral immediately on account switch or logout
   useEffect(() => {
     setActiveOrder(null);
     setRemainingSeconds(0);
     setOrders([]);
     setConfirmDeleteFeedbackId(null);
+    setReferralInfo(null);
+    setRedeemHours(1);
     setFeedbackData({
       messages: [],
       can_submit: true,
@@ -289,6 +356,65 @@ export function MembershipCenterView({
       replied_count: 0,
     });
   }, [authToken]);
+
+  const fetchMyReferral = useCallback(async () => {
+    if (!authToken) return;
+    setReferralLoading(true);
+    try {
+      const res = await fetch('/api/referral/me', {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setReferralInfo(data);
+        if (data.user) {
+          onUserUpdatedRef.current?.(data.user);
+        }
+      }
+    } catch (e) {
+      // ignore
+    } finally {
+      setReferralLoading(false);
+    }
+  }, [authToken]);
+
+  useEffect(() => {
+    fetchMyReferral();
+  }, [fetchMyReferral]);
+
+  const handleRedeemPointsForVip = async (e) => {
+    e.preventDefault();
+    if (!currentUser || !authToken) {
+      showToast('请先登录账号后再使用积分兑换 VIP 会员', 'error');
+      onOpenAuthModal('login');
+      return;
+    }
+    const hrs = Math.max(1, parseInt(redeemHours, 10) || 1);
+    setRedeemPointsBusy(true);
+    try {
+      const res = await fetch('/api/points/redeem-vip', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ hours: hrs }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(data.detail || data.message || '积分兑换失败', 'error');
+      } else {
+        showToast(data.message || `已成功兑换 +${hrs} 小时 VIP 会员`, 'success');
+        if (data.user) onUserUpdated(data.user);
+        if (data.referral) setReferralInfo(data.referral);
+        if (data.orders) setOrders(data.orders);
+      }
+    } catch (err) {
+      showToast('网络请求异常，请稍后重试', 'error');
+    } finally {
+      setRedeemPointsBusy(false);
+    }
+  };
 
   const fetchMyFeedback = useCallback(async () => {
     if (!authToken) return;
@@ -695,6 +821,31 @@ export function MembershipCenterView({
     Number(feedbackData.cooldown_remaining_sec || 0) - feedbackElapsedSec
   );
   const canSubmitFeedbackNow = Boolean(currentUser) && submitCooldownRemaining <= 0;
+  const refSettings = referralInfo?.settings || {
+    invite_enabled: true,
+    inviter_reward_points: 100,
+    invitee_reward_points: 100,
+    redeem_enabled: true,
+    points_per_vip_hour: 100,
+    max_redeem_hours_per_tx: 720,
+  };
+  const myInviteCode = referralInfo?.invite_code || currentUser?.invite_code || '';
+  const myInviteLink =
+    typeof window !== 'undefined' && myInviteCode
+      ? `${window.location.origin}/?invite=${encodeURIComponent(myInviteCode)}`
+      : '';
+  const myPointsBalance = Number(
+    referralInfo?.points_balance ?? currentUser?.points_balance ?? 0
+  );
+  const myTotalEarnedPoints = Number(
+    referralInfo?.total_points_earned ?? currentUser?.total_points_earned ?? 0
+  );
+  const myTotalInvites = Number(
+    referralInfo?.total_invites_count ?? currentUser?.total_invites_count ?? 0
+  );
+  const pointsPerHour = Math.max(1, Number(refSettings.points_per_vip_hour || 100));
+  const safeRedeemHours = Math.max(1, parseInt(redeemHours, 10) || 1);
+  const redeemCostPoints = safeRedeemHours * pointsPerHour;
 
   return (
     <div className="space-y-4 sm:space-y-5">
@@ -703,10 +854,24 @@ export function MembershipCenterView({
         <div>
           <h2 className="text-lg sm:text-xl font-bold text-main">会员中心与 Web3 多链自动收银台</h2>
           <p className="text-xs text-dim mt-1">
-            注册用户可查看实盘系统实时行情、提交问题留言，通过多链转账或激活码开通 VIP 后即可启动毫秒级实盘狙击
+            注册用户可查看实盘行情、邀请好友赚取积分兑换 VIP 会员、提交问题留言；开通 VIP 后即可启动毫秒级实盘狙击
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:gap-2.5 w-full sm:w-auto">
+          <button
+            type="button"
+            onClick={() => {
+              const el = document.getElementById('user-referral-points');
+              if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }}
+            className="btn-soft-pill px-4 py-2 sm:py-2.5 text-xs"
+          >
+            <Gift className="w-3.5 h-3.5" strokeWidth={1.75} />
+            <span>邀请赚积分</span>
+            <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-mono font-bold bg-amber-500/15 text-amber-700 dark:text-amber-300">
+              {currentUser ? `${myPointsBalance} 分` : `+${refSettings.inviter_reward_points}分`}
+            </span>
+          </button>
           <button
             type="button"
             onClick={() => {
@@ -801,11 +966,66 @@ export function MembershipCenterView({
 
           <div className="surface-subtle p-4 sm:p-5">
             <div className="text-xs text-dim font-medium">会员到期时间</div>
-            <div className="text-sm sm:text-base font-bold text-main mt-1.5">
+            <div className="text-sm sm:text-base font-bold text-main mt-1.5 font-mono">
               {currentUser ? currentUser.vip_expires_str : '未开通'}
             </div>
+            {currentUser && currentUser.is_vip && currentUser.vip_remaining_label && (
+              <div className="text-[11px] font-mono text-emerald-600 dark:text-emerald-400 mt-1">
+                剩余时长：{currentUser.vip_remaining_label}
+              </div>
+            )}
+            {currentUser && !currentUser.is_vip && Number(currentUser.vip_expires_at || 0) > 0 && (
+              <div className="text-[11px] text-rose-600 dark:text-rose-400 mt-1 font-medium">
+                已到期 · 运行策略已全部自动停止
+              </div>
+            )}
           </div>
         </div>
+
+        {currentUser && (
+          <div className="mt-4 pt-4 border-t border-line flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="flex flex-wrap items-center gap-3 sm:gap-4">
+              <div className="flex items-center gap-1.5">
+                <Coins className="w-4 h-4 text-amber-500 shrink-0" strokeWidth={1.75} />
+                <span className="text-dim">可用积分：</span>
+                <span className="font-mono font-bold text-main">{myPointsBalance} 积分</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Gift className="w-4 h-4 text-emerald-500 shrink-0" strokeWidth={1.75} />
+                <span className="text-dim">专属邀请码：</span>
+                <span className="font-mono font-bold text-main px-2 py-0.5 rounded-lg surface-subtle select-all">
+                  {myInviteCode || '--'}
+                </span>
+              </div>
+              <div className="text-dim">
+                已邀请 <span className="font-mono font-bold text-main">{myTotalInvites}</span> 人
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {myInviteCode && (
+                <button
+                  type="button"
+                  onClick={() => copyText(myInviteCode, '专属邀请码')}
+                  className="btn-soft-pill px-3 py-1.5 text-[11px]"
+                >
+                  <Copy className="w-3 h-3" strokeWidth={1.75} />
+                  <span>复制邀请码</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  const el = document.getElementById('user-referral-points');
+                  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }}
+                className="btn-primary-pill px-3.5 py-1.5 text-[11px]"
+              >
+                <Award className="w-3 h-3" strokeWidth={1.75} />
+                <span>积分兑换 VIP</span>
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* 3. 4-Step Permission Rules Card */}
@@ -1178,6 +1398,330 @@ export function MembershipCenterView({
         </div>
       </div>
 
+      {/* 5.2 Referral Invite & Points-to-VIP Redemption Section */}
+      <div id="user-referral-points" className="surface-card p-4 sm:p-6 lg:p-7 space-y-5 scroll-mt-20">
+        <div className="flex flex-wrap items-start sm:items-center justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <Gift className="w-4 h-4 sm:w-5 sm:h-5 text-main shrink-0" strokeWidth={1.75} />
+              <h3 className="text-sm sm:text-base font-bold text-main">邀请好友赚积分 & 积分兑换 VIP 会员</h3>
+              <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/12 text-emerald-700 dark:text-emerald-400">
+                邀请 1 人双方各得 +{refSettings.inviter_reward_points} / +{refSettings.invitee_reward_points} 积分
+              </span>
+              <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/15 text-amber-700 dark:text-amber-300">
+                {pointsPerHour} 积分 = 1 小时实盘 VIP
+              </span>
+            </div>
+            <p className="text-xs text-dim mt-1">
+              分享您的专属邀请码或专属链接，好友注册成功后双方自动获得积分奖励；积分可随时直接兑换实盘 VIP 会员时长（实时生效、到期自动停机保护）
+            </p>
+          </div>
+          {currentUser && (
+            <button
+              type="button"
+              onClick={fetchMyReferral}
+              disabled={referralLoading}
+              className="btn-soft-pill px-4 py-1.5 text-xs"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${referralLoading ? 'animate-spin' : ''}`} strokeWidth={1.75} />
+              <span>刷新积分数据</span>
+            </button>
+          )}
+        </div>
+
+        {!currentUser ? (
+          <div className="surface-subtle p-6 text-center space-y-3">
+            <p className="text-xs text-sub">
+              注册登录后即可获取您的专属邀请码：每成功邀请 1 位好友注册，双方均可获赠{' '}
+              <span className="font-mono font-bold text-main">+{refSettings.inviter_reward_points} 积分</span>，
+              <span className="font-mono font-bold text-main">{pointsPerHour} 积分</span> 即可直接兑换{' '}
+              <span className="font-mono font-bold text-main">1 小时</span> 实盘 VIP 会员！
+            </p>
+            <div className="flex flex-wrap items-center justify-center gap-2.5">
+              <button
+                type="button"
+                onClick={() => onOpenAuthModal('register')}
+                className="btn-primary-pill px-5 py-2 text-xs"
+              >
+                免费注册领取专属邀请码
+              </button>
+              <button
+                type="button"
+                onClick={() => onOpenAuthModal('login')}
+                className="btn-soft-pill px-5 py-2 text-xs"
+              >
+                已有账号登录
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+            {/* Left 6 Cols: Personal Invite Code, Share Link & Invited Friends */}
+            <div className="lg:col-span-6 space-y-4">
+              <div className="surface-subtle p-4 sm:p-5 space-y-4">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-bold text-main">我的专属邀请码与推广链接</span>
+                  <span
+                    className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${
+                      refSettings.invite_enabled
+                        ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-400'
+                        : 'bg-rose-500/15 text-rose-600 dark:text-rose-400'
+                    }`}
+                  >
+                    {refSettings.invite_enabled ? '邀请奖励已开启' : '邀请奖励暂停中'}
+                  </span>
+                </div>
+
+                {/* Invite Code Display */}
+                <div className="surface-card p-3.5 sm:p-4 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-[11px] text-dim">专属邀请码（好友注册时填写）</div>
+                    <div className="text-xl sm:text-2xl font-extrabold font-mono tracking-wider text-main mt-0.5 select-all">
+                      {myInviteCode || '生成中...'}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={!myInviteCode}
+                      onClick={() => copyText(myInviteCode, '专属邀请码')}
+                      className="btn-primary-pill px-3.5 py-2 text-xs"
+                    >
+                      <Copy className="w-3.5 h-3.5" strokeWidth={1.75} />
+                      <span>复制邀请码</span>
+                    </button>
+                    {myInviteLink && (
+                      <button
+                        type="button"
+                        onClick={() => copyText(myInviteLink, '专属邀请链接')}
+                        className="btn-soft-pill px-3.5 py-2 text-xs"
+                      >
+                        <Share2 className="w-3.5 h-3.5" strokeWidth={1.75} />
+                        <span>复制邀请链接</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* 3 KPI tiles */}
+                <div className="grid grid-cols-3 gap-2.5 text-center">
+                  <div className="surface-card p-3">
+                    <div className="text-[11px] text-dim">当前可用积分</div>
+                    <div className="text-lg sm:text-xl font-extrabold font-mono text-amber-600 dark:text-amber-400 mt-1">
+                      {myPointsBalance}
+                    </div>
+                  </div>
+                  <div className="surface-card p-3">
+                    <div className="text-[11px] text-dim">累计获得积分</div>
+                    <div className="text-lg sm:text-xl font-extrabold font-mono text-main mt-1">
+                      {myTotalEarnedPoints}
+                    </div>
+                  </div>
+                  <div className="surface-card p-3">
+                    <div className="text-[11px] text-dim">已邀请好友</div>
+                    <div className="text-lg sm:text-xl font-extrabold font-mono text-emerald-600 dark:text-emerald-400 mt-1">
+                      {myTotalInvites}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="text-[11px] text-dim leading-relaxed space-y-1">
+                  <div>
+                    • 每成功邀请 1 位新用户注册：您得{' '}
+                    <span className="font-mono font-semibold text-main">+{refSettings.inviter_reward_points} 积分</span>
+                    ，受邀好友得{' '}
+                    <span className="font-mono font-semibold text-main">+{refSettings.invitee_reward_points} 积分</span>
+                    （同一 IP 防刷限制与防自邀校验生效）。
+                  </div>
+                  {(referralInfo?.invited_by_username || currentUser?.invited_by_username) && (
+                    <div>
+                      • 我的邀请人：
+                      <span className="font-mono font-semibold text-main">
+                        {referralInfo?.invited_by_username || currentUser?.invited_by_username}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Invited Friends List */}
+              <div className="surface-subtle p-4 space-y-2.5 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-main">我邀请的好友列表</span>
+                  <span className="text-[11px] font-mono text-dim">
+                    共 {(referralInfo?.invited_users || []).length} 位
+                  </span>
+                </div>
+                {(referralInfo?.invited_users || []).length === 0 ? (
+                  <div className="py-5 text-center text-dim">
+                    暂未邀请好友，复制上方邀请码/链接分享给好友即可双方各得 {refSettings.inviter_reward_points} 积分
+                  </div>
+                ) : (
+                  <div className="space-y-2 max-h-52 overflow-y-auto pr-0.5">
+                    {(referralInfo?.invited_users || []).map((iu) => (
+                      <div
+                        key={iu.id}
+                        className="surface-card px-3.5 py-2.5 flex items-center justify-between gap-2"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="font-mono font-bold text-main truncate">{iu.username}</span>
+                          <span
+                            className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                              iu.is_vip
+                                ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-400'
+                                : 'surface-subtle text-dim'
+                            }`}
+                          >
+                            {iu.is_vip ? iu.vip_label : '未开VIP'}
+                          </span>
+                        </div>
+                        <span className="text-[11px] font-mono text-dim shrink-0">{iu.created_at}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Right 6 Cols: Points-to-VIP Redemption + Personal Points Ledger */}
+            <div className="lg:col-span-6 space-y-4">
+              <form onSubmit={handleRedeemPointsForVip} className="surface-subtle p-4 sm:p-5 space-y-4 text-xs">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Award className="w-4 h-4 text-amber-500 shrink-0" strokeWidth={1.75} />
+                    <span className="font-bold text-main">积分兑换实盘 VIP 会员</span>
+                  </div>
+                  <span className="font-mono text-[11px] font-semibold text-amber-700 dark:text-amber-300">
+                    {pointsPerHour} 积分 / 小时
+                  </span>
+                </div>
+
+                {!refSettings.redeem_enabled && (
+                  <div className="p-3 rounded-2xl bg-rose-500/10 border border-rose-500/25 text-rose-700 dark:text-rose-300">
+                    管理员已暂时关闭积分兑换会员功能，请稍后再试。
+                  </div>
+                )}
+
+                <div>
+                  <label className="block font-semibold text-main mb-2">选择或输入兑换小时数</label>
+                  <div className="flex flex-wrap items-center gap-1.5 mb-2.5">
+                    {[1, 2, 6, 12, 24].map((h) => (
+                      <button
+                        key={h}
+                        type="button"
+                        onClick={() => setRedeemHours(h)}
+                        className={`px-3 py-1.5 text-[11px] font-mono ${
+                          safeRedeemHours === h ? 'btn-primary-pill' : 'btn-soft-pill'
+                        }`}
+                      >
+                        +{h}小时 ({h * pointsPerHour}分)
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+                    <div className="flex items-center gap-2 flex-1">
+                      <input
+                        type="number"
+                        min={1}
+                        max={refSettings.max_redeem_hours_per_tx || 720}
+                        value={redeemHours}
+                        onChange={(e) => setRedeemHours(e.target.value)}
+                        className="w-full input-field px-3.5 py-2.5 font-mono text-base sm:text-xs"
+                      />
+                      <span className="text-sub whitespace-nowrap">小时 VIP</span>
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={
+                        redeemPointsBusy ||
+                        !refSettings.redeem_enabled ||
+                        myPointsBalance < redeemCostPoints
+                      }
+                      className="btn-primary-pill px-5 py-2.5 text-xs whitespace-nowrap disabled:opacity-55 disabled:cursor-not-allowed"
+                    >
+                      <Coins className="w-3.5 h-3.5" strokeWidth={1.75} />
+                      <span>
+                        {redeemPointsBusy
+                          ? '正在兑换...'
+                          : `立即兑换 (+${safeRedeemHours}小时)`}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="surface-card p-3.5 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                  <span className="text-sub">
+                    本次消耗：
+                    <span className="font-mono font-bold text-main ml-1">{redeemCostPoints} 积分</span>
+                  </span>
+                  <span className="text-sub">
+                    兑换后剩余：
+                    <span
+                      className={`font-mono font-bold ml-1 ${
+                        myPointsBalance >= redeemCostPoints
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-rose-600 dark:text-rose-400'
+                      }`}
+                    >
+                      {myPointsBalance >= redeemCostPoints
+                        ? `${myPointsBalance - redeemCostPoints} 积分`
+                        : `积分不足（差 ${redeemCostPoints - myPointsBalance} 分）`}
+                    </span>
+                  </span>
+                </div>
+              </form>
+
+              {/* Personal Points Ledger */}
+              <div className="surface-subtle p-4 space-y-2.5 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-main">我的积分明细流水</span>
+                  <span className="text-[11px] font-mono text-dim">
+                    最近 {(referralInfo?.ledger || []).length} 条
+                  </span>
+                </div>
+                {(referralInfo?.ledger || []).length === 0 ? (
+                  <div className="py-5 text-center text-dim">暂无积分变动记录</div>
+                ) : (
+                  <div className="space-y-2 max-h-56 overflow-y-auto pr-0.5">
+                    {(referralInfo?.ledger || []).map((row) => {
+                      const delta = Number(row.change_points || 0);
+                      return (
+                        <div
+                          key={row.id}
+                          className="surface-card px-3.5 py-2.5 flex items-start justify-between gap-3"
+                        >
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold surface-subtle text-main">
+                                {formatPointsActionLabel(row.action_type)}
+                              </span>
+                              <span className="text-[11px] font-mono text-dim">{row.created_at}</span>
+                            </div>
+                            <div className="text-sub mt-1 break-words">{row.note}</div>
+                          </div>
+                          <div className="text-right font-mono shrink-0">
+                            <div
+                              className={`font-bold ${
+                                delta >= 0
+                                  ? 'text-emerald-600 dark:text-emerald-400'
+                                  : 'text-rose-600 dark:text-rose-400'
+                              }`}
+                            >
+                              {delta >= 0 ? `+${delta}` : delta}
+                            </div>
+                            <div className="text-[10px] text-dim">余 {row.balance_after}</div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* 5.5 User Issue / Feedback Message Board */}
       <div id="user-feedback-board" className="surface-card p-4 sm:p-6 lg:p-7 space-y-5 scroll-mt-20">
         <div className="flex flex-wrap items-start sm:items-center justify-between gap-3">
@@ -1511,13 +2055,28 @@ export function MembershipCenterView({
                   </span>
                 </div>
                 <div className="flex items-center justify-between text-sub">
-                  <span>{o.plan_name} (+{o.duration_days}天)</span>
+                  <span>
+                    {o.plan_name} (
+                    {o.duration_days > 0
+                      ? `+${o.duration_days}天`
+                      : o.pay_method === 'POINTS_REDEEM'
+                        ? '积分按小时'
+                        : '按小时授权'}
+                    )
+                  </span>
                   <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">
-                    ${o.pay_amount_str || Number(o.amount_usdt).toFixed(3)}
+                    {o.pay_method === 'POINTS_REDEEM'
+                      ? '积分兑换'
+                      : `$${o.pay_amount_str || Number(o.amount_usdt).toFixed(3)}`}
                   </span>
                 </div>
                 <div className="text-[11px] font-mono text-dim truncate" title={o.tx_hash}>
-                  {o.chain_network === 'MULTI_EVM' ? '10链自动监控' : o.chain_network || o.pay_method} · {o.tx_hash}
+                  {o.pay_method === 'POINTS_REDEEM'
+                    ? '积分兑换'
+                    : o.chain_network === 'MULTI_EVM'
+                      ? '10链自动监控'
+                      : o.chain_network || o.pay_method}{' '}
+                  · {o.tx_hash}
                 </div>
                 <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-line">
                   <span className="text-[11px] font-mono text-dim">{o.created_at}</span>
@@ -1577,12 +2136,24 @@ export function MembershipCenterView({
                   <tr key={o.id}>
                     <td className="py-3 px-3 text-main font-semibold">{o.order_no}</td>
                     <td className="py-3 px-3 font-sans text-main font-medium">{o.plan_name}</td>
-                    <td className="py-3 px-3 text-sub">+{o.duration_days} 天</td>
+                    <td className="py-3 px-3 text-sub">
+                      {o.duration_days > 0
+                        ? `+${o.duration_days} 天`
+                        : o.pay_method === 'POINTS_REDEEM'
+                          ? '按小时兑换'
+                          : '按小时授权'}
+                    </td>
                     <td className="py-3 px-3 text-emerald-600 dark:text-emerald-400 font-bold">
-                      ${o.pay_amount_str || Number(o.amount_usdt).toFixed(3)}
+                      {o.pay_method === 'POINTS_REDEEM'
+                        ? '积分兑换'
+                        : `$${o.pay_amount_str || Number(o.amount_usdt).toFixed(3)}`}
                     </td>
                     <td className="py-3 px-3 font-sans text-sub">
-                      {o.chain_network === 'MULTI_EVM' ? '10链自动监控' : o.chain_network || o.pay_method}
+                      {o.pay_method === 'POINTS_REDEEM'
+                        ? '积分兑换'
+                        : o.chain_network === 'MULTI_EVM'
+                          ? '10链自动监控'
+                          : o.chain_network || o.pay_method}
                     </td>
                     <td className="py-3 px-3 text-dim max-w-xs truncate" title={o.tx_hash}>
                       {o.tx_hash}
@@ -1647,7 +2218,7 @@ export function MembershipCenterView({
 
 // ==================== 3. ADMIN USER & MEMBERSHIP MANAGEMENT VIEW ====================
 export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, onOpenAuthModal, showToast }) {
-  const [subTab, setSubTab] = useState('users'); // 'users' | 'orders' | 'plans' | 'codes' | 'feedback'
+  const [subTab, setSubTab] = useState('users'); // 'users' | 'orders' | 'plans' | 'codes' | 'feedback' | 'referral'
   const [dashboard, setDashboard] = useState({
     stats: {
       total_users: 0,
@@ -1664,12 +2235,26 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
       total_feedback_count: 0,
       open_feedback_count: 0,
       replied_feedback_count: 0,
+      total_points_balance: 0,
+      total_invites_count: 0,
+      total_redeem_count: 0,
+      total_redeem_points: 0,
     },
     users: [],
     orders: [],
     vip_codes: [],
     plans: [],
     feedback_messages: [],
+    referral_settings: {
+      invite_enabled: true,
+      inviter_reward_points: 100,
+      invitee_reward_points: 100,
+      redeem_enabled: true,
+      points_per_vip_hour: 100,
+      max_redeem_hours_per_tx: 720,
+    },
+    referral_records: [],
+    points_ledger: [],
   });
   const [userSearch, setUserSearch] = useState('');
   const [orderFilter, setOrderFilter] = useState('ALL');
@@ -1682,6 +2267,23 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
   const [feedbackBusyId, setFeedbackBusyId] = useState(null);
   const [confirmAdminDeleteFeedbackId, setConfirmAdminDeleteFeedbackId] = useState(null);
 
+  const [refSettingsForm, setRefSettingsForm] = useState({
+    invite_enabled: true,
+    inviter_reward_points: 100,
+    invitee_reward_points: 100,
+    redeem_enabled: true,
+    points_per_vip_hour: 100,
+    max_redeem_hours_per_tx: 720,
+  });
+  const [pointsAdjustForm, setPointsAdjustForm] = useState({
+    user_id: '',
+    delta_points: 100,
+    note: '',
+  });
+  const [ledgerFilter, setLedgerFilter] = useState('ALL');
+  const [ledgerSearch, setLedgerSearch] = useState('');
+  const [referralBusy, setReferralBusy] = useState(false);
+
   const [newUser, setNewUser] = useState({
     username: '',
     password: '',
@@ -1693,6 +2295,7 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
 
   const [grantTarget, setGrantTarget] = useState(null);
   const [grantDays, setGrantDays] = useState(30);
+  const [grantHours, setGrantHours] = useState(0);
   const [grantTier, setGrantTier] = useState('月度专业版会员');
 
   const [editUserTarget, setEditUserTarget] = useState(null);
@@ -1719,6 +2322,19 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
     if (res.ok) {
       const data = await res.json();
       setDashboard(data);
+      if (data.referral_settings) {
+        setRefSettingsForm({
+          invite_enabled: Boolean(data.referral_settings.invite_enabled),
+          inviter_reward_points: Number(data.referral_settings.inviter_reward_points ?? 100),
+          invitee_reward_points: Number(data.referral_settings.invitee_reward_points ?? 100),
+          redeem_enabled: Boolean(data.referral_settings.redeem_enabled),
+          points_per_vip_hour: Number(data.referral_settings.points_per_vip_hour ?? 100),
+          max_redeem_hours_per_tx: Number(data.referral_settings.max_redeem_hours_per_tx ?? 720),
+        });
+      }
+      if (data.users?.length > 0) {
+        setPointsAdjustForm((prev) => (prev.user_id ? prev : { ...prev, user_id: String(data.users[0].id) }));
+      }
     }
   }, [authToken, currentUser]);
 
@@ -1783,7 +2399,7 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
     }
   };
 
-  const handleGrantVip = async (userId, addDays, vipTier, revoke = false) => {
+  const handleGrantVip = async (userId, addDays, vipTier, revoke = false, addHours = 0) => {
     if (adminBusyRef.current) return;
     adminBusyRef.current = true;
     setAdminBusy(true);
@@ -1796,7 +2412,8 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
         },
         body: JSON.stringify({
           user_id: userId,
-          add_days: Number(addDays),
+          add_days: Number(addDays || 0),
+          add_hours: Number(addHours || 0),
           vip_tier: vipTier,
           revoke,
         }),
@@ -1806,6 +2423,7 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
         showToast(data.message, 'success');
         setDashboard(data.dashboard);
         setGrantTarget(null);
+        setGrantHours(0);
         onCurrentUserRefresh();
       } else {
         showToast(data.detail || '操作失败', 'error');
@@ -2049,6 +2667,77 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
     }
   };
 
+  const handleSaveReferralSettings = async (e) => {
+    e.preventDefault();
+    setReferralBusy(true);
+    try {
+      const res = await fetch('/api/admin/referral/settings', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({
+          invite_enabled: Boolean(refSettingsForm.invite_enabled),
+          inviter_reward_points: Math.max(0, parseInt(refSettingsForm.inviter_reward_points, 10) || 0),
+          invitee_reward_points: Math.max(0, parseInt(refSettingsForm.invitee_reward_points, 10) || 0),
+          redeem_enabled: Boolean(refSettingsForm.redeem_enabled),
+          points_per_vip_hour: Math.max(1, parseInt(refSettingsForm.points_per_vip_hour, 10) || 100),
+          max_redeem_hours_per_tx: Math.max(1, parseInt(refSettingsForm.max_redeem_hours_per_tx, 10) || 720),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(data.detail || data.message || '保存邀请积分规则失败', 'error');
+      } else {
+        showToast(data.message || '邀请与积分兑换规则已更新', 'success');
+        if (data.dashboard) setDashboard(data.dashboard);
+      }
+    } finally {
+      setReferralBusy(false);
+    }
+  };
+
+  const handleAdjustUserPoints = async (e) => {
+    e.preventDefault();
+    const targetUid = parseInt(pointsAdjustForm.user_id, 10);
+    const delta = parseInt(pointsAdjustForm.delta_points, 10);
+    if (!targetUid) {
+      showToast('请选择要调整积分的用户', 'error');
+      return;
+    }
+    if (!delta || delta === 0) {
+      showToast('请输入非零的积分调整数量（正数增加，负数扣减）', 'error');
+      return;
+    }
+    setReferralBusy(true);
+    try {
+      const res = await fetch('/api/admin/points/adjust', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({
+          user_id: targetUid,
+          delta_points: delta,
+          note: (pointsAdjustForm.note || '').trim(),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(data.detail || data.message || '调整积分失败', 'error');
+      } else {
+        showToast(data.message || '用户积分调整成功', 'success');
+        if (data.dashboard) setDashboard(data.dashboard);
+        setPointsAdjustForm((prev) => ({ ...prev, note: '' }));
+        onCurrentUserRefresh();
+      }
+    } finally {
+      setReferralBusy(false);
+    }
+  };
+
   const st = dashboard.stats || {};
   const filteredUsers = (dashboard.users || []).filter((u) => {
     const q = userSearch.trim().toLowerCase();
@@ -2058,7 +2747,27 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
       (u.email || '').toLowerCase().includes(q) ||
       (u.vip_label || '').toLowerCase().includes(q) ||
       (u.register_ip || '').toLowerCase().includes(q) ||
-      (u.last_login_ip || '').toLowerCase().includes(q)
+      (u.last_login_ip || '').toLowerCase().includes(q) ||
+      (u.invite_code || '').toLowerCase().includes(q) ||
+      (u.invited_by_username || '').toLowerCase().includes(q)
+    );
+  });
+
+  const filteredPointsLedger = (dashboard.points_ledger || []).filter((row) => {
+    if (
+      ledgerFilter === 'INVITE' &&
+      !['INVITE_REWARD_INVITER', 'INVITE_REWARD_INVITEE', 'INVITE_INVITER', 'INVITE_INVITEE'].includes(row.action_type)
+    ) {
+      return false;
+    }
+    if (ledgerFilter === 'REDEEM_VIP' && row.action_type !== 'REDEEM_VIP') return false;
+    if (ledgerFilter === 'ADMIN_ADJUST' && row.action_type !== 'ADMIN_ADJUST') return false;
+    const q = ledgerSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      (row.username || '').toLowerCase().includes(q) ||
+      (row.related_username || '').toLowerCase().includes(q) ||
+      (row.note || '').toLowerCase().includes(q)
     );
   });
 
@@ -2167,6 +2876,12 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
           { id: 'orders', label: `链上订单与审核 (${(dashboard.orders || []).length})`, icon: CreditCard, badge: 0 },
           { id: 'plans', label: `会员套餐配置 (${(dashboard.plans || []).length})`, icon: Sliders, badge: 0 },
           { id: 'codes', label: `会员卡密生成 (${(dashboard.vip_codes || []).length})`, icon: Key, badge: 0 },
+          {
+            id: 'referral',
+            label: `邀请与积分管理 (${st.total_invites_count || 0})`,
+            icon: Gift,
+            badge: 0,
+          },
           {
             id: 'feedback',
             label: `用户问题留言 (${st.total_feedback_count ?? (dashboard.feedback_messages || []).length})`,
@@ -2284,34 +2999,55 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                   <span>增加天数:</span>
                   <input
                     type="number"
-                    min={1}
+                    min={0}
                     max={36500}
                     value={grantDays}
                     onChange={(e) => setGrantDays(Number(e.target.value))}
-                    className="input-field px-3 py-2 w-24 font-mono"
+                    className="input-field px-3 py-2 w-20 font-mono"
                   />
-                  {[7, 30, 90, 365, 36500].map((d) => (
+                  <span>增加小时:</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={87600}
+                    value={grantHours}
+                    onChange={(e) => setGrantHours(Number(e.target.value))}
+                    className="input-field px-3 py-2 w-20 font-mono"
+                  />
+                  {[
+                    { label: '+1小时', d: 0, h: 1 },
+                    { label: '+12小时', d: 0, h: 12 },
+                    { label: '+24小时', d: 0, h: 24 },
+                    { label: '+7天', d: 7, h: 0 },
+                    { label: '+30天', d: 30, h: 0 },
+                    { label: '+90天', d: 90, h: 0 },
+                    { label: '+365天', d: 365, h: 0 },
+                    { label: '+永久', d: 36500, h: 0 },
+                  ].map((opt) => (
                     <button
-                      key={d}
+                      key={opt.label}
                       type="button"
-                      onClick={() => setGrantDays(d)}
+                      onClick={() => {
+                        setGrantDays(opt.d);
+                        setGrantHours(opt.h);
+                      }}
                       className="px-2.5 py-1.5 rounded-full surface-subtle text-[11px] font-mono hover:opacity-85"
                     >
-                      +{d === 36500 ? '永久' : `${d}天`}
+                      {opt.label}
                     </button>
                   ))}
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
                 <button
-                  onClick={() => handleGrantVip(grantTarget.id, grantDays, grantTier, false)}
+                  onClick={() => handleGrantVip(grantTarget.id, grantDays, grantTier, false, grantHours)}
                   className="btn-primary-pill px-5 py-2 text-xs"
                 >
                   确认开通 / 延期会员
                 </button>
                 {grantTarget.username !== 'admin' && (
                   <button
-                    onClick={() => handleGrantVip(grantTarget.id, 0, 'NONE', true)}
+                    onClick={() => handleGrantVip(grantTarget.id, 0, 'NONE', true, 0)}
                     className="btn-soft-pill px-4 py-2 text-xs text-rose-600 dark:text-rose-400"
                   >
                     收回会员资格
@@ -2400,22 +3136,23 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                   type="text"
                   value={userSearch}
                   onChange={(e) => setUserSearch(e.target.value)}
-                  placeholder="搜索用户名 / 邮箱 / 会员等级..."
+                  placeholder="搜索用户名 / 邮箱 / 邀请码 / 会员等级..."
                   className="w-full input-field rounded-full pl-10 pr-4 py-2.5 text-base sm:text-xs"
                 />
               </div>
             </div>
 
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[920px] text-left border-collapse text-xs">
+              <table className="w-full min-w-[1040px] text-left border-collapse text-xs">
                 <thead>
                   <tr className="border-b border-line text-[11px] text-dim">
                     <th className="py-3 px-3">ID</th>
                     <th className="py-3 px-3">用户名 / 邮箱</th>
+                    <th className="py-3 px-3">专属邀请码 / 积分</th>
                     <th className="py-3 px-3">注册 / 最近登录 IP</th>
                     <th className="py-3 px-3">角色</th>
                     <th className="py-3 px-3">会员等级</th>
-                    <th className="py-3 px-3">到期时间</th>
+                    <th className="py-3 px-3">到期 / 剩余时长</th>
                     <th className="py-3 px-3">实盘工作区状态</th>
                     <th className="py-3 px-3">实盘系统权限</th>
                     <th className="py-3 px-3">状态</th>
@@ -2433,6 +3170,15 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                           <div className="text-[11px] text-dim">{u.email || '未设置邮箱'}</div>
                         </td>
                         <td className="py-3.5 px-3 font-mono text-[11px]">
+                          <div className="font-bold text-main">{u.invite_code || '--'}</div>
+                          <div className="text-amber-600 dark:text-amber-400 font-semibold">
+                            {Number(u.points_balance || 0)} 积分 · 邀 {Number(u.total_invites_count || 0)} 人
+                          </div>
+                          {u.invited_by_username && (
+                            <div className="text-[10px] text-dim">受邀自: {u.invited_by_username}</div>
+                          )}
+                        </td>
+                        <td className="py-3.5 px-3 font-mono text-[11px]">
                           <div className="text-main font-semibold" title="注册绑定 IP">
                             {u.register_ip || '系统/后台创建'}
                           </div>
@@ -2446,10 +3192,21 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                           </span>
                         </td>
                         <td className="py-3.5 px-3 font-semibold text-main">{u.vip_label}</td>
-                        <td className="py-3.5 px-3 font-mono text-sub">{u.vip_expires_str}</td>
+                        <td className="py-3.5 px-3 font-mono text-sub">
+                          <div>{u.vip_expires_str}</div>
+                          {u.is_vip && u.vip_remaining_label && (
+                            <div className="text-[10px] text-emerald-600 dark:text-emerald-400">
+                              剩 {u.vip_remaining_label}
+                            </div>
+                          )}
+                          {!u.is_vip && Number(u.vip_expires_at || 0) > 0 && (
+                            <div className="text-[10px] text-rose-500">已到期</div>
+                          )}
+                        </td>
                         <td className="py-3.5 px-3 font-mono text-[11px]">
                           <div className="text-main">
-                            {lw.symbols_count || 0} 币种 ·{' '}
+                            {lw.symbols_count || 0} 币种
+                            {lw.running_symbols_count > 0 ? ` (${lw.running_symbols_count}运行)` : ''} ·{' '}
                             <span className={lw.trading_active ? 'text-emerald-600 font-bold' : 'text-dim'}>
                               {lw.trading_active ? '实盘运行中' : '待命'}
                             </span>
@@ -2482,16 +3239,32 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                             {u.is_active ? '正常' : '已封禁'}
                           </span>
                         </td>
-                        <td className="py-3.5 px-3 text-right space-x-2 whitespace-nowrap">
+                        <td className="py-3.5 px-3 text-right space-x-1.5 whitespace-nowrap">
                           <button
                             onClick={() => {
                               setGrantTarget(u);
                               setEditUserTarget(null);
+                              setGrantDays(30);
+                              setGrantHours(0);
                               setGrantTier(u.vip_tier !== 'NONE' ? u.vip_tier : '季度旗舰版会员');
                             }}
-                            className="btn-primary-pill px-3.5 py-1.5 text-[11px]"
+                            className="btn-primary-pill px-3 py-1.5 text-[11px]"
                           >
-                            会员授权/延期
+                            会员授权
+                          </button>
+                          <button
+                            onClick={() => {
+                              setPointsAdjustForm({
+                                user_id: String(u.id),
+                                delta_points: 100,
+                                note: '',
+                              });
+                              setSubTab('referral');
+                            }}
+                            className="btn-soft-pill px-2.5 py-1.5 text-[11px]"
+                          >
+                            <Coins className="w-3 h-3" strokeWidth={1.75} />
+                            <span>调积分</span>
                           </button>
                           <button
                             onClick={() => {
@@ -2631,12 +3404,24 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                       <td className="py-3.5 px-3 font-semibold text-main">{o.order_no}</td>
                       <td className="py-3.5 px-3 font-bold text-main">{o.username}</td>
                       <td className="py-3.5 px-3 font-sans text-main">{o.plan_name}</td>
-                      <td className="py-3.5 px-3 text-sub">+{o.duration_days} 天</td>
+                      <td className="py-3.5 px-3 text-sub">
+                        {o.duration_days > 0
+                          ? `+${o.duration_days} 天`
+                          : o.pay_method === 'POINTS_REDEEM'
+                            ? '按小时兑换'
+                            : '按小时授权'}
+                      </td>
                       <td className="py-3.5 px-3 font-bold text-emerald-600 dark:text-emerald-400">
-                        ${o.pay_amount_str || Number(o.amount_usdt).toFixed(3)}
+                        {o.pay_method === 'POINTS_REDEEM'
+                          ? '积分兑换'
+                          : `$${o.pay_amount_str || Number(o.amount_usdt).toFixed(3)}`}
                       </td>
                       <td className="py-3.5 px-3 font-sans text-sub">
-                        {o.chain_network === 'MULTI_EVM' ? '10链监控' : o.chain_network || o.pay_method}
+                        {o.pay_method === 'POINTS_REDEEM'
+                          ? '积分兑换'
+                          : o.chain_network === 'MULTI_EVM'
+                            ? '10链监控'
+                            : o.chain_network || o.pay_method}
                       </td>
                       <td className="py-3.5 px-3 text-dim max-w-xs truncate" title={o.tx_hash}>
                         {o.tx_hash}
@@ -3267,6 +4052,406 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
               })}
             </div>
           )}
+        </div>
+      )}
+
+      {/* ==================== SUB-TAB 6: REFERRAL INVITES & POINTS MANAGEMENT ==================== */}
+      {subTab === 'referral' && (
+        <div className="space-y-4 sm:space-y-5">
+          {/* 4 Referral / Points KPIs */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+            <div className="surface-card p-4 sm:p-5 flex items-center gap-3">
+              <div className="icon-box w-10 h-10">
+                <Coins className="w-4 h-4" strokeWidth={1.75} />
+              </div>
+              <div className="min-w-0">
+                <div className="text-lg sm:text-xl font-bold font-mono text-main">
+                  {Number(st.total_points_balance || 0)}
+                </div>
+                <div className="text-[11px] text-dim truncate">全站用户当前积分余额</div>
+              </div>
+            </div>
+            <div className="surface-card p-4 sm:p-5 flex items-center gap-3">
+              <div className="icon-box w-10 h-10">
+                <Gift className="w-4 h-4" strokeWidth={1.75} />
+              </div>
+              <div className="min-w-0">
+                <div className="text-lg sm:text-xl font-bold font-mono text-main">
+                  {Number(st.total_invites_count || 0)}
+                </div>
+                <div className="text-[11px] text-dim truncate">累计成功邀请人数</div>
+              </div>
+            </div>
+            <div className="surface-card p-4 sm:p-5 flex items-center gap-3">
+              <div className="icon-box w-10 h-10">
+                <Award className="w-4 h-4" strokeWidth={1.75} />
+              </div>
+              <div className="min-w-0">
+                <div className="text-lg sm:text-xl font-bold font-mono text-main">
+                  {Number(st.total_redeem_count || 0)}
+                </div>
+                <div className="text-[11px] text-dim truncate">积分兑换会员次数</div>
+              </div>
+            </div>
+            <div className="surface-card p-4 sm:p-5 flex items-center gap-3">
+              <div className="icon-box w-10 h-10">
+                <BarChart2 className="w-4 h-4" strokeWidth={1.75} />
+              </div>
+              <div className="min-w-0">
+                <div className="text-lg sm:text-xl font-bold font-mono text-main">
+                  {Number(st.total_redeem_points || 0)}
+                </div>
+                <div className="text-[11px] text-dim truncate">累计兑换消耗积分</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Global Rules + Manual Points Adjustment Grid */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-5">
+            {/* Left 7 Cols: Global Referral & Redeem Settings */}
+            <form onSubmit={handleSaveReferralSettings} className="lg:col-span-7 surface-card p-4 sm:p-6 space-y-4 text-xs">
+              <div className="flex items-center gap-2.5">
+                <Sliders className="w-4 h-4 text-main shrink-0" strokeWidth={1.75} />
+                <div>
+                  <h3 className="text-sm sm:text-base font-bold text-main">邀请奖励与积分兑换会员规则配置</h3>
+                  <p className="text-[11px] text-dim mt-0.5">
+                    实时控制全站邀请注册双向奖励积分以及积分兑换 VIP 会员的汇率与单次上限
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                <label className="surface-subtle p-3.5 flex items-center justify-between gap-2 cursor-pointer">
+                  <div>
+                    <div className="font-bold text-main">开启邀请注册积分奖励</div>
+                    <div className="text-[11px] text-dim">关闭后填邀请码注册不再发放积分</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(refSettingsForm.invite_enabled)}
+                    onChange={(e) =>
+                      setRefSettingsForm({ ...refSettingsForm, invite_enabled: e.target.checked })
+                    }
+                    className="w-4 h-4 accent-emerald-600"
+                  />
+                </label>
+
+                <label className="surface-subtle p-3.5 flex items-center justify-between gap-2 cursor-pointer">
+                  <div>
+                    <div className="font-bold text-main">开启积分兑换 VIP 会员</div>
+                    <div className="text-[11px] text-dim">关闭后前台将暂停积分自助兑换</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(refSettingsForm.redeem_enabled)}
+                    onChange={(e) =>
+                      setRefSettingsForm({ ...refSettingsForm, redeem_enabled: e.target.checked })
+                    }
+                    className="w-4 h-4 accent-emerald-600"
+                  />
+                </label>
+
+                <div>
+                  <label className="block text-dim mb-1 font-semibold">邀请人奖励积分 (每位好友)</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={1000000}
+                    value={refSettingsForm.inviter_reward_points}
+                    onChange={(e) =>
+                      setRefSettingsForm({ ...refSettingsForm, inviter_reward_points: e.target.value })
+                    }
+                    className="w-full input-field px-3.5 py-2.5 font-mono"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-dim mb-1 font-semibold">受邀新用户奖励积分</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={1000000}
+                    value={refSettingsForm.invitee_reward_points}
+                    onChange={(e) =>
+                      setRefSettingsForm({ ...refSettingsForm, invitee_reward_points: e.target.value })
+                    }
+                    className="w-full input-field px-3.5 py-2.5 font-mono"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-dim mb-1 font-semibold">兑换 1 小时 VIP 所需积分</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={1000000}
+                    value={refSettingsForm.points_per_vip_hour}
+                    onChange={(e) =>
+                      setRefSettingsForm({ ...refSettingsForm, points_per_vip_hour: e.target.value })
+                    }
+                    className="w-full input-field px-3.5 py-2.5 font-mono"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-dim mb-1 font-semibold">单次兑换最大小时数上限</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={8760}
+                    value={refSettingsForm.max_redeem_hours_per_tx}
+                    onChange={(e) =>
+                      setRefSettingsForm({ ...refSettingsForm, max_redeem_hours_per_tx: e.target.value })
+                    }
+                    className="w-full input-field px-3.5 py-2.5 font-mono"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <button
+                  type="submit"
+                  disabled={referralBusy}
+                  className="btn-primary-pill px-6 py-2.5 text-xs"
+                >
+                  {referralBusy ? '正在保存...' : '保存全局邀请与兑换规则'}
+                </button>
+              </div>
+            </form>
+
+            {/* Right 5 Cols: Manual Points Adjust */}
+            <form onSubmit={handleAdjustUserPoints} className="lg:col-span-5 surface-card p-4 sm:p-6 space-y-4 text-xs">
+              <div className="flex items-center gap-2.5">
+                <Coins className="w-4 h-4 text-main shrink-0" strokeWidth={1.75} />
+                <div>
+                  <h3 className="text-sm sm:text-base font-bold text-main">手动发放 / 扣减用户积分</h3>
+                  <p className="text-[11px] text-dim mt-0.5">
+                    输入正数发放活动积分，输入负数扣减异常积分，所有操作均记入积分审计流水
+                  </p>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-dim mb-1 font-semibold">目标用户</label>
+                <select
+                  value={pointsAdjustForm.user_id}
+                  onChange={(e) => setPointsAdjustForm({ ...pointsAdjustForm, user_id: e.target.value })}
+                  className="w-full input-field px-3.5 py-2.5 font-mono"
+                >
+                  <option value="">-- 请选择用户 --</option>
+                  {(dashboard.users || []).map((u) => (
+                    <option key={u.id} value={String(u.id)}>
+                      #{u.id} {u.username}（当前 {Number(u.points_balance || 0)} 积分 · 码 {u.invite_code || '--'}）
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-dim mb-1 font-semibold">变动积分（正数增加 / 负数扣减）</label>
+                <input
+                  type="number"
+                  value={pointsAdjustForm.delta_points}
+                  onChange={(e) =>
+                    setPointsAdjustForm({ ...pointsAdjustForm, delta_points: e.target.value })
+                  }
+                  className="w-full input-field px-3.5 py-2.5 font-mono"
+                />
+                <div className="flex flex-wrap gap-1.5 mt-2">
+                  {[100, 300, 500, 1000, -100, -500].map((v) => (
+                    <button
+                      key={v}
+                      type="button"
+                      onClick={() => setPointsAdjustForm({ ...pointsAdjustForm, delta_points: v })}
+                      className="px-2.5 py-1 rounded-full surface-subtle text-[11px] font-mono hover:opacity-85"
+                    >
+                      {v > 0 ? `+${v}` : v}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-dim mb-1 font-semibold">备注原因（选填）</label>
+                <input
+                  type="text"
+                  maxLength={200}
+                  value={pointsAdjustForm.note}
+                  onChange={(e) => setPointsAdjustForm({ ...pointsAdjustForm, note: e.target.value })}
+                  placeholder="如：活动奖励 / 客服补偿 / 违规扣回"
+                  className="w-full input-field px-3.5 py-2.5"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={referralBusy}
+                className="btn-primary-pill w-full py-2.5 text-xs"
+              >
+                {referralBusy ? '正在处理...' : '确认调整用户积分'}
+              </button>
+            </form>
+          </div>
+
+          {/* Referral Relationships Table */}
+          <div className="surface-card p-4 sm:p-6">
+            <div className="flex items-center justify-between gap-3 mb-4">
+              <div>
+                <h3 className="text-sm sm:text-base font-bold text-main">全站邀请关系明细表</h3>
+                <p className="text-xs text-dim mt-0.5">
+                  记录每一位通过专属邀请码注册的新用户与其邀请人绑定关系
+                </p>
+              </div>
+              <span className="text-xs font-mono text-dim">
+                共 {(dashboard.referral_records || []).length} 条记录
+              </span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[700px] text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-line text-[11px] text-dim">
+                    <th className="py-2.5 px-3">邀请人</th>
+                    <th className="py-2.5 px-3">使用邀请码</th>
+                    <th className="py-2.5 px-3">受邀新用户</th>
+                    <th className="py-2.5 px-3">受邀人当前会员</th>
+                    <th className="py-2.5 px-3">注册时间</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y border-line font-mono">
+                  {(dashboard.referral_records || []).length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="py-8 text-center text-dim font-sans">
+                        暂无用户邀请注册记录
+                      </td>
+                    </tr>
+                  ) : (
+                    (dashboard.referral_records || []).map((rec) => (
+                      <tr key={`ref-${rec.invitee_id}`}>
+                        <td className="py-3 px-3 font-bold text-main">
+                          #{rec.inviter_id} {rec.inviter_username}
+                        </td>
+                        <td className="py-3 px-3 text-sub">{rec.inviter_code || '--'}</td>
+                        <td className="py-3 px-3 font-bold text-emerald-600 dark:text-emerald-400">
+                          #{rec.invitee_id} {rec.invitee_username}
+                        </td>
+                        <td className="py-3 px-3 font-sans">
+                          <span
+                            className={`px-2 py-0.5 rounded-full text-[11px] font-semibold ${
+                              rec.invitee_is_vip
+                                ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-400'
+                                : 'surface-subtle text-dim'
+                            }`}
+                          >
+                            {rec.invitee_is_vip ? '有效 VIP' : '未开 VIP'}
+                          </span>
+                        </td>
+                        <td className="py-3 px-3 text-dim">{rec.created_at}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Full Platform Points Ledger Table */}
+          <div className="surface-card p-4 sm:p-6 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm sm:text-base font-bold text-main">全站积分变动审计流水</h3>
+                <p className="text-xs text-dim mt-0.5">
+                  追踪每笔邀请发分、积分兑换会员及管理员手动调整的余额变化
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 w-full lg:w-auto">
+                <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                  {[
+                    { k: 'ALL', l: '全部' },
+                    { k: 'INVITE', l: '邀请奖励' },
+                    { k: 'REDEEM_VIP', l: '积分兑换' },
+                    { k: 'ADMIN_ADJUST', l: '管理员调整' },
+                  ].map((f) => (
+                    <button
+                      key={f.k}
+                      type="button"
+                      onClick={() => setLedgerFilter(f.k)}
+                      className={`px-3 py-1.5 text-xs ${
+                        ledgerFilter === f.k ? 'btn-primary-pill' : 'btn-soft-pill'
+                      }`}
+                    >
+                      {f.l}
+                    </button>
+                  ))}
+                </div>
+                <div className="relative w-full sm:w-56">
+                  <Search className="w-4 h-4 text-dim absolute left-3.5 top-2.5" strokeWidth={1.75} />
+                  <input
+                    type="text"
+                    value={ledgerSearch}
+                    onChange={(e) => setLedgerSearch(e.target.value)}
+                    placeholder="搜索用户名 / 备注..."
+                    className="w-full input-field rounded-full pl-10 pr-4 py-2 text-base sm:text-xs"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[780px] text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-line text-[11px] text-dim">
+                    <th className="py-2.5 px-3">ID</th>
+                    <th className="py-2.5 px-3">用户</th>
+                    <th className="py-2.5 px-3">类型</th>
+                    <th className="py-2.5 px-3">变动积分</th>
+                    <th className="py-2.5 px-3">变动后余额</th>
+                    <th className="py-2.5 px-3">关联对象</th>
+                    <th className="py-2.5 px-3">说明备注</th>
+                    <th className="py-2.5 px-3">时间</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y border-line font-mono">
+                  {filteredPointsLedger.length === 0 ? (
+                    <tr>
+                      <td colSpan={8} className="py-8 text-center text-dim font-sans">
+                        暂无符合条件的积分变动流水
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredPointsLedger.map((row) => {
+                      const delta = Number(row.change_points || 0);
+                      return (
+                        <tr key={row.id}>
+                          <td className="py-3 px-3 text-dim">#{row.id}</td>
+                          <td className="py-3 px-3 font-bold text-main">{row.username}</td>
+                          <td className="py-3 px-3 font-sans">
+                            <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold surface-subtle text-main">
+                              {formatPointsActionLabel(row.action_type)}
+                            </span>
+                          </td>
+                          <td
+                            className={`py-3 px-3 font-bold ${
+                              delta >= 0
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : 'text-rose-600 dark:text-rose-400'
+                            }`}
+                          >
+                            {delta >= 0 ? `+${delta}` : delta}
+                          </td>
+                          <td className="py-3 px-3 text-main">{row.balance_after}</td>
+                          <td className="py-3 px-3 text-sub">{row.related_username || '--'}</td>
+                          <td className="py-3 px-3 font-sans text-sub max-w-xs truncate" title={row.note}>
+                            {row.note}
+                          </td>
+                          <td className="py-3 px-3 text-dim">{row.created_at}</td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       )}
     </div>

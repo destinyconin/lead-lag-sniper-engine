@@ -765,6 +765,7 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authModalMode, setAuthModalMode] = useState('login');
+  const [urlInviteCode, setUrlInviteCode] = useState('');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [preflightResult, setPreflightResult] = useState(null);
   const [preflightLoading, setPreflightLoading] = useState(false);
@@ -915,6 +916,24 @@ export default function App() {
     refreshCurrentUser();
   }, [refreshCurrentUser]);
 
+  // Capture ?invite=CODE referral link on initial page load
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const inv = (params.get('invite') || params.get('ref') || '').trim().toUpperCase();
+      if (inv) {
+        setUrlInviteCode(inv);
+        if (!localStorage.getItem('sniper_auth_token')) {
+          setAuthModalMode('register');
+          setAuthModalOpen(true);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
   const handleAuthSuccess = useCallback(
     async (token, user, message) => {
       setAuthToken(token);
@@ -975,6 +994,41 @@ export default function App() {
   useEffect(() => {
     fetchInitialData();
   }, [fetchInitialData]);
+
+  // Real-time VIP expiration watcher: immediately sync user & stopped strategies when VIP expires mid-session
+  const vipExpiryHandledRef = useRef(0);
+  const wsOwnerCanUseLive = snapshot?.owner_vip_status?.can_use_live;
+  useEffect(() => {
+    if (!authToken || !currentUser || currentUser.is_admin) return;
+    if (currentUser.can_use_live && wsOwnerCanUseLive === false) {
+      const expKey = Number(currentUser.vip_expires_at || 1);
+      if (vipExpiryHandledRef.current !== expKey) {
+        vipExpiryHandledRef.current = expKey;
+        showToast('您的 VIP 会员已到期，所有运行中的策略已自动停止，交易系统已锁定；请续费或使用积分兑换会员', 'error');
+        refreshCurrentUser();
+        fetchInitialData();
+      }
+    }
+  }, [authToken, currentUser, wsOwnerCanUseLive, refreshCurrentUser, fetchInitialData, showToast]);
+
+  useEffect(() => {
+    if (!authToken || !currentUser || currentUser.is_admin || !currentUser.can_use_live) return undefined;
+    const expSec = Number(currentUser.vip_expires_at || 0);
+    if (expSec <= 0) return undefined;
+    const msLeft = expSec * 1000 - Date.now();
+    // Only arm a timer when expiry is within 24 hours (avoids 32-bit setTimeout overflow)
+    if (msLeft > 86400 * 1000) return undefined;
+    const delay = Math.max(1200, msLeft + 1500);
+    const timer = setTimeout(() => {
+      if (vipExpiryHandledRef.current !== expSec) {
+        vipExpiryHandledRef.current = expSec;
+        showToast('您的 VIP 会员已到期，所有运行中的策略已自动停止，交易系统已锁定；请续费或使用积分兑换会员', 'error');
+        refreshCurrentUser();
+        fetchInitialData();
+      }
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [authToken, currentUser, refreshCurrentUser, fetchInitialData, showToast]);
 
   const fetchMarketSentiment = useCallback(async (forceRefresh = false) => {
     setSentimentLoading(true);
@@ -3037,6 +3091,7 @@ export default function App() {
         isOpen={authModalOpen}
         onClose={() => setAuthModalOpen(false)}
         initialMode={authModalMode}
+        defaultInviteCode={urlInviteCode}
         onAuthSuccess={handleAuthSuccess}
         showToast={showToast}
       />
@@ -3052,15 +3107,19 @@ export default function App() {
               </div>
               <div className="min-w-0">
                 <div className="text-sm sm:text-base font-bold text-main">
-                  当前账号【{currentUser.username}】尚未开通 VIP 会员
+                  {Number(currentUser.vip_expires_at || 0) > 0
+                    ? `当前账号【${currentUser.username}】VIP 会员已到期，运行中的策略已全部自动停止`
+                    : `当前账号【${currentUser.username}】尚未开通 VIP 会员`}
                 </div>
                 <div className="text-xs text-dim mt-1">
-                  您已拥有实盘通道实时行情查看权限；开通 VIP 会员后即可绑定交易所 API 并启动实盘自动狙击。
+                  {Number(currentUser.vip_expires_at || 0) > 0
+                    ? '会员到期后交易系统已自动锁定（仍可安全查看或手动平仓）；前往会员中心续费或用积分兑换会员即可立即恢复。'
+                    : '您已拥有实盘通道实时行情查看权限；开通 VIP 会员或使用邀请积分兑换后即可绑定交易所 API 并启动实盘自动狙击。'}
                 </div>
               </div>
             </div>
             <button onClick={() => setActiveTab('membership')} className="btn-primary-pill w-full sm:w-auto px-6 py-2.5 text-xs">
-              立即开通 VIP 会员
+              {Number(currentUser.vip_expires_at || 0) > 0 ? '续费 / 积分兑换 VIP' : '立即开通 VIP 会员'}
             </button>
           </div>
         )}

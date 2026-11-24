@@ -5815,6 +5815,351 @@ def test_all_4_traditional_brokers_shadow_execution_live_isolation_and_protocols
     asyncio.run(_run_all_broker_checks())
 
 
+def test_referral_invite_points_redeem_and_vip_expiry_auto_stop():
+    """
+    End-to-end verification of:
+      1. Personal invite code generation + dual +100 points referral reward + anti-abuse (invalid code / same IP)
+      2. Points-to-VIP redemption (100 pts = 1 hour VIP), accurate remaining-time label, zero revenue inflation
+      3. Admin referral rules config, manual points adjustment, hour-based VIP grant & zero-day accidental-wipe guard
+      4. Strict VIP expiration auto-stop: stops trading AND sets ALL strategies is_running=False in memory & SQLite,
+         locks all trading mutation endpoints while keeping stop/kill-switch/manual-close safe, and unlocks immediately
+         upon points redemption or admin grant (and re-stops on admin revoke).
+    """
+    import sqlite3
+    import time
+    from backend import main as main_mod
+    from backend.user_membership import UserMembershipManager
+    from backend.engine_manager import EngineManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = os.path.join(tmpdir, "referral_vip_audit.db")
+        adb = AsyncDatabaseManager(db_path=db_file)
+        adb.init_sync()
+        um = UserMembershipManager(db_path=db_file)
+        um.init_sync()
+        em = EngineManager(adb, get_user_fn=um.get_user_by_id)
+
+        with (
+            patch.object(main_mod, "db_manager", adb),
+            patch.object(main_mod, "user_manager", um),
+            patch.object(main_mod, "engine_manager", em),
+            patch("backend.sniper_engine.BidirectionalSniperEngine.start", new=AsyncMock()),
+            patch.object(em, "_vip_guard_loop", new=AsyncMock()),
+        ):
+            with TestClient(main_mod.app) as client:
+                # Admin login
+                r_adm = client.post("/api/auth/login", json={"username": "admin", "password": "admin123456"})
+                assert r_adm.status_code == 200
+                adm_hdr = {"Authorization": f"Bearer {r_adm.json()['token']}"}
+                assert r_adm.json()["user"]["invite_code"].startswith("INV-")
+
+                # 1. User A registers and receives a unique invite code
+                r_a = client.post(
+                    "/api/auth/register",
+                    json={"username": "inviter_a", "password": "Password123!", "email": "a@test.local"},
+                    headers={"x-forwarded-for": "198.51.100.10"},
+                )
+                assert r_a.status_code == 200, r_a.text
+                u_a = r_a.json()["user"]
+                tok_a = r_a.json()["token"]
+                hdr_a = {"Authorization": f"Bearer {tok_a}"}
+                code_a = u_a["invite_code"]
+                assert code_a.startswith("INV-") and len(code_a) >= 8
+                assert u_a["points_balance"] == 0
+
+                # Invalid invite code rejected
+                r_bad_code = client.post(
+                    "/api/auth/register",
+                    json={
+                        "username": "bad_invitee",
+                        "password": "Password123!",
+                        "invite_code": "INV-NOEXIST1",
+                    },
+                    headers={"x-forwarded-for": "198.51.100.19"},
+                )
+                assert r_bad_code.status_code == 400
+
+                # Same non-loopback IP self-referral rejected
+                r_same_ip = client.post(
+                    "/api/auth/register",
+                    json={
+                        "username": "same_ip_user",
+                        "password": "Password123!",
+                        "invite_code": code_a,
+                    },
+                    headers={"x-forwarded-for": "198.51.100.10"},
+                )
+                assert r_same_ip.status_code == 400
+
+                # User B registers with User A's invite code from a distinct IP -> BOTH gain +100 points!
+                r_b = client.post(
+                    "/api/auth/register",
+                    json={
+                        "username": "invitee_b",
+                        "password": "Password123!",
+                        "email": "b@test.local",
+                        "invite_code": code_a.lower(),  # case-insensitive
+                    },
+                    headers={"x-forwarded-for": "198.51.100.11"},
+                )
+                assert r_b.status_code == 200, r_b.text
+                u_b = r_b.json()["user"]
+                uid_b = int(u_b["id"])
+                tok_b = r_b.json()["token"]
+                hdr_b = {"Authorization": f"Bearer {tok_b}"}
+                assert u_b["points_balance"] == 100
+                assert u_b["total_points_earned"] == 100
+                assert u_b["invited_by_username"] == "inviter_a"
+                assert u_b["invite_code"].startswith("INV-") and u_b["invite_code"] != code_a
+
+                # Check User A's referral summary
+                r_ref_a = client.get("/api/referral/me", headers=hdr_a)
+                assert r_ref_a.status_code == 200
+                ref_a = r_ref_a.json()
+                assert ref_a["points_balance"] == 100
+                assert ref_a["total_invites_count"] == 1
+                assert any(x["username"] == "invitee_b" for x in ref_a["invited_users"])
+                assert any(x["action_type"] == "INVITE_REWARD_INVITER" and x["change_points"] == 100 for x in ref_a["ledger"])
+
+                # 2. Points-to-VIP redemption (100 pts = 1 hour VIP)
+                # Insufficient points (needs 200 for 2 hours, has 100)
+                r_insuff = client.post("/api/points/redeem-vip", json={"hours": 2}, headers=hdr_b)
+                assert r_insuff.status_code == 400
+
+                # Redeem 1 hour (100 pts)
+                r_redeem = client.post("/api/points/redeem-vip", json={"hours": 1}, headers=hdr_b)
+                assert r_redeem.status_code == 200, r_redeem.text
+                red_data = r_redeem.json()
+                assert red_data["cost_points"] == 100
+                assert red_data["hours_added"] == 1
+                u_b_vip = red_data["user"]
+                assert u_b_vip["points_balance"] == 0
+                assert u_b_vip["is_vip"] is True
+                assert u_b_vip["can_use_live"] is True
+                assert 3540 <= int(u_b_vip["vip_remaining_seconds"]) <= 3605
+                assert "0 天" not in u_b_vip["vip_remaining_label"]
+                assert ("小时" in u_b_vip["vip_remaining_label"]) or ("分" in u_b_vip["vip_remaining_label"])
+                assert any(o["pay_method"] == "POINTS_REDEEM" and o["amount_usdt"] == 0.0 for o in red_data["orders"])
+
+                # 3. Admin referral management: dashboard, settings update, manual points adjust, hour grant & zero-day guard
+                r_dash = client.get("/api/admin/dashboard", headers=adm_hdr)
+                assert r_dash.status_code == 200
+                dash = r_dash.json()
+                assert dash["stats"]["total_invites_count"] == 1
+                assert dash["stats"]["total_redeem_count"] == 1
+                assert dash["stats"]["total_redeem_points"] == 100
+                assert dash["stats"]["total_revenue_usdt"] == 0.0  # points redemption does NOT inflate USDT revenue!
+                assert len(dash["referral_records"]) == 1
+
+                # Admin updates referral rules
+                r_set = client.post(
+                    "/api/admin/referral/settings",
+                    json={
+                        "invite_enabled": True,
+                        "inviter_reward_points": 150,
+                        "invitee_reward_points": 120,
+                        "redeem_enabled": True,
+                        "points_per_vip_hour": 120,
+                        "max_redeem_hours_per_tx": 48,
+                    },
+                    headers=adm_hdr,
+                )
+                assert r_set.status_code == 200
+
+                # User C registers with User A's code -> A gets +150 (total 250), C gets +120
+                r_c = client.post(
+                    "/api/auth/register",
+                    json={"username": "invitee_c", "password": "Password123!", "invite_code": code_a},
+                    headers={"x-forwarded-for": "198.51.100.12"},
+                )
+                assert r_c.status_code == 200
+                assert r_c.json()["user"]["points_balance"] == 120
+                assert client.get("/api/referral/me", headers=hdr_a).json()["points_balance"] == 250
+
+                # Admin adjusts User B points (+200, then -50 => 150; reject -500)
+                r_adj1 = client.post(
+                    "/api/admin/points/adjust",
+                    json={"user_id": uid_b, "delta_points": 200, "note": "活动奖励"},
+                    headers=adm_hdr,
+                )
+                assert r_adj1.status_code == 200
+                assert r_adj1.json()["user"]["points_balance"] == 200
+
+                r_adj2 = client.post(
+                    "/api/admin/points/adjust",
+                    json={"user_id": uid_b, "delta_points": -50, "note": "测试扣减"},
+                    headers=adm_hdr,
+                )
+                assert r_adj2.status_code == 200
+                assert r_adj2.json()["user"]["points_balance"] == 150
+
+                r_adj_bad = client.post(
+                    "/api/admin/points/adjust",
+                    json={"user_id": uid_b, "delta_points": -500, "note": "超额扣减"},
+                    headers=adm_hdr,
+                )
+                assert r_adj_bad.status_code == 400
+
+                # Accidental add_days=0 & add_hours=0 without revoke=True MUST be rejected (never wipe VIP!)
+                r_wipe_guard = client.post(
+                    "/api/admin/users/grant-vip",
+                    json={"user_id": uid_b, "add_days": 0, "add_hours": 0, "vip_tier": "月度专业版会员", "revoke": False},
+                    headers=adm_hdr,
+                )
+                assert r_wipe_guard.status_code == 400
+                assert um.get_user_by_id(uid_b)["is_vip"] is True
+
+                # Grant +2 hours VIP works cleanly
+                prev_exp = um.get_user_by_id(uid_b)["vip_expires_at"]
+                r_grant_h = client.post(
+                    "/api/admin/users/grant-vip",
+                    json={"user_id": uid_b, "add_days": 0, "add_hours": 2, "vip_tier": "月度专业版会员", "revoke": False},
+                    headers=adm_hdr,
+                )
+                assert r_grant_h.status_code == 200
+                assert um.get_user_by_id(uid_b)["vip_expires_at"] >= prev_exp + 7200
+
+                # 4. Strict VIP expiration auto-stop & full trading lockout
+                # Enter LIVE, configure mock verified OKX keys via real API, add 2 running strategies, and start trading
+                r_live = client.post("/api/mode/enter-live", headers=hdr_b)
+                assert r_live.status_code == 200
+                eng_b = em.user_engines[uid_b]
+                eng_b.sync_live_exchange_positions = AsyncMock(return_value={"ok": True, "synced_count": 0})
+                eng_b.executor.verify_exchange_credentials = AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "auth_status": "VERIFIED",
+                        "auth_message": "Mock OKX Verified",
+                        "account_equity_usdt": 1000.0,
+                    }
+                )
+                r_ex = client.post(
+                    "/api/exchanges/update",
+                    json={
+                        "exchange_id": "okx",
+                        "display_name": "OKX Swap",
+                        "role": "follower",
+                        "api_key": "test-live-key",
+                        "api_secret": "test-live-secret",
+                        "passphrase": "test-live-pass",
+                        "is_active": True,
+                    },
+                    headers=hdr_b,
+                )
+                assert r_ex.status_code == 200, r_ex.text
+                r_ver = client.post("/api/exchanges/verify?exchange_id=okx", headers=hdr_b)
+                assert r_ver.status_code == 200, r_ver.text
+
+                cfg_btc = SymbolStrategy(
+                    symbol="BTC/USDT:USDT",
+                    strategy_type="LONG_SHORT_GRID",
+                    order_usdt=50.0,
+                    leverage=5,
+                    is_running=True,
+                )
+                cfg_eth = SymbolStrategy(
+                    symbol="ETH/USDT:USDT",
+                    strategy_type="LEAD_LAG",
+                    order_usdt=50.0,
+                    leverage=5,
+                    is_running=True,
+                )
+                assert client.post("/api/symbol/update", json=cfg_btc.model_dump(), headers=hdr_b).status_code == 200
+                assert client.post("/api/symbol/update", json=cfg_eth.model_dump(), headers=hdr_b).status_code == 200
+                assert len(eng_b.strategies) >= 2
+
+                r_start = client.post("/api/trading/start", headers=hdr_b)
+                assert r_start.status_code == 200 and r_start.json()["ok"] is True, r_start.text
+                assert eng_b.trading_active_by_mode["LIVE"] is True
+                assert all(c.is_running for c in eng_b.strategies.values())
+
+                # Expire User B's VIP right now in SQLite (simulating time passing past vip_expires_at)
+                expired_ts = int(time.time()) - 5
+                with sqlite3.connect(db_file) as c_exp:
+                    c_exp.execute("UPDATE users SET vip_expires_at = ? WHERE id = ?", (expired_ts, uid_b))
+                    c_exp.commit()
+
+                # Verify real-time engine check catches expiry immediately even before guard loop fires
+                eng_b.sync_owner_vip_status(um.get_user_by_id(uid_b))
+                assert eng_b.is_owner_vip_valid_realtime() is False
+
+                # Force immediate check via /api/stats (also happens automatically per-tick & every 5s in guard loop)
+                r_stats_exp = client.get("/api/stats", headers=hdr_b)
+                assert r_stats_exp.status_code == 200
+                snap_exp = r_stats_exp.json()
+                assert snap_exp["owner_vip_status"]["can_use_live"] is False
+                assert snap_exp["trading_control"]["trading_active"] is False
+                assert snap_exp["trading_control"]["status_code"] == "VIP_EXPIRED"
+
+                # Verify BOTH trading_active AND EVERY strategy's is_running flipped to False (in memory AND SQLite!)
+                assert eng_b.trading_active_by_mode["LIVE"] is False
+                assert eng_b.trading_active_by_mode["SHADOW"] is False
+                assert all(not c.is_running for c in eng_b.strategies.values())
+                persisted_cfgs = adb.load_symbols_sync(user_id=uid_b)
+                assert len(persisted_cfgs) > 0
+                assert all(not c.is_running for c in persisted_cfgs)
+
+                # Verify ALL trading mutation endpoints are locked for expired VIP!
+                r_start_exp = client.post("/api/trading/start", headers=hdr_b)
+                assert r_start_exp.status_code == 200
+                assert r_start_exp.json()["ok"] is False and r_start_exp.json()["require_vip"] is True
+
+                sample_cfg = next(iter(eng_b.strategies.values())).model_copy(update={"is_running": True})
+                assert client.post("/api/symbol/update", json=sample_cfg.model_dump(), headers=hdr_b).status_code == 403
+                assert (
+                    client.post(
+                        "/api/risk/update",
+                        json=GlobalRiskConfig(trading_mode="LIVE", max_daily_loss_usdt=123.0).model_dump(),
+                        headers=hdr_b,
+                    ).status_code
+                    == 403
+                )
+                assert client.post("/api/stats/reset", headers=hdr_b).status_code == 403
+                assert (
+                    client.post(
+                        "/api/exchanges/update",
+                        json={"exchange_id": "okx", "api_key": "k", "api_secret": "s", "api_passphrase": "p"},
+                        headers=hdr_b,
+                    ).status_code
+                    == 403
+                )
+                r_pf_exp = client.post("/api/exchanges/preflight", headers=hdr_b)
+                assert r_pf_exp.status_code == 200
+                assert r_pf_exp.json()["ok"] is False
+                assert any("VIP" in b for b in r_pf_exp.json().get("blockers", []))
+
+                # Safe emergency actions STILL work when expired (stop trading & activate kill switch),
+                # while releasing kill switch requires VIP
+                assert client.post("/api/trading/stop", headers=hdr_b).status_code == 200
+                assert client.post("/api/risk/kill-switch?active=true", headers=hdr_b).status_code == 200
+                assert client.post("/api/risk/kill-switch?active=false", headers=hdr_b).status_code == 403
+
+                # 5. User B redeems 120 points (balance 150 -> 30) -> IMMEDIATELY unlocks trading again!
+                r_redeem2 = client.post("/api/points/redeem-vip", json={"hours": 1}, headers=hdr_b)
+                assert r_redeem2.status_code == 200
+                assert r_redeem2.json()["user"]["points_balance"] == 30
+                assert r_redeem2.json()["user"]["can_use_live"] is True
+                assert eng_b.is_owner_vip_valid_realtime() is True
+
+                assert client.post("/api/risk/kill-switch?active=false", headers=hdr_b).status_code == 200
+                assert client.post("/api/symbol/update", json=sample_cfg.model_dump(), headers=hdr_b).status_code == 200
+                r_start_ok = client.post("/api/trading/start", headers=hdr_b)
+                assert r_start_ok.status_code == 200 and r_start_ok.json()["ok"] is True
+                assert eng_b.trading_active_by_mode["LIVE"] is True
+                assert any(c.is_running for c in eng_b.strategies.values())
+
+                # 6. Admin revoking VIP immediately stops trading AND stops all running strategies!
+                r_revoke = client.post(
+                    "/api/admin/users/grant-vip",
+                    json={"user_id": uid_b, "add_days": 0, "add_hours": 0, "vip_tier": "NONE", "revoke": True},
+                    headers=adm_hdr,
+                )
+                assert r_revoke.status_code == 200
+                assert eng_b.trading_active_by_mode["LIVE"] is False
+                assert all(not c.is_running for c in eng_b.strategies.values())
+
+
+
 
 
 

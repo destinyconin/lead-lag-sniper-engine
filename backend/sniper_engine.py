@@ -7,10 +7,11 @@ Includes:
 """
 import asyncio
 import math
+import time
 from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from backend.database import AsyncDatabaseManager
 from backend.executor import ExecutionAdapter, OkxPrivateWsClient, resolve_okx_spec
 from backend.grid_engine import LongShortGridTracker, calc_pyramid_weights
@@ -101,12 +102,21 @@ class BidirectionalSniperEngine:
         user_id: int = 0,
         shared_gateway: Optional[MarketDataGateway] = None,
         is_guest_preview: bool = False,
+        get_user_fn: Optional[Callable[[int], Optional[dict]]] = None,
     ):
         self.db = db
         self.user_id = int(user_id)
         self.is_guest_preview = bool(is_guest_preview)
+        self._get_user_fn = get_user_fn
         self._owns_gateway = shared_gateway is None
         self._subscriber_id = f"guest-{self.user_id}" if self.is_guest_preview else f"user-{self.user_id}"
+
+        # Cached owner VIP state for 0ms real-time expiration enforcement on every tick
+        self._owner_vip_checked_mono: float = 0.0
+        self._owner_is_admin: bool = False
+        self._owner_is_active: bool = True
+        self._owner_vip_expires_at: int = 0
+        self._owner_vip_enforced_stop: bool = False
 
         self.risk_config = GlobalRiskConfig()
         self.strategies: Dict[str, SymbolStrategy] = {}
@@ -2527,6 +2537,82 @@ class BidirectionalSniperEngine:
             self.append_log("INFO", "SHADOW_MODE", "[切换模拟盘] 已恢复高频脉冲模拟盘视图", mode="SHADOW")
         self.persist_runtime_state()
 
+    def sync_owner_vip_status(self, user_info: Optional[dict] = None) -> bool:
+        """Refreshes cached owner VIP expiration metadata and returns whether live trading is permitted."""
+        if self.is_guest_preview or self.user_id <= 0 or (self._get_user_fn is None and user_info is None):
+            return True
+        info = user_info if user_info is not None else self._get_user_fn(self.user_id)
+        self._owner_vip_checked_mono = mono_ms()
+        if not info:
+            self._owner_is_active = False
+            self._owner_is_admin = False
+            self._owner_vip_expires_at = 0
+            return False
+        self._owner_is_active = bool(info.get("is_active", True))
+        self._owner_is_admin = bool(info.get("is_admin", False) or info.get("role") == "admin")
+        self._owner_vip_expires_at = int(info.get("vip_expires_at") or 0)
+        now_s = int(time.time())
+        valid = self._owner_is_active and (self._owner_is_admin or self._owner_vip_expires_at > now_s)
+        if valid:
+            self._owner_vip_enforced_stop = False
+        return valid
+
+    def is_owner_vip_valid_realtime(self) -> bool:
+        """O(1) per-tick check with 10s DB refresh; blocks orders the exact second VIP expires."""
+        if self.is_guest_preview or self.user_id <= 0 or self._get_user_fn is None:
+            return True
+        now_m = mono_ms()
+        if self._owner_vip_checked_mono <= 0.0 or (now_m - self._owner_vip_checked_mono >= 10_000.0):
+            return self.sync_owner_vip_status()
+        if not self._owner_is_active:
+            return False
+        if self._owner_is_admin:
+            return True
+        return self._owner_vip_expires_at > int(time.time())
+
+    async def enforce_vip_expired_stop(
+        self,
+        reason: str = "VIP 会员已到期，所有运行中的策略已自动停止，无法继续使用交易系统；请续费或使用积分兑换会员",
+    ) -> int:
+        """Immediately stops automated trading AND pauses EVERY running symbol strategy on VIP expiration/revocation."""
+        stopped_strategies = 0
+        was_trading = bool(self.trading_active_by_mode.get("LIVE") or self.trading_active_by_mode.get("SHADOW"))
+        self.trading_active_by_mode["LIVE"] = False
+        self.trading_active_by_mode["SHADOW"] = False
+
+        for cfg in self.strategies.values():
+            if cfg.is_running:
+                cfg.is_running = False
+                cfg.auto_disabled_reason = reason
+                stopped_strategies += 1
+                if not self.is_guest_preview:
+                    try:
+                        self.db.upsert_symbol_sync(cfg, user_id=self.user_id)
+                    except Exception:
+                        pass
+
+        db_stopped = 0
+        if not self.is_guest_preview and self.user_id > 0:
+            try:
+                db_stopped = self.db.stop_all_user_strategies_sync(self.user_id, reason)
+            except Exception:
+                pass
+        stopped_total = max(stopped_strategies, db_stopped)
+
+        if stopped_total > 0 or was_trading or not self._owner_vip_enforced_stop:
+            self._owner_vip_enforced_stop = True
+            self.persist_runtime_state(sync=True)
+            self._save_open_strategy_state()
+            detail = (
+                f"[会员到期停机] {reason}（已自动停止 {stopped_total} 个运行中策略）"
+                if stopped_total > 0
+                else f"[会员到期停机] {reason}"
+            )
+            self.append_log("WARN", "VIP_EXPIRED", detail, mode="LIVE")
+            if not self.is_guest_preview:
+                self.db.record_risk_event_async("WARN", "VIP_EXPIRED", "SYSTEM", detail, user_id=self.user_id)
+        return stopped_total
+
     async def set_trading_active(self, active: bool) -> Dict[str, Any]:
         cur_mode = self.risk_config.trading_mode
         if not active:
@@ -2537,6 +2623,16 @@ class BidirectionalSniperEngine:
             msg = f"已停止{mode_label}自动交易（当前仅实时刷新行情，不会发送任何新订单）"
             self.append_log("WARN", "CONTROL", f"[停止自动交易] {msg}", mode=cur_mode)
             return {"ok": True, "trading_active": False, "message": msg}
+
+        if not self.is_guest_preview and self.user_id > 0 and self._get_user_fn is not None:
+            if not self.sync_owner_vip_status():
+                await self.enforce_vip_expired_stop()
+                return {
+                    "ok": False,
+                    "require_vip": True,
+                    "trading_active": False,
+                    "message": "VIP 会员已到期或未开通，所有策略已自动停止，无法启动交易系统；请前往会员中心续费或用积分兑换会员",
+                }
 
         if self.risk_config.kill_switch_active:
             self.risk_config.kill_switch_active = False
@@ -2673,6 +2769,16 @@ class BidirectionalSniperEngine:
                 gpos["trail_stop_price"] = (
                     tracker.long_trail_stop_price if gpos["side"] == "LONG" else tracker.short_trail_stop_price
                 )
+
+        vip_ok_rt = self.is_owner_vip_valid_realtime()
+        if not vip_ok_rt:
+            if (
+                self.trading_active_by_mode.get(cur_mode, False)
+                or any(c.is_running for c in self.strategies.values())
+                or not self._owner_vip_enforced_stop
+            ):
+                self._spawn_task(self.enforce_vip_expired_stop())
+            return
 
         allow_recenter = (
             cfg.is_running
@@ -2831,7 +2937,15 @@ class BidirectionalSniperEngine:
         if not cfg.is_running or self.risk_config.kill_switch_active:
             return
 
-        # Respect explicit Start / Stop Trading state
+        # Respect explicit Start / Stop Trading state & real-time VIP validity
+        if not self.is_owner_vip_valid_realtime():
+            if (
+                self.trading_active_by_mode.get(cur_mode, False)
+                or any(c.is_running for c in self.strategies.values())
+                or not self._owner_vip_enforced_stop
+            ):
+                self._spawn_task(self.enforce_vip_expired_stop())
+            return
         if not self.trading_active_by_mode.get(cur_mode, False):
             return
 
@@ -3004,6 +3118,10 @@ class BidirectionalSniperEngine:
             async with self._get_symbol_exec_lock(sym):
                 lv_pre = tracker.levels.get(slot_id)
                 if not lv_pre or lv_pre.get("status") != "ENTERING":
+                    return
+                if not self.is_owner_vip_valid_realtime():
+                    tracker.mark_entry_missed(slot_id, backoff_ms=60_000.0)
+                    await self.enforce_vip_expired_stop()
                     return
                 if (
                     self.risk_config.kill_switch_active
@@ -3947,6 +4065,9 @@ class BidirectionalSniperEngine:
             )
 
             async with self._get_symbol_exec_lock(sym):
+                if not self.is_owner_vip_valid_realtime():
+                    await self.enforce_vip_expired_stop()
+                    return
                 if self.risk_config.kill_switch_active or self.risk_config.trading_mode != exec_mode:
                     return
                 entry_res = await self.executor.place_entry_ioc(
@@ -4952,6 +5073,7 @@ class BidirectionalSniperEngine:
             )
 
         user_started = bool(self.trading_active_by_mode.get(cur_mode, False))
+        vip_valid_now = self.is_owner_vip_valid_realtime()
         f_auth_status = follower_ex.get("auth_status", "UNCONFIGURED")
         f_auth_msg = follower_ex.get("auth_message", "未配置 API 密钥")
         f_equity = float(follower_ex.get("account_equity_usdt") or 0.0)
@@ -4963,6 +5085,11 @@ class BidirectionalSniperEngine:
             status_code = "KILL_SWITCH"
             status_label = "已暂停：全局紧急熔断激活"
             status_detail = "点击顶部「解除熔断恢复监控」或「开始交易」恢复自动抢单"
+        elif cur_mode == "LIVE" and not self.is_guest_preview and not vip_valid_now:
+            eff_active = False
+            status_code = "VIP_EXPIRED"
+            status_label = "无法交易：VIP 会员已到期或未开通"
+            status_detail = "所有运行中的策略已自动停止，请前往会员中心续费或使用积分兑换会员"
         elif cur_mode == "LIVE" and f_auth_status != "VERIFIED":
             eff_active = False
             status_code = "AUTH_ERROR"
@@ -5002,9 +5129,21 @@ class BidirectionalSniperEngine:
         raw_avail = self.executor._usdt_avail_by_key.get(f_api_key, okx_meta.get("usdt_avail_usdt", 0.0)) if f_api_key else 0.0
         effective_avail_usdt = 0.0 if self.is_guest_preview else round(float(raw_avail or 0.0), 2)
 
+        owner_vip_rem = (
+            (36500 * 86400)
+            if self._owner_is_admin
+            else max(0, int(self._owner_vip_expires_at) - int(time.time()))
+        )
         return {
             "ts": wall_ms(),
             "owner_user_id": self.user_id,
+            "owner_vip_status": {
+                "can_use_live": bool(vip_valid_now),
+                "is_vip": bool(vip_valid_now),
+                "is_admin": bool(self._owner_is_admin),
+                "vip_expires_at": int(self._owner_vip_expires_at),
+                "vip_remaining_seconds": owner_vip_rem if vip_valid_now else 0,
+            },
             "is_guest_preview": self.is_guest_preview,
             "trading_mode": cur_mode,
             "feed_source": "HIGH_FREQ_SIM" if self.is_guest_preview else self.gateway.active_source,

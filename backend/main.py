@@ -37,12 +37,14 @@ from backend.market_gateway import (
 from backend.models import (
     ALL_EXCHANGE_IDS,
     TRADITIONAL_BROKER_IDS,
+    AdminAdjustPointsRequest,
     AdminAuditOrderRequest,
     AdminCreateUserRequest,
     AdminFeedbackReplyRequest,
     AdminGenerateVipCodesRequest,
     AdminGrantVipRequest,
     AdminMembershipPlanModel,
+    AdminReferralSettingsRequest,
     AdminUpdateUserRequest,
     BatchSymbolUpdateRequest,
     ChangePasswordRequest,
@@ -50,6 +52,7 @@ from backend.models import (
     ExchangeConfigModel,
     GlobalRiskConfig,
     LoginRequest,
+    PointsRedeemVipRequest,
     PurchaseMembershipRequest,
     PulseInjectionRequest,
     RedeemVipCodeRequest,
@@ -448,7 +451,16 @@ async def switch_exchange_account_mode(
 
 @app.post("/api/exchanges/preflight")
 async def preflight_exchange_orders(authorization: str = Header(default="")):
-    _, eng = await _require_user_engine(authorization)
+    user, eng = await _require_user_engine(authorization)
+    if not user.get("can_use_live"):
+        await eng.enforce_vip_expired_stop()
+        return {
+            "ok": False,
+            "account": {"auth_status": "VIP_REQUIRED", "auth_message": "VIP 会员已到期或未开通"},
+            "blockers": ["VIP 会员已到期或未开通，无法使用实盘交易系统；请前往会员中心续费或使用积分兑换会员"],
+            "warnings": [],
+            "symbols": [],
+        }
     return await eng.run_preflight_check()
 
 
@@ -478,7 +490,15 @@ async def fetch_vip_fees(exchange_id: str = Query(...), vip_level: str = Query(d
 # ==================== 2. Symbol Watchlist & Strategy Matrix APIs ====================
 @app.get("/api/symbols")
 async def get_symbols(authorization: str = Header(default="")):
-    _, eng = await _resolve_user_engine(authorization)
+    user, eng = await _resolve_user_engine(authorization)
+    if user is not None:
+        eng.sync_owner_vip_status(user)
+        if not user.get("can_use_live") and (
+            eng.trading_active_by_mode.get("LIVE")
+            or eng.trading_active_by_mode.get("SHADOW")
+            or any(c.is_running for c in eng.strategies.values())
+        ):
+            await eng.enforce_vip_expired_stop()
     return {
         "strategies": [cfg.model_dump() for cfg in eng.strategies.values()],
         "catalog": SUPPORTED_PERP_CATALOG,
@@ -894,6 +914,13 @@ async def enter_live_mode(authorization: str = Header(default="")):
     affecting any other tenant or stopping an already-running LIVE session.
     """
     user, eng = await _require_user_engine(authorization)
+    eng.sync_owner_vip_status(user)
+    if not user.get("can_use_live") and (
+        eng.trading_active_by_mode.get("LIVE")
+        or eng.trading_active_by_mode.get("SHADOW")
+        or any(c.is_running for c in eng.strategies.values())
+    ):
+        await eng.enforce_vip_expired_stop()
     if eng.risk_config.trading_mode != "LIVE":
         await eng.switch_trading_mode("LIVE", preserve_user_started=True)
     if user and user.get("can_use_live") and not eng.exchange_live_positions:
@@ -918,13 +945,11 @@ async def update_risk(cfg: GlobalRiskConfig, authorization: str = Header(default
 
     # Only VIP / Admin users can modify risk parameters on the server
     if not user.get("can_use_live"):
-        if eng.risk_config.trading_mode != "LIVE":
-            await eng.switch_trading_mode("LIVE", preserve_user_started=True)
-        return {
-            "status": "ok",
-            "risk": eng.risk_config.model_dump(),
-            "snapshot": eng.build_dashboard_snapshot(),
-        }
+        await eng.enforce_vip_expired_stop()
+        raise HTTPException(
+            status_code=403,
+            detail="您的 VIP 会员已到期或未开通，所有策略已自动停止，无法修改风控参数或使用交易系统；请续费或积分兑换会员",
+        )
 
     prev_kill = eng.risk_config.kill_switch_active
     prev_mode = eng.risk_config.trading_mode
@@ -959,14 +984,14 @@ async def start_trading(authorization: str = Header(default="")):
             "snapshot": guest_eng.build_public_preview_snapshot(),
         }
     eng = await engine_manager.get_user_engine(int(user["id"]))
+    eng.sync_owner_vip_status(user)
     if not user.get("can_use_live"):
-        eng.trading_active_by_mode["LIVE"] = False
-        eng.persist_runtime_state()
+        await eng.enforce_vip_expired_stop()
         return {
             "ok": False,
             "require_vip": True,
             "trading_active": False,
-            "message": "注册用户需开通 VIP 会员后才可使用实盘自动交易，请先前往会员中心开通会员",
+            "message": "VIP 会员已到期或未开通，所有运行中的策略已自动停止；请前往会员中心续费或使用积分兑换会员",
             "snapshot": eng.build_dashboard_snapshot(),
         }
     res = await eng.set_trading_active(True)
@@ -1026,7 +1051,14 @@ async def auth_register(req: RegisterRequest, request: Request):
     allowed, retry = rate_limiter.check_and_record(f"reg:{client_ip}", max_hits=10, window_sec=300.0)
     if not allowed:
         raise HTTPException(status_code=429, detail=f"注册请求过于频繁，请在 {retry} 秒后重试")
-    res = await asyncio.to_thread(user_manager.register_user, req.username, req.password, req.email, client_ip)
+    res = await asyncio.to_thread(
+        user_manager.register_user,
+        req.username,
+        req.password,
+        req.email,
+        client_ip,
+        req.invite_code,
+    )
     if not res["ok"]:
         raise HTTPException(status_code=400, detail=res["message"])
     return res
@@ -1122,6 +1154,9 @@ async def get_membership_order_status(order_no: str, authorization: str = Header
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
     refreshed_user = user_manager.get_user_by_id(user["id"])
+    eng_paid = engine_manager.user_engines.get(int(user["id"]))
+    if eng_paid and refreshed_user and order["status"] == "PAID":
+        eng_paid.sync_owner_vip_status(refreshed_user)
     return {
         "ok": True,
         "order": order,
@@ -1152,6 +1187,9 @@ async def check_membership_order_onchain(
 
     refreshed_user = user_manager.get_user_by_id(user["id"])
     paid = order["status"] == "PAID"
+    eng_paid = engine_manager.user_engines.get(int(user["id"]))
+    if eng_paid and refreshed_user and paid:
+        eng_paid.sync_owner_vip_status(refreshed_user)
     msg = (
         f"链上支付已确认到账（{order.get('chain_network')}）！已为您自动激活【{order['plan_name']}】"
         if paid
@@ -1190,7 +1228,32 @@ async def redeem_vip_code(req: RedeemVipCodeRequest, authorization: str = Header
     res = user_manager.redeem_vip_code(user_id=user["id"], code=req.code)
     if not res["ok"]:
         raise HTTPException(status_code=400, detail=res["message"])
+    eng = engine_manager.user_engines.get(int(user["id"]))
+    if eng and res.get("user"):
+        eng.sync_owner_vip_status(res["user"])
     res["orders"] = user_manager.list_user_orders(user["id"])
+    return res
+
+
+# ==================== 4.4 Referral Invite & Points Redemption APIs ====================
+@app.get("/api/referral/me")
+async def get_my_referral_summary(authorization: str = Header(default="")):
+    user = _require_user(authorization)
+    return await asyncio.to_thread(user_manager.get_user_referral_summary, user["id"])
+
+
+@app.post("/api/points/redeem-vip")
+async def redeem_points_for_vip(req: PointsRedeemVipRequest, authorization: str = Header(default="")):
+    user = _require_user(authorization)
+    allowed, retry = rate_limiter.check_and_record(f"pts_redeem:{user['id']}", max_hits=15, window_sec=60.0)
+    if not allowed:
+        raise HTTPException(status_code=429, detail=f"积分兑换操作过于频繁，请在 {retry} 秒后重试")
+    res = await asyncio.to_thread(user_manager.redeem_points_for_vip, user["id"], req.hours)
+    if not res["ok"]:
+        raise HTTPException(status_code=400, detail=res["message"])
+    eng = engine_manager.user_engines.get(int(user["id"]))
+    if eng and res.get("user"):
+        eng.sync_owner_vip_status(res["user"])
     return res
 
 
@@ -1259,13 +1322,31 @@ async def admin_update_user(req: AdminUpdateUserRequest, authorization: str = He
     if not res["ok"]:
         raise HTTPException(status_code=400, detail=res["message"])
     if req.is_active is False:
+        ban_reason = "账号已被管理员封禁，所有策略已立即停止"
+        eng_ban = engine_manager.user_engines.get(int(req.user_id))
+        if eng_ban:
+            await eng_ban.enforce_vip_expired_stop(ban_reason)
+        else:
+            await asyncio.to_thread(db_manager.stop_all_user_strategies_sync, int(req.user_id), ban_reason)
+            await asyncio.to_thread(
+                db_manager.save_runtime_setting_sync,
+                "trading_active_by_mode",
+                {"SHADOW": False, "LIVE": False},
+                int(req.user_id),
+            )
         await engine_manager.stop_user_engine(req.user_id)
     else:
         updated_u = await asyncio.to_thread(user_manager.get_user_by_id, req.user_id)
+        eng = engine_manager.user_engines.get(int(req.user_id))
         if updated_u and not updated_u.get("can_use_live"):
-            eng = engine_manager.user_engines.get(int(req.user_id))
-            if eng and eng.trading_active_by_mode.get("LIVE"):
-                await eng.set_trading_active(False)
+            demote_reason = "管理员变更账号权限后无有效 VIP，所有策略已立即停止"
+            if eng:
+                eng.sync_owner_vip_status(updated_u)
+                await eng.enforce_vip_expired_stop(demote_reason)
+            else:
+                await asyncio.to_thread(db_manager.stop_all_user_strategies_sync, int(req.user_id), demote_reason)
+        elif eng and updated_u:
+            eng.sync_owner_vip_status(updated_u)
     return {**res, "dashboard": await _admin_summary_async()}
 
 
@@ -1276,11 +1357,22 @@ async def admin_grant_vip(req: AdminGrantVipRequest, authorization: str = Header
     if not res["ok"]:
         raise HTTPException(status_code=400, detail=res["message"])
     updated_u = await asyncio.to_thread(user_manager.get_user_by_id, req.user_id)
+    eng = engine_manager.user_engines.get(int(req.user_id))
     if updated_u and not updated_u.get("can_use_live"):
-        eng = engine_manager.user_engines.get(int(req.user_id))
-        if eng and eng.trading_active_by_mode.get("LIVE"):
-            await eng.set_trading_active(False)
-            eng.append_log("WARN", "VIP_REVOKED", "[会员权限收回] 管理员已收回会员权限，实盘自动交易已立即暂停", mode="LIVE")
+        revoke_reason = "管理员已收回会员权限，所有运行中策略及实盘自动交易已立即停止"
+        if eng:
+            eng.sync_owner_vip_status(updated_u)
+            await eng.enforce_vip_expired_stop(revoke_reason)
+        else:
+            await asyncio.to_thread(db_manager.stop_all_user_strategies_sync, int(req.user_id), revoke_reason)
+            await asyncio.to_thread(
+                db_manager.save_runtime_setting_sync,
+                "trading_active_by_mode",
+                {"SHADOW": False, "LIVE": False},
+                int(req.user_id),
+            )
+    elif eng and updated_u:
+        eng.sync_owner_vip_status(updated_u)
     return {**res, "dashboard": await _admin_summary_async()}
 
 
@@ -1316,6 +1408,13 @@ async def admin_audit_order(req: AdminAuditOrderRequest, authorization: str = He
     res = await asyncio.to_thread(user_manager.admin_audit_order, req.order_id, req.action, req.tx_hash)
     if not res["ok"]:
         raise HTTPException(status_code=400, detail=res["message"])
+    if req.action == "APPROVE" and res.get("user_id"):
+        uid = int(res["user_id"])
+        eng = engine_manager.user_engines.get(uid)
+        if eng is not None:
+            updated_user = await asyncio.to_thread(user_manager.get_user_by_id, uid)
+            if updated_user:
+                eng.sync_owner_vip_status(updated_user)
     return {**res, "dashboard": await _admin_summary_async()}
 
 
@@ -1394,6 +1493,36 @@ async def admin_delete_feedback(message_id: int, authorization: str = Header(def
     }
 
 
+@app.get("/api/admin/referral")
+async def admin_get_referral_overview(authorization: str = Header(default="")):
+    _require_admin(authorization)
+    return await asyncio.to_thread(user_manager.admin_get_referral_overview)
+
+
+@app.post("/api/admin/referral/settings")
+async def admin_update_referral_settings(req: AdminReferralSettingsRequest, authorization: str = Header(default="")):
+    _require_admin(authorization)
+    res = await asyncio.to_thread(user_manager.admin_update_referral_settings, req)
+    if not res["ok"]:
+        raise HTTPException(status_code=400, detail=res["message"])
+    return {**res, "dashboard": await _admin_summary_async()}
+
+
+@app.post("/api/admin/points/adjust")
+async def admin_adjust_user_points(req: AdminAdjustPointsRequest, authorization: str = Header(default="")):
+    admin_user = _require_admin(authorization)
+    res = await asyncio.to_thread(
+        user_manager.admin_adjust_user_points,
+        admin_user["username"],
+        req.user_id,
+        req.delta_points,
+        req.note,
+    )
+    if not res["ok"]:
+        raise HTTPException(status_code=400, detail=res["message"])
+    return {**res, "dashboard": await _admin_summary_async()}
+
+
 @app.get("/api/market/sentiment")
 async def get_market_sentiment(refresh: bool = Query(default=False)):
     return await market_sentiment_service.get_sentiment(force_refresh=bool(refresh))
@@ -1408,6 +1537,13 @@ async def get_stats(
     user, eng = await _resolve_user_engine(authorization)
     if user is None:
         return eng.build_public_preview_snapshot(radar_symbol=radar_symbol)
+    eng.sync_owner_vip_status(user)
+    if not user.get("can_use_live") and (
+        eng.trading_active_by_mode.get("LIVE")
+        or eng.trading_active_by_mode.get("SHADOW")
+        or any(c.is_running for c in eng.strategies.values())
+    ):
+        await eng.enforce_vip_expired_stop()
     return eng.build_dashboard_snapshot(radar_symbol=radar_symbol)
 
 
@@ -1416,7 +1552,7 @@ async def reset_stats(
     radar_symbol: Optional[str] = Query(default=None),
     authorization: str = Header(default=""),
 ):
-    _, eng = await _require_user_engine(authorization)
+    _, eng = await _require_vip_engine(authorization)
     res = eng.reset_statistics()
     return {
         **res,
@@ -1475,9 +1611,22 @@ async def dashboard_ws(
                     eng = engine_manager.get_guest_engine()
                 elif bound_uid in engine_manager.user_engines:
                     eng = engine_manager.user_engines[bound_uid]
+                    eng.sync_owner_vip_status(refreshed)
+                    if not refreshed.get("can_use_live") and (
+                        eng.trading_active_by_mode.get("LIVE")
+                        or eng.trading_active_by_mode.get("SHADOW")
+                        or any(c.is_running for c in eng.strategies.values())
+                    ):
+                        await eng.enforce_vip_expired_stop()
 
             target_radar = ws_state["radar_symbol"] or None
             if bound_uid > 0:
+                if not eng.is_owner_vip_valid_realtime() and (
+                    eng.trading_active_by_mode.get("LIVE")
+                    or eng.trading_active_by_mode.get("SHADOW")
+                    or any(c.is_running for c in eng.strategies.values())
+                ):
+                    await eng.enforce_vip_expired_stop()
                 snapshot = eng.build_dashboard_snapshot(radar_symbol=target_radar)
             else:
                 snapshot = eng.build_public_preview_snapshot(radar_symbol=target_radar)

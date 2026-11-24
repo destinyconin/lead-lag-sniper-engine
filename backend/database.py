@@ -865,6 +865,19 @@ class AsyncDatabaseManager:
         finally:
             conn.close()
 
+    def stop_all_user_strategies_sync(self, user_id: int, reason: str = "") -> int:
+        """Atomically stops all persisted running strategies for a user in SQLite."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE symbol_configs SET is_running = 0, auto_disabled_reason = ? WHERE user_id = ? AND is_running = 1",
+                (reason, user_id),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+        finally:
+            conn.close()
+
     def load_recent_trades_sync(self, limit: int = 100, user_id: int = 0) -> List[Dict[str, Any]]:
         conn = self._connect()
         conn.row_factory = sqlite3.Row

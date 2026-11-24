@@ -63,14 +63,9 @@ class EngineManager:
                     continue
                 eng = await self.get_user_engine(uid)
                 if user_info and not user_info.get("can_use_live", False):
-                    if eng.trading_active_by_mode.get("LIVE"):
-                        await eng.set_trading_active(False)
-                        eng.append_log(
-                            "WARN",
-                            "VIP_EXPIRED",
-                            "[会员到期暂停] 会员有效期已结束，实盘自动下单已暂停；续费后自动恢复",
-                            mode="LIVE",
-                        )
+                    await eng.enforce_vip_expired_stop(
+                        "会员有效期已结束，所有运行中策略及实盘自动交易已自动停止；续费或积分兑换会员后可重新启用"
+                    )
             except Exception as e:
                 print(f"[EngineManager] auto-resume uid={uid} warning: {e}")
 
@@ -118,14 +113,17 @@ class EngineManager:
                 user_id=uid,
                 shared_gateway=self.gateway,
                 is_guest_preview=False,
+                get_user_fn=self._get_user_fn,
             )
             await eng.start()
-            # Lazy-reload VIP guard: never allow expired/disabled user to auto-resume LIVE orders
+            # Lazy-reload VIP guard: never allow expired/disabled user to auto-resume trading or running strategies
             if self._get_user_fn:
                 user_info = self._get_user_fn(uid)
+                eng.sync_owner_vip_status(user_info)
                 if not user_info or not user_info.get("is_active", True) or not user_info.get("can_use_live", False):
-                    if eng.trading_active_by_mode.get("LIVE"):
-                        await eng.set_trading_active(False)
+                    await eng.enforce_vip_expired_stop(
+                        "VIP 会员已到期或未开通，所有运行中策略已自动停止；续费或积分兑换会员后可重新启用"
+                    )
             self.user_engines[uid] = eng
             return eng
 
@@ -157,13 +155,13 @@ class EngineManager:
         return out
 
     async def _vip_guard_loop(self):
-        """Periodically enforces membership expiration & prunes aged SQLite MISSED order/event logs."""
+        """Enforces membership expiration every 5 seconds & prunes aged SQLite MISSED order/event logs every 6 hours."""
         tick = 0
         while self._running:
-            await asyncio.sleep(60.0)
+            await asyncio.sleep(5.0)
             tick += 1
             # Run DB housekeeping 1 min after boot and every 6 hours thereafter (non-blocking)
-            if tick == 1 or tick % 360 == 0:
+            if tick == 12 or tick % 4320 == 0:
                 try:
                     await asyncio.to_thread(self.db.cleanup_old_records_sync, 48, 14)
                 except Exception:
@@ -173,14 +171,18 @@ class EngineManager:
             for uid, eng in list(self.user_engines.items()):
                 try:
                     u = self._get_user_fn(uid)
-                    if not u or not u.get("is_active", True) or not u.get("can_use_live", False):
-                        if eng.trading_active_by_mode.get("LIVE"):
-                            await eng.set_trading_active(False)
-                            eng.append_log(
-                                "WARN",
-                                "VIP_EXPIRED",
-                                "[会员权限变更] 账户已过期或被禁用，后台实盘自动交易已自动停止",
-                                mode="LIVE",
+                    eng.sync_owner_vip_status(u)
+                    if not u or not u.get("is_active", True):
+                        await eng.enforce_vip_expired_stop("账号已被禁用或删除，所有策略已立即停止")
+                        await self.stop_user_engine(uid)
+                    elif not u.get("can_use_live", False):
+                        if (
+                            eng.trading_active_by_mode.get("LIVE")
+                            or eng.trading_active_by_mode.get("SHADOW")
+                            or any(c.is_running for c in eng.strategies.values())
+                        ):
+                            await eng.enforce_vip_expired_stop(
+                                "VIP 会员有效期已结束，所有正在运行的策略与自动交易已全部自动停止；续费或积分兑换会员后可重新启用"
                             )
                 except Exception:
                     pass

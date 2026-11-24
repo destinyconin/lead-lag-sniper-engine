@@ -198,6 +198,7 @@ class RegisterRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=32)
     password: str = Field(..., min_length=6, max_length=64)
     email: str = Field(default="", max_length=120)
+    invite_code: str = Field(default="", max_length=32)
 
 
 class LoginRequest(BaseModel):
@@ -243,7 +244,8 @@ class AdminUpdateUserRequest(BaseModel):
 
 class AdminGrantVipRequest(BaseModel):
     user_id: int
-    add_days: int = Field(..., ge=-3650, le=3650, description="Days to add (positive to extend, 0 or negative to revoke)")
+    add_days: int = Field(default=0, ge=-3650, le=3650, description="Days to add (positive to extend)")
+    add_hours: int = Field(default=0, ge=0, le=87600, description="Hours to add (positive to extend)")
     vip_tier: str = "专业版会员"
     revoke: bool = False
 
@@ -281,6 +283,25 @@ class UserFeedbackCreateRequest(BaseModel):
 
 class AdminFeedbackReplyRequest(BaseModel):
     reply: str = Field(..., min_length=1, max_length=2000)
+
+
+class PointsRedeemVipRequest(BaseModel):
+    hours: int = Field(default=1, ge=1, le=720, description="Number of VIP hours to redeem with points")
+
+
+class AdminReferralSettingsRequest(BaseModel):
+    invite_enabled: bool = True
+    inviter_reward_points: int = Field(default=100, ge=0, le=100_000)
+    invitee_reward_points: int = Field(default=100, ge=0, le=100_000)
+    redeem_enabled: bool = True
+    points_per_vip_hour: int = Field(default=100, ge=1, le=100_000)
+    max_redeem_hours_per_tx: int = Field(default=720, ge=1, le=8760)
+
+
+class AdminAdjustPointsRequest(BaseModel):
+    user_id: int
+    delta_points: int = Field(..., ge=-1_000_000, le=1_000_000)
+    note: str = Field(default="", max_length=200)
 
 
 
