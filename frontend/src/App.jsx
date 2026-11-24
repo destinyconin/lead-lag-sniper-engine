@@ -14,6 +14,7 @@ import {
   Layers,
   Lock,
   LogOut,
+  Menu,
   Moon,
   Percent,
   Plus,
@@ -31,6 +32,7 @@ import {
   Users,
   Wallet,
   Wifi,
+  X,
   Zap,
 } from 'lucide-react';
 import MarketSentimentChart from './components/MarketSentimentChart';
@@ -746,6 +748,7 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authModalMode, setAuthModalMode] = useState('login');
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [preflightResult, setPreflightResult] = useState(null);
   const [preflightLoading, setPreflightLoading] = useState(false);
   const [syncingPositions, setSyncingPositions] = useState(false);
@@ -2205,12 +2208,56 @@ export default function App() {
     };
   }, [filteredRecentTrades]);
 
+  useEffect(() => {
+    if (!mobileMenuOpen) return undefined;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') setMobileMenuOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [mobileMenuOpen]);
+
+  const navTabs = useMemo(
+    () =>
+      [
+        { id: 'radar', label: '矩阵观察', shortLabel: '观察', icon: Radar, visible: true },
+        { id: 'watchlist', label: `策略参数矩阵 (${strategies.length})`, shortLabel: '策略', icon: Sliders, visible: true },
+        { id: 'exchanges', label: '交易所与风控', shortLabel: '风控', icon: Shield, visible: Boolean(currentUser) },
+        { id: 'analytics', label: '盈亏统计与诊断', shortLabel: '盈亏', icon: BarChart2, visible: true },
+        {
+          id: 'membership',
+          label: currentUser?.is_vip ? '会员中心 (VIP)' : '购买会员 / 解锁实盘',
+          shortLabel: '会员',
+          icon: CreditCard,
+          visible: true,
+        },
+        {
+          id: 'admin',
+          label: '后台管理',
+          shortLabel: '后台',
+          icon: Users,
+          visible: Boolean(currentUser?.is_admin),
+        },
+      ].filter((t) => t.visible),
+    [strategies.length, currentUser]
+  );
+
+  const mobileBottomTabs = useMemo(() => {
+    const coreIds = currentUser ? ['radar', 'watchlist', 'analytics', 'exchanges'] : ['radar', 'watchlist', 'analytics', 'membership'];
+    return coreIds.map((id) => navTabs.find((t) => t.id === id)).filter(Boolean);
+  }, [navTabs, currentUser]);
+
   return (
     <div className="min-h-screen flex flex-col">
       {/* Notification Toast */}
       {toast && (
         <div
-          className={`fixed bottom-4 left-3 right-3 sm:left-auto sm:bottom-6 sm:right-6 sm:max-w-md z-50 px-4 sm:px-5 py-3 rounded-2xl sm:rounded-full shadow-lg text-xs font-semibold flex items-center gap-2.5 transition-all surface-card ${
+          className={`fixed bottom-20 left-3 right-3 lg:left-auto lg:bottom-6 lg:right-6 lg:max-w-md z-50 px-4 sm:px-5 py-3 rounded-2xl sm:rounded-full shadow-lg text-xs font-semibold flex items-center gap-2.5 transition-all surface-card ${
             toast.type === 'error'
               ? 'border-rose-500/60 text-rose-600 dark:text-rose-300'
               : toast.type === 'success'
@@ -2229,6 +2276,98 @@ export default function App() {
 
       {/* ==================== TOP HEADER ==================== */}
       <header className="sticky top-0 z-30 neu-header">
+        {/* Mobile Ultra-Slim Single-Row Header (< lg, ~56px) */}
+        <div className="flex lg:hidden items-center justify-between px-3 h-14 gap-2">
+          <button
+            type="button"
+            onClick={() => setActiveTab('radar')}
+            className="flex items-center gap-2 min-w-0 text-left"
+            title="返回矩阵观察"
+          >
+            <div className="icon-box w-8 h-8 shrink-0">
+              <svg className="w-4 h-4 text-main" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1">
+                <path d="M2 12h4l3-8 4 16 3-8h6" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <span className="brand-title-luxury text-[14px] text-main leading-tight truncate">无聊的交易系统</span>
+              </div>
+              <div className="flex items-center gap-1.5 text-[10px] text-dim leading-none mt-0.5 truncate">
+                <span>{navTabs.find((t) => t.id === activeTab)?.shortLabel || '观察'}</span>
+                <span>·</span>
+                <span className="font-mono">{snapshot.last_order_rtt_ms}ms</span>
+                {isLiveMode && Number(liveStatus.usdt_avail_usdt || 0) > 0 && (
+                  <>
+                    <span>·</span>
+                    <span className="font-mono text-main">{Number(liveStatus.usdt_avail_usdt).toFixed(0)}U</span>
+                  </>
+                )}
+              </div>
+            </div>
+          </button>
+
+          <div className="flex items-center gap-1.5 shrink-0">
+            {/* Compact Status Pill — taps open control drawer */}
+            <button
+              type="button"
+              onClick={() => setMobileMenuOpen(true)}
+              className={`inline-flex items-center gap-1.5 h-8 px-2.5 rounded-full neu-well text-[11px] font-semibold ${
+                isTradingActive
+                  ? 'text-emerald-600 dark:text-emerald-400'
+                  : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
+                  ? 'text-rose-600 dark:text-rose-400'
+                  : 'text-amber-600 dark:text-amber-400'
+              }`}
+              title="点击展开交易控制面板"
+            >
+              <span
+                className={`w-2 h-2 rounded-full shrink-0 ${
+                  isTradingActive
+                    ? 'bg-emerald-500 animate-pulse'
+                    : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
+                    ? 'bg-rose-500'
+                    : 'bg-amber-500'
+                }`}
+              />
+              <span>{isKillActive ? '熔断' : isTradingActive ? '运行中' : '已停止'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
+              className="w-8 h-8 rounded-full neu-btn flex items-center justify-center text-main shrink-0"
+              title={theme === 'light' ? '切换至深色模式' : '切换至明亮模式'}
+              aria-label="切换主题"
+            >
+              {theme === 'light' ? (
+                <Moon className="w-3.5 h-3.5 text-slate-700" strokeWidth={1.85} />
+              ) : (
+                <Sun className="w-3.5 h-3.5 text-amber-400" strokeWidth={1.85} />
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setMobileMenuOpen((v) => !v)}
+              className="relative w-9 h-9 rounded-full neu-btn flex items-center justify-center text-main shrink-0"
+              aria-label={mobileMenuOpen ? '关闭菜单' : '打开菜单'}
+              aria-expanded={mobileMenuOpen}
+            >
+              {mobileMenuOpen ? <X className="w-4 h-4" strokeWidth={2.1} /> : <Menu className="w-4 h-4" strokeWidth={2.1} />}
+              {!mobileMenuOpen && (
+                <span
+                  className={`absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full ${
+                    wsConnected ? 'bg-emerald-500' : 'bg-rose-500'
+                  }`}
+                />
+              )}
+            </button>
+          </div>
+        </div>
+
+        {/* Desktop Full Two-Tier Header (>= lg) */}
+        <div className="hidden lg:block">
         {/* Tier 1: Brand Identity | Carved Execution Command Dock | Utility & Account Dock */}
         <div className="max-w-[1520px] mx-auto px-3 sm:px-5 lg:px-6 pt-3 pb-2.5 flex flex-wrap lg:flex-nowrap items-center justify-between gap-2.5 sm:gap-3.5">
           {/* Left: Brand Identity + Sculpted Live Badge */}
@@ -2436,26 +2575,7 @@ export default function App() {
               aria-label="主导航"
               className="inline-flex items-center gap-1.5 p-1.5 rounded-full neu-well overflow-x-auto xl:overflow-visible no-scrollbar max-w-full"
             >
-              {[
-                { id: 'radar', label: '矩阵观察', icon: Radar, visible: true },
-                { id: 'watchlist', label: `策略参数矩阵 (${strategies.length})`, icon: Sliders, visible: true },
-                { id: 'exchanges', label: '交易所与风控', icon: Shield, visible: Boolean(currentUser) },
-                { id: 'analytics', label: '盈亏统计与诊断', icon: BarChart2, visible: true },
-                {
-                  id: 'membership',
-                  label: currentUser?.is_vip ? '会员中心 (VIP)' : '购买会员 / 解锁实盘',
-                  icon: CreditCard,
-                  visible: true,
-                },
-                {
-                  id: 'admin',
-                  label: '后台管理',
-                  icon: Users,
-                  visible: Boolean(currentUser?.is_admin),
-                },
-              ]
-                .filter((t) => t.visible)
-                .map((tab) => {
+              {navTabs.map((tab) => {
                   const Icon = tab.icon;
                   const active = activeTab === tab.id;
                   return (
@@ -2567,7 +2687,329 @@ export default function App() {
             )}
           </div>
         </div>
+        </div>
       </header>
+
+      {/* ==================== MOBILE HAMBURGER OVERLAY DRAWER (< lg) ==================== */}
+      {mobileMenuOpen && (
+        <div className="fixed inset-0 z-50 lg:hidden flex justify-end" role="dialog" aria-modal="true" aria-label="移动端控制台菜单">
+          {/* Frosted Backdrop */}
+          <div
+            className="fixed inset-0 bg-black/35 backdrop-blur-sm"
+            onClick={() => setMobileMenuOpen(false)}
+          />
+
+          {/* Slide-Over Sculpted Ceramic Drawer */}
+          <div className="relative z-10 w-[86vw] max-w-[340px] h-full neu-drawer overflow-y-auto p-4 flex flex-col gap-4">
+            {/* Drawer Header */}
+            <div className="flex items-center justify-between gap-2 pb-2 border-b border-line/60">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="icon-box w-9 h-9 shrink-0">
+                  <svg className="w-4 h-4 text-main" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1">
+                    <path d="M2 12h4l3-8 4 16 3-8h6" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </div>
+                <div className="min-w-0">
+                  <div className="brand-title-luxury text-sm text-main truncate">无聊的交易系统</div>
+                  <div className="flex items-center gap-1.5 mt-0.5 text-[10px]">
+                    <span className={`w-1.5 h-1.5 rounded-full ${currentUser ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
+                    <span className="text-sub">{currentUser ? '实盘 · 24h云端托管' : '访客仿真预览'}</span>
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMobileMenuOpen(false)}
+                className="w-9 h-9 rounded-full neu-btn flex items-center justify-center text-main shrink-0"
+                aria-label="关闭菜单"
+              >
+                <X className="w-4 h-4" strokeWidth={2.1} />
+              </button>
+            </div>
+
+            {/* 1. Execution Command Control Center */}
+            <div className="surface-card p-3.5 space-y-3">
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <div
+                  className={`flex items-center gap-1.5 font-semibold min-w-0 ${
+                    isTradingActive
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
+                      ? 'text-rose-600 dark:text-rose-400'
+                      : 'text-amber-600 dark:text-amber-400'
+                  }`}
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full shrink-0 ${
+                      isTradingActive
+                        ? 'bg-emerald-500 animate-ping'
+                        : tradingControl.status_code === 'AUTH_ERROR' || tradingControl.status_code === 'KILL_SWITCH'
+                        ? 'bg-rose-500'
+                        : 'bg-amber-500'
+                    }`}
+                  />
+                  <span className="truncate">{tradingControl.status_label || (isTradingActive ? '运行中' : '已停止')}</span>
+                </div>
+                <div className="flex items-center gap-1 px-2.5 py-0.5 rounded-full neu-well font-mono text-[11px] shrink-0">
+                  <span className={`w-1.5 h-1.5 rounded-full ${wsConnected ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+                  <Wifi className="w-3 h-3 text-sub" strokeWidth={1.75} />
+                  <span className="text-main font-bold">{snapshot.last_order_rtt_ms}ms</span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-2 p-1.5 rounded-2xl neu-well">
+                <button
+                  type="button"
+                  onClick={handleStartTrading}
+                  className={`h-9 rounded-full text-xs font-semibold flex items-center justify-center gap-1 ${
+                    isTradingActive ? 'btn-primary-pill' : 'neu-btn text-sub hover:text-main'
+                  }`}
+                >
+                  <svg className="w-2.5 h-2.5" viewBox="0 0 24 24" fill="currentColor">
+                    <polygon points="5 3 19 12 5 21 5 3" />
+                  </svg>
+                  <span>开始</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleStopTrading}
+                  className={`h-9 rounded-full text-xs font-semibold flex items-center justify-center gap-1 ${
+                    !isTradingActive ? 'neu-btn text-main' : 'text-sub hover:text-main'
+                  }`}
+                >
+                  <svg className="w-2.5 h-2.5" viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="5" y="5" width="14" height="14" rx="2" />
+                  </svg>
+                  <span>停止</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleKillSwitch}
+                  className={`h-9 rounded-full text-xs font-semibold flex items-center justify-center gap-1 ${
+                    isKillActive ? 'bg-emerald-600 text-white shadow-md' : 'neu-btn text-rose-600 dark:text-rose-400'
+                  }`}
+                >
+                  <Power className="w-3 h-3" strokeWidth={2.1} />
+                  <span>{isKillActive ? '解熔断' : '熔断'}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* 2. Navigation Menu */}
+            <div className="surface-card p-3 space-y-1.5">
+              <div className="px-2 pb-1 text-[11px] font-semibold text-dim">功能模块</div>
+              {navTabs.map((tab) => {
+                const Icon = tab.icon;
+                const active = activeTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => {
+                      setActiveTab(tab.id);
+                      setMobileMenuOpen(false);
+                    }}
+                    className={`w-full flex items-center gap-2.5 px-3.5 py-2.5 rounded-full text-xs font-semibold transition-all ${
+                      active ? 'btn-primary-pill justify-start' : 'text-main hover:bg-[var(--bg-hover)]'
+                    }`}
+                  >
+                    <Icon className="w-4 h-4 shrink-0" strokeWidth={1.85} />
+                    <span className="truncate">{tab.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* 3. Live Exchange Status OR Shadow Pulse Test Controls */}
+            {isLiveMode ? (
+              <div className="surface-card p-3.5 space-y-2.5 text-[11px]">
+                <div className="text-[11px] font-semibold text-dim">实盘通道与连接</div>
+                <div className="flex flex-wrap gap-1.5">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full neu-well font-semibold">
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full ${
+                        liveStatus.binance_ws_connected && liveStatus.okx_ws_connected ? 'bg-emerald-500' : 'bg-amber-500 animate-pulse'
+                      }`}
+                    />
+                    <span className="text-main">
+                      BN {liveStatus.binance_ws_connected ? '在线' : '重连'} · OKX {liveStatus.okx_ws_connected ? '在线' : '重连'}
+                    </span>
+                  </span>
+                  {liveStatus.follower_auth_status === 'VERIFIED' && (
+                    <>
+                      <span
+                        className={`px-2.5 py-1 rounded-full neu-badge ${
+                          liveStatus.okx_pos_mode === 'long_short_mode'
+                            ? 'text-emerald-600 dark:text-emerald-400'
+                            : 'text-amber-600 dark:text-amber-300'
+                        }`}
+                      >
+                        {liveStatus.okx_pos_mode === 'long_short_mode' ? '双向持仓' : '单向持仓'}
+                      </span>
+                      <span
+                        className={`px-2.5 py-1 rounded-full neu-badge ${
+                          liveStatus.okx_private_ws_connected ? 'text-emerald-600 dark:text-emerald-400' : 'text-dim'
+                        }`}
+                      >
+                        私有WS {liveStatus.okx_private_ws_connected ? '在线' : '轮询'}
+                      </span>
+                      {Number(liveStatus.usdt_avail_usdt || 0) > 0 && (
+                        <span className="px-2.5 py-1 rounded-full neu-well font-mono font-semibold text-main">
+                          可用 {Number(liveStatus.usdt_avail_usdt).toFixed(2)}U
+                        </span>
+                      )}
+                    </>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('exchanges');
+                    setMobileMenuOpen(false);
+                  }}
+                  className="w-full px-3 py-2 rounded-full neu-btn text-main text-left truncate"
+                >
+                  {liveStatus.follower_auth_message || '点击配置执行端 API'}
+                </button>
+              </div>
+            ) : (
+              activeTab === 'radar' && (
+                <div className="surface-card p-3.5 space-y-2 text-[11px]">
+                  <div className="text-[11px] font-semibold text-dim">脉冲注入测试 ({selectedSymbol.split('/')[0]})</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleInjectPulse('LONG', 0.0085, 'CONVERGE_TP', '多头拉升收敛止盈');
+                        setMobileMenuOpen(false);
+                      }}
+                      className="btn-soft-pill px-2.5 py-1.5 text-xs text-emerald-600 dark:text-emerald-400"
+                    >
+                      <ArrowUpRight className="w-3.5 h-3.5" strokeWidth={2} />
+                      拉升止盈
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleInjectPulse('SHORT', 0.0085, 'CONVERGE_TP', '空头下挫收敛止盈');
+                        setMobileMenuOpen(false);
+                      }}
+                      className="btn-soft-pill px-2.5 py-1.5 text-xs text-rose-600 dark:text-rose-400"
+                    >
+                      <ArrowDownRight className="w-3.5 h-3.5" strokeWidth={2} />
+                      下挫止盈
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleInjectPulse('LONG', 0.0082, 'REVERSAL_SL', '主所假突破反转止损');
+                        setMobileMenuOpen(false);
+                      }}
+                      className="btn-soft-pill px-2.5 py-1.5 text-xs text-amber-600 dark:text-amber-400"
+                    >
+                      <RefreshCw className="w-3 h-3" strokeWidth={2} />
+                      反转止损
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleInjectPulse('LONG', 0.008, 'MM_WITHDRAW_MISS', '做市商抢先撤单未成交');
+                        setMobileMenuOpen(false);
+                      }}
+                      className="btn-soft-pill px-2.5 py-1.5 text-xs"
+                    >
+                      <Activity className="w-3.5 h-3.5" strokeWidth={1.75} />
+                      撤单未成
+                    </button>
+                  </div>
+                </div>
+              )
+            )}
+
+            {/* 4. Account Card */}
+            <div className="surface-card p-3.5 space-y-2.5 mt-auto">
+              {currentUser ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveTab('membership');
+                      setMobileMenuOpen(false);
+                    }}
+                    className="w-full flex items-center justify-between gap-2 text-left"
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <div className="icon-box w-8 h-8 shrink-0">
+                        <User className="w-4 h-4 text-main" strokeWidth={1.85} />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="font-mono font-bold text-xs text-main truncate">{currentUser.username}</div>
+                        <span
+                          className={`inline-block mt-0.5 px-2 py-0.2 rounded-full text-[10px] font-bold ${
+                            currentUser.is_vip
+                              ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                              : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+                          }`}
+                        >
+                          {currentUser.is_vip ? currentUser.vip_label : '未开VIP'}
+                        </span>
+                      </div>
+                    </div>
+                    <span className="text-[11px] text-sub shrink-0">会员中心 →</span>
+                  </button>
+                  <div className="grid grid-cols-2 gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMobileMenuOpen(false);
+                        openAuthModal('login');
+                      }}
+                      className="btn-soft-pill h-8 text-xs"
+                    >
+                      切换账号
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMobileMenuOpen(false);
+                        handleLogout();
+                      }}
+                      className="btn-soft-pill h-8 text-xs text-rose-600 dark:text-rose-400"
+                    >
+                      <LogOut className="w-3.5 h-3.5" strokeWidth={1.85} />
+                      退出登录
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMobileMenuOpen(false);
+                      openAuthModal('login');
+                    }}
+                    className="btn-soft-pill h-9 text-xs"
+                  >
+                    登录
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMobileMenuOpen(false);
+                      openAuthModal('register');
+                    }}
+                    className="btn-primary-pill h-9 text-xs"
+                  >
+                    <Lock className="w-3 h-3" strokeWidth={2} />
+                    注册实盘
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Auth Login / Register Modal */}
       <AuthModal
@@ -2579,7 +3021,7 @@ export default function App() {
       />
 
       {/* ==================== MAIN WORKSPACE ==================== */}
-      <main className="flex-1 max-w-[1520px] w-full mx-auto px-3 sm:px-5 lg:px-6 py-4 sm:py-6 space-y-4 sm:space-y-5">
+      <main className="flex-1 max-w-[1520px] w-full mx-auto px-3 sm:px-5 lg:px-6 pt-3.5 sm:pt-5 lg:pt-6 pb-24 lg:pb-6 space-y-4 sm:space-y-5">
         {/* VIP REQUIREMENT BANNER WHEN LOGGED IN AS NON-VIP IN LIVE MODE */}
         {isLiveMode && currentUser && !currentUser.can_use_live && (
           <div className="surface-card p-4 sm:p-6 flex flex-wrap items-center justify-between gap-3 sm:gap-4">
@@ -6567,6 +7009,45 @@ export default function App() {
           />
         )}
       </main>
+
+      {/* ==================== MOBILE FLOATING BOTTOM QUICK BAR (< lg) ==================== */}
+      <nav
+        aria-label="移动端快捷导航"
+        className="lg:hidden fixed bottom-0 inset-x-0 z-30 neu-bottom-bar"
+      >
+        <div className="grid grid-cols-5 items-center h-14 px-1.5 gap-1">
+          {mobileBottomTabs.map((tab) => {
+            const Icon = tab.icon;
+            const active = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setActiveTab(tab.id)}
+                className={`flex flex-col items-center justify-center gap-0.5 h-11 rounded-2xl text-[10px] font-semibold transition-all ${
+                  active ? 'btn-primary-pill !gap-0.5 !rounded-2xl' : 'text-sub hover:text-main'
+                }`}
+              >
+                <Icon className="w-4 h-4 shrink-0" strokeWidth={active ? 2.1 : 1.8} />
+                <span className="leading-none truncate max-w-full">{tab.shortLabel}</span>
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            onClick={() => setMobileMenuOpen(true)}
+            className={`flex flex-col items-center justify-center gap-0.5 h-11 rounded-2xl text-[10px] font-semibold transition-all ${
+              mobileMenuOpen || !mobileBottomTabs.some((t) => t.id === activeTab)
+                ? 'neu-btn text-main !gap-0.5 !rounded-2xl'
+                : 'text-sub hover:text-main'
+            }`}
+            aria-label="更多功能与交易控制"
+          >
+            <Menu className="w-4 h-4 shrink-0" strokeWidth={1.9} />
+            <span className="leading-none">控制台</span>
+          </button>
+        </div>
+      </nav>
     </div>
   );
 }

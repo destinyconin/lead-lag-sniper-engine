@@ -197,6 +197,45 @@
   -webkit-backdrop-filter: blur(20px) saturate(1.25);
 }
 
+/* Mobile Bottom Quick Navigation Bar (Frosted Porcelain with Safe-Area Support) */
+.neu-bottom-bar {
+  background-color: var(--bg-header);
+  border-top: 1px solid var(--border-header);
+  box-shadow: 0 -8px 26px -10px rgba(168, 156, 138, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(22px) saturate(1.25);
+  -webkit-backdrop-filter: blur(22px) saturate(1.25);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+[data-theme="dark"] .neu-bottom-bar {
+  box-shadow: 0 -10px 30px -10px rgba(0, 0, 0, 0.72), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+/* Mobile Hamburger Slide-Over Ceramic Drawer */
+@keyframes drawerSlideIn {
+  from {
+    opacity: 0.5;
+    transform: translateX(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.neu-drawer {
+  background-color: var(--bg-page);
+  background-image: var(--bg-page-gradient);
+  border-left: 1px solid var(--border-header);
+  box-shadow: -14px 0 36px -10px rgba(45, 41, 37, 0.24);
+  animation: drawerSlideIn 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+  padding-bottom: calc(1.75rem + env(safe-area-inset-bottom, 0px));
+}
+
+[data-theme="dark"] .neu-drawer {
+  box-shadow: -16px 0 42px -8px rgba(0, 0, 0, 0.78);
+}
+
 /* Carved Recessed Track / Pill Well (Matches Reference Image Inset Channel) */
 .neu-well {
   background: var(--bg-well-grad);
