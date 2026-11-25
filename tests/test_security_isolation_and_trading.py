@@ -3462,9 +3462,12 @@ def test_reverse_oscillating_grid_core_lifecycle():
     assert trk.levels["L2"]["order_usdt"] == 500.0 and trk.levels["L2"]["trigger_price"] == 101.20
     assert trk.levels["L3"]["order_usdt"] == 300.0 and trk.levels["L3"]["trigger_price"] == 101.80
     assert trk.levels["L4"]["order_usdt"] == 100.0 and trk.levels["L4"]["trigger_price"] == 102.40
-    assert trk.levels["C"]["trigger_price"] == 100.00 and trk.levels["C"]["tp_price"] == 100.60
-    assert trk.levels["S1"]["trigger_price"] == 99.40 and trk.levels["S1"]["tp_price"] == 100.00
-    assert trk.levels["S5"]["trigger_price"] == 97.00 and trk.levels["S5"]["tp_price"] == 97.60
+    assert trk.levels["C"]["trigger_price"] == 100.00 and trk.levels["C"]["tp_price"] == 100.60 and trk.levels["C"]["order_usdt"] == 1000.0
+    assert trk.levels["S1"]["trigger_price"] == 99.40 and trk.levels["S1"]["tp_price"] == 100.00 and trk.levels["S1"]["order_usdt"] == 1000.0
+    assert trk.levels["S2"]["order_usdt"] == 1000.0
+    assert trk.levels["S3"]["order_usdt"] == 500.0
+    assert trk.levels["S4"]["order_usdt"] == 300.0
+    assert trk.levels["S5"]["trigger_price"] == 97.00 and trk.levels["S5"]["tp_price"] == 97.60 and trk.levels["S5"]["order_usdt"] == 200.0
     assert trk.should_place_maker_tp_for_slot("Q", cfg) is False
     assert trk.should_place_maker_tp_for_slot("L2", cfg) is False
     assert trk.should_place_maker_tp_for_slot("C", cfg) is True
@@ -3555,11 +3558,11 @@ def test_reverse_oscillating_grid_core_lifecycle():
     for sid in ("Q", "L2", "L3", "L4"):
         trk_rest.mark_exited(sid, 12.0, is_sl=False)
 
-    # All slots flat -> enters PENDING_RECONCILE + 4-min TP cooldown (~240s); blocked until verified clean AND cooldown expires!
+    # All slots flat -> enters PENDING_RECONCILE + 30-min TP cooldown (~1800s); blocked until verified clean AND cooldown expires!
     assert trk_rest.strategy.cycle_phase == "PENDING_RECONCILE"
     assert trk_rest.needs_post_cycle_flat_reconcile() is True
     assert trk_rest.strategy.restart_reason == "TP_COOLDOWN"
-    assert trk_rest.strategy.restart_cooldown_until_mono >= now_pre + 230_000.0
+    assert now_pre + 1_790_000.0 <= trk_rest.strategy.restart_cooldown_until_mono <= now_pre + 1_810_000.0
     # Even if cooldown elapsed, unverified reconcile MUST block re-anchor!
     trk_rest.strategy.restart_cooldown_until_mono = 0.0
     trk_rest.evaluate_tick(105.00, 105.02, 105.01, cfg, is_net_mode=False, round_trip_fee=0.0010)
@@ -3593,7 +3596,7 @@ def test_reverse_oscillating_grid_core_lifecycle():
     for e in ex_gsl:
         trk_gsl.mark_exited(e["slot_id"], -65.0, is_sl=True)
     assert trk_gsl.strategy.restart_reason == "GLOBAL_SL_COOLDOWN"
-    assert trk_gsl.strategy.restart_cooldown_until_mono >= t_sl_pre + 10_000_000.0  # Multi-hour cooldown!
+    assert t_sl_pre + 3_590_000.0 <= trk_gsl.strategy.restart_cooldown_until_mono <= t_sl_pre + 3_610_000.0  # 1-hour SL cooldown!
 
     # --- CASE 2: SHORT Mode (exact mirror when S1 = 99.40 hits first) ---
     trk_s = LongShortGridTracker("SOL/USDT:USDT", strategy_type="REVERSE_GRID")
@@ -3604,8 +3607,10 @@ def test_reverse_oscillating_grid_core_lifecycle():
     assert trk_s.strategy.locked_mode == "SHORT"
     assert trk_s.strategy.full_tp_price == 97.00
     assert trk_s.strategy.global_sl_price == 108.15
-    assert trk_s.levels["CS"]["trigger_price"] == 100.00 and trk_s.levels["CS"]["tp_price"] == 99.40
-    assert trk_s.levels["L1"]["trigger_price"] == 100.60 and trk_s.levels["L1"]["tp_price"] == 100.00
+    assert trk_s.levels["CS"]["trigger_price"] == 100.00 and trk_s.levels["CS"]["tp_price"] == 99.40 and trk_s.levels["CS"]["order_usdt"] == 1000.0
+    assert trk_s.levels["L1"]["trigger_price"] == 100.60 and trk_s.levels["L1"]["tp_price"] == 100.00 and trk_s.levels["L1"]["order_usdt"] == 1000.0
+    assert trk_s.levels["L2"]["order_usdt"] == 1000.0 and trk_s.levels["L3"]["order_usdt"] == 500.0
+    assert trk_s.levels["L4"]["order_usdt"] == 300.0 and trk_s.levels["L5"]["order_usdt"] == 200.0
     assert trk_s.levels["S2"]["order_usdt"] == 500.0 and trk_s.levels["S3"]["order_usdt"] == 300.0 and trk_s.levels["S4"]["order_usdt"] == 100.0
 
     # Bounce to 100.00 -> Short CS; drop to 99.40 -> Cover CS
@@ -6157,6 +6162,113 @@ def test_referral_invite_points_redeem_and_vip_expiry_auto_stop():
                 assert r_revoke.status_code == 200
                 assert eng_b.trading_active_by_mode["LIVE"] is False
                 assert all(not c.is_running for c in eng_b.strategies.values())
+
+
+def test_reverse_grid_10_levels_osc_decay_and_updated_cooldowns():
+    """
+    Verifies the 10-level mode-locked REVERSE_GRID specification (C=100.00, step=0.6%, grid_levels=10):
+      1. LONG mode: Q=100%, C=100%, S1=100%, S2=100%, S3=50%, S4=30%, S5..S10=20% fixed,
+         sequential dip-buy & 1-grid TP up to L1, 1.5s slot cooldown, 0.03% re-arm, and C->Q conversion.
+      2. SHORT mode (exact mirror): QS=100%, CS=100%, L1=100%, L2=100%, L3=50%, L4=30%, L5..L10=20% fixed.
+      3. Cycle cooldowns: TP cycle = 30 minutes (1,800,000 ms), Global SL = 1 hour (3,600,000 ms).
+    """
+    from backend.grid_engine import LongShortGridTracker
+    from backend.math_engine import mono_ms
+    from backend.strategies.reverse_oscillating_grid import (
+        GLOBAL_SL_COOLDOWN_MS,
+        SLOT_CLOSE_COOLDOWN_MS,
+        TP_CYCLE_COOLDOWN_MS,
+    )
+
+    assert TP_CYCLE_COOLDOWN_MS == 1_800_000.0
+    assert GLOBAL_SL_COOLDOWN_MS == 3_600_000.0
+    assert SLOT_CLOSE_COOLDOWN_MS == 1500.0
+
+    cfg10 = SymbolStrategy(
+        symbol="SOL/USDT:USDT",
+        strategy_type="REVERSE_GRID",
+        grid_side_mode="LONG_SHORT",
+        grid_levels=10,
+        grid_step_pct=0.006,
+        grid_take_profit_pct=0.0065,
+        grid_range_pct=0.07,
+        grid_stop_loss_pct=0.05,
+        order_usdt=1000.0,
+        leverage=3,
+        price_precision=2,
+        qty_precision=2,
+        grid_recenter_enabled=True,
+    )
+
+    # --- 1. LONG Mode with 10 levels ---
+    trk_l = LongShortGridTracker("SOL/USDT:USDT", strategy_type="REVERSE_GRID")
+    trk_l.sync_config(cfg10, current_mid=100.00)
+    en_q, _ = trk_l.evaluate_tick(100.59, 100.60, 100.595, cfg10, is_net_mode=False, round_trip_fee=0.0010)
+    assert [e["slot_id"] for e in en_q] == ["Q"] and en_q[0]["order_usdt"] == 1000.0
+    trk_l.mark_entry_filled("Q", 100.60, 10.0, 10.0, 1.0, cfg10, round_trip_fee=0.0010)
+
+    assert trk_l.strategy.locked_mode == "LONG"
+    assert trk_l.strategy.full_tp_price == 106.00  # L10 = 100 * (1 + 10 * 0.6%)
+    assert trk_l.strategy.global_sl_price == 89.30  # S10 (94.00) * (1 - 5%)
+
+    # Check C + S1..S10 exact ratios & prices
+    assert trk_l.levels["C"]["order_usdt"] == 1000.0 and trk_l.levels["C"]["weight_pct"] == 100.0
+    expected_osc_weights = {
+        1: (1000.0, 100.0, 99.40, 100.00),
+        2: (1000.0, 100.0, 98.80, 99.40),
+        3: (500.0, 50.0, 98.20, 98.80),
+        4: (300.0, 30.0, 97.60, 98.20),
+        5: (200.0, 20.0, 97.00, 97.60),
+        6: (200.0, 20.0, 96.40, 97.00),
+        7: (200.0, 20.0, 95.80, 96.40),
+        8: (200.0, 20.0, 95.20, 95.80),
+        9: (200.0, 20.0, 94.60, 95.20),
+        10: (200.0, 20.0, 94.00, 94.60),
+    }
+    for idx, (exp_usdt, exp_pct, exp_trig, exp_tp) in expected_osc_weights.items():
+        lv = trk_l.levels[f"S{idx}"]
+        assert lv["order_usdt"] == exp_usdt, f"S{idx} order_usdt={lv['order_usdt']} != {exp_usdt}"
+        assert lv["weight_pct"] == exp_pct, f"S{idx} weight_pct={lv['weight_pct']} != {exp_pct}"
+        assert lv["trigger_price"] == exp_trig
+        assert lv["tp_price"] == exp_tp
+
+    # Verify entry evaluation emits scaled order_usdt when S3 / S5 / S10 trigger
+    for sid_chk, px_chk, exp_u in (("C", 100.00, 1000.0), ("S1", 99.40, 1000.0), ("S2", 98.80, 1000.0), ("S3", 98.20, 500.0), ("S4", 97.60, 300.0), ("S5", 97.00, 200.0), ("S10", 94.00, 200.0)):
+        en_s, _ = trk_l.evaluate_tick(px_chk - 0.01, px_chk, px_chk - 0.005, cfg10, is_net_mode=False, round_trip_fee=0.0010)
+        assert len(en_s) == 1 and en_s[0]["slot_id"] == sid_chk
+        assert en_s[0]["order_usdt"] == exp_u
+        trk_l.mark_entry_filled(sid_chk, px_chk, exp_u / px_chk, exp_u / px_chk, 1.0, cfg10, round_trip_fee=0.0010)
+
+    # Bounce from 94.00 to 94.60 -> S10 sells at 94.60 (GRID_TP), enters 1.5s cooldown & disarms until >= 94.00 * 1.0003!
+    _, ex_s10 = trk_l.evaluate_tick(94.60, 94.61, 94.605, cfg10, is_net_mode=False, round_trip_fee=0.0010)
+    assert [e["slot_id"] for e in ex_s10] == ["S10"] and ex_s10[0]["exit_reason"] == "GRID_TP"
+    t_close = mono_ms()
+    trk_l.mark_exited("S10", 1.2, is_sl=False)
+    assert trk_l.levels["S10"]["armed"] is False
+    assert trk_l.levels["S10"]["cooldown_until_mono"] >= t_close + 1400.0
+
+    # --- 2. SHORT Mode with 10 levels (exact mirror) ---
+    trk_s = LongShortGridTracker("SOL/USDT:USDT", strategy_type="REVERSE_GRID")
+    trk_s.sync_config(cfg10, current_mid=100.00)
+    en_qs, _ = trk_s.evaluate_tick(99.40, 99.41, 99.405, cfg10, is_net_mode=False, round_trip_fee=0.0010)
+    assert [e["slot_id"] for e in en_qs] == ["QS"] and en_qs[0]["order_usdt"] == 1000.0
+    trk_s.mark_entry_filled("QS", 99.40, 10.0, 10.0, 1.0, cfg10, round_trip_fee=0.0010)
+
+    assert trk_s.strategy.locked_mode == "SHORT"
+    assert trk_s.strategy.full_tp_price == 94.00  # S10
+    assert trk_s.strategy.global_sl_price == 111.30  # L10 (106.00) * (1 + 5%)
+    assert trk_s.levels["CS"]["order_usdt"] == 1000.0 and trk_s.levels["CS"]["weight_pct"] == 100.0
+    for idx, exp_u in ((1, 1000.0), (2, 1000.0), (3, 500.0), (4, 300.0), (5, 200.0), (6, 200.0), (10, 200.0)):
+        assert trk_s.levels[f"L{idx}"]["order_usdt"] == exp_u
+
+    # Full S-group TP at S10 (94.00) -> 30-min TP cooldown; Global SL at 111.30 -> 1-hour SL cooldown!
+    _, ex_tp_all = trk_s.evaluate_tick(93.99, 94.00, 93.995, cfg10, is_net_mode=False, round_trip_fee=0.0010)
+    assert [e["slot_id"] for e in ex_tp_all] == ["QS"]
+    t_tp = mono_ms()
+    trk_s.mark_exited("QS", 52.0, is_sl=False)
+    assert trk_s.strategy.restart_reason == "TP_COOLDOWN"
+    assert abs((trk_s.strategy.restart_cooldown_until_mono - t_tp) - 1_800_000.0) < 5000.0
+
 
 
 

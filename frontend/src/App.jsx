@@ -63,8 +63,8 @@ const STRATEGY_STATE_PIPELINES = {
     { key: 'LOCKED', step: '2', label: '底仓锁向', desc: 'Q/Q\'底仓·逆向格套利' },
     { key: 'PYRAMID', step: '3', label: '递减加仓', desc: '50%·30%·10%金字塔' },
     { key: 'TRAILING', step: '4', label: '组移动止盈', desc: '均价保底·0.8%回撤' },
-    { key: 'EXITING', step: '5', label: '全平对账', desc: 'L5/S5或残仓清零' },
-    { key: 'COOLDOWN', step: '6', label: '冷却重锚', desc: '止盈4m·止损数小时' },
+    { key: 'EXITING', step: '5', label: '全平对账', desc: '顶格或残仓清零' },
+    { key: 'COOLDOWN', step: '6', label: '冷却重锚', desc: '止盈30m·止损1h' },
   ],
   TREND_GRID: [
     { key: 'DEADZONE', step: '1', label: '死区观察', desc: '过滤震荡噪音' },
@@ -5773,7 +5773,16 @@ export default function App() {
                                 </button>
                               </div>
                               {gSnap.regime_reason && (
-                                <div className="text-[11px] text-dim">{gSnap.regime_reason}</div>
+                                <div className="flex flex-wrap items-center gap-2 text-[11px] text-dim">
+                                  <span>{gSnap.regime_reason}</span>
+                                  {isReverseOscActive &&
+                                    gSnap.cycle_phase === 'COOLDOWN' &&
+                                    Number(gSnap.restart_cooldown_rem_sec || 0) > 0 && (
+                                      <span className="px-2 py-0.5 rounded-full font-mono text-[10px] font-semibold bg-amber-500/15 text-amber-700 dark:text-amber-300">
+                                        剩余冷却 {Math.ceil(Number(gSnap.restart_cooldown_rem_sec) / 60)} 分钟
+                                      </span>
+                                    )}
+                                </div>
                               )}
                               {isTrendActive &&
                                 (Number(gSnap.long_trail_stop_price || 0) > 0 ||
@@ -5826,10 +5835,16 @@ export default function App() {
                                     ) : isReverseOscActive ? (
                                       <>
                                         <div className="text-[10px] text-emerald-600 dark:text-emerald-400">
-                                          止盈 {Number(lv.tp_price).toFixed(gridPrec)}
+                                          止盈{' '}
+                                          {Number(lv.tp_price || 0) > 0
+                                            ? Number(lv.tp_price).toFixed(gridPrec)
+                                            : '组追踪/顶格'}
                                         </div>
                                         <div className="text-[10px] text-rose-500">
                                           止损 {Number(lv.sl_price || 0).toFixed(gridPrec)}
+                                        </div>
+                                        <div className="text-[10px] text-dim">
+                                          仓位 {Number(lv.order_usdt || 0).toFixed(1)}U ({Number(lv.weight_pct || 0).toFixed(0)}%)
                                         </div>
                                         {lv.status === 'IDLE' && lv.armed === false && (
                                           <div className="text-[9px] font-sans text-amber-600 dark:text-amber-300 mt-0.5">

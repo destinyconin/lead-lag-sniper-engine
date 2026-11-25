@@ -12,34 +12,39 @@ Implements the full mode-locked base + oscillation scalp + decaying pyramid + gr
 
 2. LONG Mode (`locked_mode == "LONG"`, all positions are LONG):
    - `Q` (100% at L1): base position, no fixed TP; managed by L-group trailing TP / L_N full TP / Global SL.
-   - Oscillation dip-buy slots (100% each, Maker Post-Only TP supported):
-       * `C`:  buy at C,  sell at L1 (when `Q` is held, rising to L1 ONLY sells `C`, never re-buys `Q`;
+   - Oscillation dip-buy slots (Maker Post-Only TP supported):
+       * `C` (100%):  buy at C,  sell at L1 (when `Q` is held, rising to L1 ONLY sells `C`, never re-buys `Q`;
                if `C` is held WITHOUT `Q`, reaching L1 converts `C` in-place to `Q` with zero extra order!)
-       * `S1`: buy at S1, sell at C
-       * `S2`: buy at S2, sell at S1 ... up to `S_N`: buy at S_N, sell at S_{N-1}
+       * `S1` (100%): buy at S1, sell at C
+       * `S2` (100%): buy at S2, sell at S1
+       * `S3` (50%):  buy at S3, sell at S2
+       * `S4` (30%):  buy at S4, sell at S3
+       * `S5..S_N` (20% fixed each): buy at S_i, sell at S_{i-1}
    - Decaying Pyramid trend slots (join L-group with `Q`, no fixed TP):
        * `L2` (50% at L2): activates L-group trailing TP
        * `L3` (30% at L3): joins L-group, recalculates group VWAP & monotonic floor
        * `L4` (10% at L4): joins L-group, recalculates group VWAP & monotonic floor
-       * `L_N` (L5 at C + 5*step): closes ENTIRE L-group (`Q, L2..L_{N-1}`) for full take-profit (`GRID_GROUP_TP`)
+       * `L5..L_{N-1}` (5% each when N > 5): joins L-group
+       * `L_N` (at C + N*step): closes ENTIRE L-group (`Q, L2..L_{N-1}`) for full take-profit (`GRID_GROUP_TP`)
    - L-Group Trailing Take-Profit:
        * `floor = max(prev_floor, group_vwap * (1 + rt_fee))` (monotonically upward only)
        * `trail_stop = max(prev_trail, floor, peak * (1 - retracement))` (`retracement` in 0.8%~1.0%, upward only)
        * When `bid <= trail_stop`: closes entire L-group via `GRID_TRAIL_TP`
-   - Global Stop-Loss: `S_N * (1 - global_sl_pct)` (default 5% below S5 -> ~92.15 when C=100, step=0.6%).
-     Closes ALL open slots via `GRID_GLOBAL_SL` and triggers multi-hour cooldown.
+   - Global Stop-Loss: `S_N * (1 - global_sl_pct)` (default 5% below S_N).
+     Closes ALL open slots via `GRID_GLOBAL_SL` and triggers 1-hour cooldown.
 
 3. SHORT Mode (`locked_mode == "SHORT"`, exact mirror — all positions are SHORT):
-   - `QS` (Q', 100% at S1), `CS` (C', short at C, cover at S1; converts to `QS` if `QS` not held),
-     `L1..L_N` (100% oscillation shorts covering 1 step lower), `S2 (50%), S3 (30%), S4 (10%)`
-     pyramid shorts activating S-group trailing TP, `S_N` (S5) full group close, Global SL above `L_N` by 5%.
+   - `QS` (Q', 100% at S1), `CS` (C', 100% short at C, cover at S1; converts to `QS` if `QS` not held),
+     `L1, L2 (100%), L3 (50%), L4 (30%), L5..L_N (20% fixed)` oscillation shorts covering 1 step lower,
+     `S2 (50%), S3 (30%), S4 (10%), S5..S_{N-1} (5%)` pyramid shorts activating S-group trailing TP,
+     `S_N` full group close, Global SL above `L_N` by `global_sl_pct`.
 
 4. Shared Restart, Reconciliation, Cooldowns & Range Drift:
    - Per-slot re-arm hysteresis: after a slot closes, price must return >= 0.03% to its outer side + 1.5s cooldown.
    - After all positions close in a locked cycle:
        * Requires exchange zero-position & zero-order verification (cleanup any residual before re-anchor)
-       * Normal TP cycle cooldown: 4 minutes (within 3~5 minutes)
-       * Global SL cooldown: 3 hours (multi-hour protection)
+       * Normal TP cycle cooldown: 30 minutes
+       * Global SL cooldown: 1 hour
        * Once verified flat & cooldown expires: pulls latest mid as new `center_price`, resets `locked_mode = "NONE"`,
          rebuilds all levels with every slot freshly armed.
    - Idle range drift (`locked_mode == "NONE"`, flat, not in cooldown): if `|mid - C| / C > grid_range_pct` (±3.5%),
@@ -53,8 +58,8 @@ from backend.strategies.base import BaseGridStrategy
 
 # Cooldown constants (milliseconds)
 SLOT_CLOSE_COOLDOWN_MS = 1500.0        # 1~2s per-slot post-close cooldown
-TP_CYCLE_COOLDOWN_MS = 240_000.0       # 4 min (3~5 min) post-TP restart cooldown
-GLOBAL_SL_COOLDOWN_MS = 10_800_000.0   # 3 hours post-global-SL cooldown
+TP_CYCLE_COOLDOWN_MS = 1_800_000.0     # 30 min post-TP restart cooldown
+GLOBAL_SL_COOLDOWN_MS = 3_600_000.0    # 1 hour post-global-SL cooldown
 REARM_OUTER_BUF_PCT = 0.0003           # 0.03% outer-side re-arm hysteresis
 
 # Pyramid level ratios for L2/S2, L3/S3, L4/S4, ...
@@ -62,6 +67,15 @@ PYRAMID_LEVEL_RATIOS = {
     2: 0.50,
     3: 0.30,
     4: 0.10,
+}
+
+# Oscillation counter-move slot ratios: S1/S2=100%, S3=50%, S4=30%, S5+=20% (mirrored on L1..LN in SHORT mode)
+OSC_LEVEL_RATIOS = {
+    1: 1.00,
+    2: 1.00,
+    3: 0.50,
+    4: 0.30,
+    5: 0.20,
 }
 
 
@@ -135,8 +149,9 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         role = str(lv.get("role") or "")
         prec = cfg.price_precision
         if role == "OSC":
+            w_pct = float(lv.get("weight_pct") or 100.0)
             return (
-                f"[多空震荡成交] {self.symbol} [{slot_id}] {side} (震荡格) 均价: {avg_price:.{prec}f} | "
+                f"[多空震荡成交] {self.symbol} [{slot_id}] {side} (震荡格 {w_pct:g}%) 均价: {avg_price:.{prec}f} | "
                 f"数量: {filled_qty} | 止盈目标: {lv.get('tp_price', 0):.{prec}f} | "
                 f"全局止损: {lv.get('sl_price', 0):.{prec}f}{prot_suffix}"
             )
@@ -201,6 +216,19 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         return max(0.05, round(0.10 * (0.5 ** max(0, level_idx - 4)), 4))
 
     @staticmethod
+    def _osc_ratio(level_idx: int) -> float:
+        """
+        Oscillation counter-move sizing ratio for S1..SN (LONG mode) and L1..LN (SHORT mode):
+        - Level 1 & 2: 100%
+        - Level 3:     50%
+        - Level 4:     30%
+        - Level 5+:    fixed 20%
+        """
+        if level_idx in OSC_LEVEL_RATIOS:
+            return OSC_LEVEL_RATIOS[level_idx]
+        return 0.20 if level_idx >= 5 else 1.00
+
+    @staticmethod
     def _trail_retracement(cfg: SymbolStrategy) -> float:
         # User spec: 0.8% ~ 1.0% retracement (exact 0.80% at step=0.60%, scaling up to 1.00% at step>=0.80%)
         step = max(0.0001, float(cfg.grid_step_pct))
@@ -225,7 +253,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         if self.cycle_phase == "PENDING_RECONCILE":
             self.last_regime_reason = "多空震荡 · 周期平仓完成，正在对账确认交易所零持仓/零挂单"
         elif self.cycle_phase == "COOLDOWN":
-            tag = "全局止损长冷却" if self.restart_reason == "GLOBAL_SL_COOLDOWN" else "止盈重启冷却(4m)"
+            tag = "全局止损冷却(1h)" if self.restart_reason == "GLOBAL_SL_COOLDOWN" else "止盈重启冷却(30m)"
             self.last_regime_reason = f"多空震荡 · {tag}，冷却结束后拉最新价重锚"
         elif self.locked_mode == "LONG":
             if self.group_trail_active:
@@ -419,10 +447,11 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 cd_u=cd_u,
                 last_c=last_c,
             )
-            # Oscillation dip-buy slots S1..S_n (buy at S_i, sell at C / S_{i-1}, 100%)
+            # Oscillation dip-buy slots S1..S_n (S1/S2=100%, S3=50%, S4=30%, S5+=20%; sell at C / S_{i-1})
             for i in range(1, n + 1):
                 sid = f"S{i}"
                 sell_tp = c_px if i == 1 else s_px[i - 1]
+                osc_ratio = self._osc_ratio(i)
                 cd_u, last_c = old_cooldowns.get(sid, (0.0, 0.0))
                 new_levels[sid] = self._new_slot(
                     slot_id=sid,
@@ -432,8 +461,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     trigger_price=s_px[i],
                     tp_price=sell_tp,
                     sl_price=long_global_sl,
-                    order_usdt=base_usdt,
-                    weight_pct=100.0,
+                    order_usdt=base_usdt * osc_ratio,
+                    weight_pct=osc_ratio * 100.0,
                     sort_price=s_px[i],
                     armed=True,
                     cd_u=cd_u,
@@ -497,10 +526,11 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 cd_u=cd_u,
                 last_c=last_c,
             )
-            # Oscillation bounce-short slots L1..L_n (short at L_i, cover at C / L_{i-1}, 100%)
+            # Oscillation bounce-short slots L1..L_n (L1/L2=100%, L3=50%, L4=30%, L5+=20%; cover at C / L_{i-1})
             for i in range(1, n + 1):
                 sid = f"L{i}"
                 cover_tp = c_px if i == 1 else l_px[i - 1]
+                osc_ratio = self._osc_ratio(i)
                 cd_u, last_c = old_cooldowns.get(sid, (0.0, 0.0))
                 new_levels[sid] = self._new_slot(
                     slot_id=sid,
@@ -510,8 +540,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     trigger_price=l_px[i],
                     tp_price=cover_tp,
                     sl_price=short_global_sl,
-                    order_usdt=base_usdt,
-                    weight_pct=100.0,
+                    order_usdt=base_usdt * osc_ratio,
+                    weight_pct=osc_ratio * 100.0,
                     sort_price=l_px[i],
                     armed=True,
                     cd_u=cd_u,
