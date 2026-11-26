@@ -6270,6 +6270,141 @@ def test_reverse_grid_10_levels_osc_decay_and_updated_cooldowns():
     assert abs((trk_s.strategy.restart_cooldown_until_mono - t_tp) - 1_800_000.0) < 5000.0
 
 
+def test_reverse_grid_custom_pcts_ln_sn_trail_start_cooldowns_and_edge_guards():
+    """
+    Verifies all user-customizable REVERSE_GRID parameters & edge-case protections:
+      1. SQLite persistence of rev_l_pcts, rev_s_pcts, rev_c_pct, rev_tp_cooldown_min,
+         rev_sl_cooldown_min, rev_trail_start_level, rev_trail_retracement_pct, rev_max_level_mode.
+      2. Crossing outermost Ln/Sn (rev_trail_start_level=0 / 5, TRAIL_ONLY) starts trailing TP
+         without capping at Ln/Sn, and exits 100% on custom retracement (e.g. 1.20%).
+      3. Pure base-only mode (rev_l_pcts="100,0") still starts trailing TP by price crossing Ln/Sn.
+      4. Anti-suicide floor clamp under inverted anti-pyramid weights (rev_l_pcts="20,100").
+      5. Live cooldown update while sitting in COOLDOWN + blocking new OSC dip-buys during active trail.
+    """
+    from backend.grid_engine import LongShortGridTracker
+    from backend.math_engine import mono_ms
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        adb = AsyncDatabaseManager(db_path=os.path.join(tmpdir, "rev_custom.db"))
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(55)
+
+        cfg = SymbolStrategy(
+            symbol="SOL/USDT:USDT",
+            strategy_type="REVERSE_GRID",
+            grid_side_mode="LONG_SHORT",
+            grid_levels=5,
+            grid_step_pct=0.006,
+            grid_range_pct=0.04,
+            grid_stop_loss_pct=0.045,
+            order_usdt=1000.0,
+            leverage=3,
+            price_precision=2,
+            qty_precision=2,
+            rev_l_pcts="80,40,25,15,10",
+            rev_s_pcts="90,70,50,35,25",
+            rev_c_pct=80.0,
+            rev_tp_cooldown_min=12.0,
+            rev_sl_cooldown_min=45.0,
+            rev_trail_start_level=0,  # 0 = cross outermost Ln/Sn (L5/S5) to start trailing TP!
+            rev_trail_retracement_pct=0.012,  # 1.20% custom trailing retracement
+            rev_max_level_mode="TRAIL_ONLY",
+        )
+        adb.upsert_symbol_sync(cfg, user_id=55)
+        reloaded = {s.symbol: s for s in adb.load_symbols_sync(user_id=55)}["SOL/USDT:USDT"]
+        assert reloaded.rev_l_pcts == "80,40,25,15,10"
+        assert reloaded.rev_s_pcts == "90,70,50,35,25"
+        assert reloaded.rev_c_pct == 80.0
+        assert reloaded.rev_tp_cooldown_min == 12.0
+        assert reloaded.rev_sl_cooldown_min == 45.0
+        assert reloaded.rev_trail_start_level == 0
+        assert abs(reloaded.rev_trail_retracement_pct - 0.012) < 1e-7
+        assert reloaded.rev_max_level_mode == "TRAIL_ONLY"
+
+    # 1. Uncapped Ln/Sn trailing trigger (L5 = 103.00 starts trailing TP; L2..L4 do NOT start trailing early!)
+    trk = LongShortGridTracker("SOL/USDT:USDT", strategy_type="REVERSE_GRID")
+    trk.sync_config(reloaded, current_mid=100.00)
+    en_q, _ = trk.evaluate_tick(100.59, 100.60, 100.595, reloaded, is_net_mode=False, round_trip_fee=0.0010)
+    assert [e["slot_id"] for e in en_q] == ["Q"] and en_q[0]["order_usdt"] == 800.0
+    trk.mark_entry_filled("Q", 100.60, 8.0, 8.0, 1.0, reloaded, round_trip_fee=0.0010)
+
+    assert trk.strategy.full_tp_price == 0.0  # Uncapped!
+    assert trk.strategy.trail_trigger_level == 5 and trk.strategy.trail_trigger_price == 103.00
+    assert trk.levels["C"]["order_usdt"] == 800.0
+    for idx, exp_u in ((1, 900.0), (2, 700.0), (3, 500.0), (4, 350.0), (5, 250.0)):
+        assert trk.levels[f"S{idx}"]["order_usdt"] == exp_u
+    for idx, exp_u in ((2, 400.0), (3, 250.0), (4, 150.0), (5, 100.0)):
+        assert trk.levels[f"L{idx}"]["order_usdt"] == exp_u
+
+    # Fill L2, L3, L4 -> group_trail_active MUST remain False before L5!
+    for sid, px, qty in (("L2", 101.20, 4.0), ("L3", 101.80, 2.5), ("L4", 102.40, 1.5)):
+        en_p, ex_p = trk.evaluate_tick(px - 0.01, px, px - 0.005, reloaded, is_net_mode=False, round_trip_fee=0.0010)
+        assert ex_p == [] and [e["slot_id"] for e in en_p] == [sid]
+        trk.mark_entry_filled(sid, px, qty, qty, 1.0, reloaded, round_trip_fee=0.0010)
+        assert trk.strategy.group_trail_active is False
+
+    # Pullback to 100.90 before L5 does NOT trigger trailing exit!
+    _, ex_pre = trk.evaluate_tick(100.90, 100.92, 100.91, reloaded, is_net_mode=False, round_trip_fee=0.0010)
+    assert ex_pre == []
+
+    # Cross L5 (103.00) -> fills L5 (10% = 100U) AND activates trailing TP without capping!
+    en_l5, ex_l5 = trk.evaluate_tick(103.00, 103.01, 103.005, reloaded, is_net_mode=False, round_trip_fee=0.0010)
+    assert ex_l5 == [] and [e["slot_id"] for e in en_l5] == ["L5"] and en_l5[0]["order_usdt"] == 100.0
+    trk.mark_entry_filled("L5", 103.00, 1.0, 1.0, 1.0, reloaded, round_trip_fee=0.0010)
+    assert trk.strategy.group_trail_active is True
+
+    # Surge uncapped to 110.00 -> trail = round(110.00 * (1 - 0.012), 2) = 108.68!
+    _, ex_run = trk.evaluate_tick(110.00, 110.02, 110.01, reloaded, is_net_mode=False, round_trip_fee=0.0010)
+    assert ex_run == []
+    assert trk.long_trail_stop_price == 108.68
+
+    # Pullback -1.20% to 108.68 -> closes 100% of Q + L2 + L3 + L4 + L5 via GRID_TRAIL_TP!
+    _, ex_hit = trk.evaluate_tick(108.68, 108.70, 108.69, reloaded, is_net_mode=False, round_trip_fee=0.0010)
+    assert set(e["slot_id"] for e in ex_hit) == {"Q", "L2", "L3", "L4", "L5"}
+    assert all(e["exit_reason"] == "GRID_TRAIL_TP" for e in ex_hit)
+    t_pre_cd = mono_ms()
+    for sid in ("Q", "L2", "L3", "L4", "L5"):
+        trk.mark_exited(sid, 25.0, is_sl=False)
+
+    # Custom 12-min TP cooldown (720,000 ms) applied, and live shortening to 2 min via sync_config updates immediately!
+    assert abs((trk.strategy.restart_cooldown_until_mono - t_pre_cd) - 720_000.0) < 5000.0
+    short_cd_cfg = reloaded.model_copy(update={"rev_tp_cooldown_min": 2.0})
+    trk.sync_config(short_cd_cfg, current_mid=108.69)
+    assert abs((trk.strategy.restart_cooldown_until_mono - t_pre_cd) - 120_000.0) < 5000.0
+
+    # 2. Pure base-only mode (rev_l_pcts="100,0") with crossing S5 (97.00) in SHORT mode activating trailing TP by price!
+    cfg_zero_pyr = reloaded.model_copy(update={"rev_l_pcts": "100,0", "rev_trail_retracement_pct": 0.04})
+    trk_z = LongShortGridTracker("SOL/USDT:USDT", strategy_type="REVERSE_GRID")
+    trk_z.sync_config(cfg_zero_pyr, current_mid=100.00)
+    trk_z.evaluate_tick(99.39, 99.40, 99.395, cfg_zero_pyr, is_net_mode=False, round_trip_fee=0.0010)
+    trk_z.mark_entry_filled("QS", 99.40, 10.0, 10.0, 1.0, cfg_zero_pyr, round_trip_fee=0.0010)
+    assert "S2" not in trk_z.levels and "S5" not in trk_z.levels
+    # Cross S5 (97.00) -> activates trailing TP purely via price crossing!
+    en_z5, ex_z5 = trk_z.evaluate_tick(96.98, 97.00, 96.99, cfg_zero_pyr, is_net_mode=False, round_trip_fee=0.0010)
+    assert en_z5 == [] and ex_z5 == []
+    assert trk_z.strategy.group_trail_active is True
+    # Even with wide 4% retracement (trail ~ 100.88 > CS=100.00), bouncing to 100.05 MUST NOT open CS while trailing is active!
+    en_no_osc, _ = trk_z.evaluate_tick(100.05, 100.07, 100.06, cfg_zero_pyr, is_net_mode=False, round_trip_fee=0.0010)
+    assert en_no_osc == []
+
+    # 3. Anti-suicide floor clamp under inverted anti-pyramid weights (L1=20%, L2=100%, start at L2)
+    cfg_inv = reloaded.model_copy(update={"rev_l_pcts": "20,100,100,100,100", "rev_trail_start_level": 2, "rev_trail_retracement_pct": 0.01})
+    trk_inv = LongShortGridTracker("SOL/USDT:USDT", strategy_type="REVERSE_GRID")
+    trk_inv.sync_config(cfg_inv, current_mid=100.00)
+    trk_inv.evaluate_tick(100.59, 100.60, 100.595, cfg_inv, is_net_mode=False, round_trip_fee=0.0010)
+    trk_inv.mark_entry_filled("Q", 100.60, 2.0, 2.0, 1.0, cfg_inv, round_trip_fee=0.0010)
+    trk_inv.evaluate_tick(101.19, 101.20, 101.195, cfg_inv, is_net_mode=False, round_trip_fee=0.0010)
+    trk_inv.mark_entry_filled("L2", 101.20, 10.0, 10.0, 1.0, cfg_inv, round_trip_fee=0.0010)
+    # VWAP = 101.10 -> ideal breakeven floor ~101.24 > 101.20! Anti-suicide clamp MUST keep trail_stop < 101.20 initially!
+    assert trk_inv.long_trail_stop_price < 101.20
+    _, ex_no_suicide = trk_inv.evaluate_tick(101.18, 101.20, 101.19, cfg_inv, is_net_mode=False, round_trip_fee=0.0010)
+    assert ex_no_suicide == []
+    # Once price rallies to 102.00, breakeven floor locks in above VWAP!
+    trk_inv.evaluate_tick(102.00, 102.02, 102.01, cfg_inv, is_net_mode=False, round_trip_fee=0.0010)
+    assert trk_inv.strategy.group_floor_price >= 101.20
+
+
+
 
 
 

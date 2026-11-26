@@ -51,25 +51,27 @@ Implements the full mode-locked base + oscillation scalp + decaying pyramid + gr
      auto-recenters cleanly to latest mid.
 """
 from typing import Dict, List, Optional, Tuple
+import re
 
 from backend.math_engine import mono_ms
 from backend.models import SymbolStrategy
 from backend.strategies.base import BaseGridStrategy
 
-# Cooldown constants (milliseconds)
+# Cooldown constants (default milliseconds; per-symbol overrides come from SymbolStrategy)
 SLOT_CLOSE_COOLDOWN_MS = 1500.0        # 1~2s per-slot post-close cooldown
-TP_CYCLE_COOLDOWN_MS = 1_800_000.0     # 30 min post-TP restart cooldown
-GLOBAL_SL_COOLDOWN_MS = 3_600_000.0    # 1 hour post-global-SL cooldown
+TP_CYCLE_COOLDOWN_MS = 1_800_000.0     # Default 30 min post-TP restart cooldown
+GLOBAL_SL_COOLDOWN_MS = 3_600_000.0    # Default 1 hour post-global-SL cooldown
 REARM_OUTER_BUF_PCT = 0.0003           # 0.03% outer-side re-arm hysteresis
 
-# Pyramid level ratios for L2/S2, L3/S3, L4/S4, ...
+DEFAULT_TREND_PCT_LIST = [100.0, 50.0, 30.0, 10.0, 5.0]
+DEFAULT_OSC_PCT_LIST = [100.0, 100.0, 50.0, 30.0, 20.0]
+
+# Legacy lookup dicts kept for backward compatibility
 PYRAMID_LEVEL_RATIOS = {
     2: 0.50,
     3: 0.30,
     4: 0.10,
 }
-
-# Oscillation counter-move slot ratios: S1/S2=100%, S3=50%, S4=30%, S5+=20% (mirrored on L1..LN in SHORT mode)
 OSC_LEVEL_RATIOS = {
     1: 1.00,
     2: 1.00,
@@ -77,6 +79,39 @@ OSC_LEVEL_RATIOS = {
     4: 0.30,
     5: 0.20,
 }
+
+
+def parse_level_pct_ratios(
+    raw_pcts: Optional[str],
+    count: int,
+    fallback_pcts: List[float],
+    min_first_pct: float = 0.0,
+) -> List[float]:
+    """
+    Parses a comma/space-separated percentage string (e.g. '100,50,30,10,5') into ratios [1.0, 0.5, ...].
+    - Clamps each entry to [0.0, 1000.0]% (ratio 0.0 ~ 10.0).
+    - Clamps index 0 to >= min_first_pct (e.g. 1.0% for base slot Q/QS).
+    - Pads up to `count` by repeating the last configured value when `count > len(vals)`.
+    """
+    n = max(1, int(count))
+    parsed: List[float] = []
+    if raw_pcts is not None and str(raw_pcts).strip():
+        for tok in re.split(r"[,;，；\s]+", str(raw_pcts).strip()):
+            clean = tok.replace("%", "").strip()
+            if not clean:
+                continue
+            try:
+                pct = float(clean)
+                if pct == pct:  # guard NaN
+                    parsed.append(max(0.0, min(1000.0, pct)))
+            except ValueError:
+                continue
+    if not parsed:
+        parsed = list(fallback_pcts)
+    parsed[0] = max(min_first_pct, parsed[0])
+    while len(parsed) < n:
+        parsed.append(parsed[-1])
+    return [round(v / 100.0, 6) for v in parsed[:n]]
 
 
 class ReverseOscillatingGridStrategy(BaseGridStrategy):
@@ -92,6 +127,13 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         self.group_floor_price: float = 0.0
         self.full_tp_price: float = 0.0
         self.global_sl_price: float = 0.0
+        self.trail_trigger_level: int = 2
+        self.trail_trigger_price: float = 0.0
+        self.max_level_mode: str = "CAP_TP"
+        self.trail_retracement_pct: float = 0.0080
+        self._tp_cooldown_ms: float = TP_CYCLE_COOLDOWN_MS
+        self._sl_cooldown_ms: float = GLOBAL_SL_COOLDOWN_MS
+        self._cooldown_started_mono: float = 0.0
         self.cycle_phase: str = "ACTIVE"  # "ACTIVE" | "PENDING_RECONCILE" | "COOLDOWN"
         self.needs_flat_reconcile: bool = False
         self.reconcile_verified: bool = True
@@ -186,6 +228,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
     def clear_cooldowns(self):
         super().clear_cooldowns()
         self.restart_cooldown_until_mono = 0.0
+        self._cooldown_started_mono = 0.0
         self.restart_reason = ""
         if self.cycle_phase == "COOLDOWN" and self.reconcile_verified:
             self.cycle_phase = "ACTIVE"
@@ -198,6 +241,13 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         self.group_floor_price = 0.0
         self.full_tp_price = 0.0
         self.global_sl_price = 0.0
+        self.trail_trigger_level = 2
+        self.trail_trigger_price = 0.0
+        self.max_level_mode = "CAP_TP"
+        self.trail_retracement_pct = 0.0080
+        self._tp_cooldown_ms = TP_CYCLE_COOLDOWN_MS
+        self._sl_cooldown_ms = GLOBAL_SL_COOLDOWN_MS
+        self._cooldown_started_mono = 0.0
         self.cycle_phase = "ACTIVE"
         self.needs_flat_reconcile = False
         self.reconcile_verified = True
@@ -209,28 +259,38 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
     # ---------------- Internal helpers ----------------
 
     @staticmethod
-    def _pyramid_ratio(level_idx: int) -> float:
-        if level_idx in PYRAMID_LEVEL_RATIOS:
-            return PYRAMID_LEVEL_RATIOS[level_idx]
-        # Graceful decay for N > 5
-        return max(0.05, round(0.10 * (0.5 ** max(0, level_idx - 4)), 4))
+    def _effective_trail_trigger_level(cfg: SymbolStrategy) -> int:
+        n = max(1, int(cfg.grid_levels))
+        raw_k = int(getattr(cfg, "rev_trail_start_level", 2) if getattr(cfg, "rev_trail_start_level", None) is not None else 2)
+        if raw_k <= 0 or raw_k > n:
+            return n
+        return raw_k
 
-    @staticmethod
-    def _osc_ratio(level_idx: int) -> float:
-        """
-        Oscillation counter-move sizing ratio for S1..SN (LONG mode) and L1..LN (SHORT mode):
-        - Level 1 & 2: 100%
-        - Level 3:     50%
-        - Level 4:     30%
-        - Level 5+:    fixed 20%
-        """
-        if level_idx in OSC_LEVEL_RATIOS:
-            return OSC_LEVEL_RATIOS[level_idx]
-        return 0.20 if level_idx >= 5 else 1.00
+    @classmethod
+    def _effective_cap_at_max(cls, cfg: SymbolStrategy) -> bool:
+        n = max(1, int(cfg.grid_levels))
+        if n < 2:
+            return False
+        trig_lvl = cls._effective_trail_trigger_level(cfg)
+        mode = str(getattr(cfg, "rev_max_level_mode", "CAP_TP") or "CAP_TP").upper()
+        if trig_lvl >= n or mode == "TRAIL_ONLY":
+            return False
+        return True
+
+    def _sync_cfg_scalars(self, cfg: SymbolStrategy):
+        tp_min = max(0.0, float(getattr(cfg, "rev_tp_cooldown_min", 30.0) if getattr(cfg, "rev_tp_cooldown_min", None) is not None else 30.0))
+        sl_min = max(0.0, float(getattr(cfg, "rev_sl_cooldown_min", 60.0) if getattr(cfg, "rev_sl_cooldown_min", None) is not None else 60.0))
+        self._tp_cooldown_ms = tp_min * 60_000.0
+        self._sl_cooldown_ms = sl_min * 60_000.0
+        self.trail_trigger_level = self._effective_trail_trigger_level(cfg)
+        self.max_level_mode = "CAP_TP" if self._effective_cap_at_max(cfg) else "TRAIL_ONLY"
+        self.trail_retracement_pct = self._trail_retracement(cfg)
 
     @staticmethod
     def _trail_retracement(cfg: SymbolStrategy) -> float:
-        # User spec: 0.8% ~ 1.0% retracement (exact 0.80% at step=0.60%, scaling up to 1.00% at step>=0.80%)
+        raw_r = getattr(cfg, "rev_trail_retracement_pct", None)
+        if raw_r is not None:
+            return max(0.0005, min(0.50, float(raw_r)))
         step = max(0.0001, float(cfg.grid_step_pct))
         if step <= 0.0065:
             return 0.0080
@@ -247,28 +307,45 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             round(float(cfg.grid_range_pct), 6),
             round(float(cfg.grid_stop_loss_pct), 6),
             int(cfg.price_precision),
+            str(getattr(cfg, "rev_l_pcts", "100,50,30,10,5") or "100,50,30,10,5").strip(),
+            str(getattr(cfg, "rev_s_pcts", "100,100,50,30,20") or "100,100,50,30,20").strip(),
+            round(float(getattr(cfg, "rev_c_pct", 100.0)), 2),
+            round(float(getattr(cfg, "rev_tp_cooldown_min", 30.0)), 2),
+            round(float(getattr(cfg, "rev_sl_cooldown_min", 60.0)), 2),
+            int(getattr(cfg, "rev_trail_start_level", 2)),
+            round(float(getattr(cfg, "rev_trail_retracement_pct", 0.0080)), 6),
+            str(getattr(cfg, "rev_max_level_mode", "CAP_TP") or "CAP_TP"),
         )
 
     def _update_regime_reason(self):
         if self.cycle_phase == "PENDING_RECONCILE":
             self.last_regime_reason = "多空震荡 · 周期平仓完成，正在对账确认交易所零持仓/零挂单"
         elif self.cycle_phase == "COOLDOWN":
-            tag = "全局止损冷却(1h)" if self.restart_reason == "GLOBAL_SL_COOLDOWN" else "止盈重启冷却(30m)"
+            if self.restart_reason == "GLOBAL_SL_COOLDOWN":
+                mins = round(self._sl_cooldown_ms / 60_000.0, 1)
+                tag = f"全局止损冷却({mins:g}m)"
+            else:
+                mins = round(self._tp_cooldown_ms / 60_000.0, 1)
+                tag = f"止盈重启冷却({mins:g}m)"
             self.last_regime_reason = f"多空震荡 · {tag}，冷却结束后拉最新价重锚"
         elif self.locked_mode == "LONG":
             if self.group_trail_active:
                 self.last_regime_reason = (
-                    f"多头模式(锁定) · L组移动止盈已激活 (均价 {self.group_vwap:g} / 保底 {self.group_floor_price:g})"
+                    f"多头模式(锁定) · L组移动止盈已激活 (回撤 {self.trail_retracement_pct*100:.2f}% · 均价 {self.group_vwap:g} / 保底 {self.group_floor_price:g})"
                 )
             else:
-                self.last_regime_reason = "多头模式(锁定) · 底仓Q持仓 · C/S档震荡套利 · 上破L2激活追踪"
+                self.last_regime_reason = (
+                    f"多头模式(锁定) · 底仓Q持仓 · C/S档震荡套利 · 上破L{self.trail_trigger_level}激活移动止盈({self.trail_retracement_pct*100:.2f}%)"
+                )
         elif self.locked_mode == "SHORT":
             if self.group_trail_active:
                 self.last_regime_reason = (
-                    f"空头模式(锁定) · S组移动止盈已激活 (均价 {self.group_vwap:g} / 保底 {self.group_floor_price:g})"
+                    f"空头模式(锁定) · S组移动止盈已激活 (回撤 {self.trail_retracement_pct*100:.2f}% · 均价 {self.group_vwap:g} / 保底 {self.group_floor_price:g})"
                 )
             else:
-                self.last_regime_reason = "空头模式(锁定) · 底仓Q'持仓 · C'/L档震荡套利 · 下破S2激活追踪"
+                self.last_regime_reason = (
+                    f"空头模式(锁定) · 底仓Q'持仓 · C'/L档震荡套利 · 下破S{self.trail_trigger_level}激活移动止盈({self.trail_retracement_pct*100:.2f}%)"
+                )
         else:
             self.last_regime_reason = "多空震荡（待锁定方向 · 涨破L1做多 / 跌破S1做空）"
 
@@ -329,12 +406,30 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             if preserve_cooldowns
             else {}
         )
+        self._sync_cfg_scalars(cfg)
         prec = self._calc_prec(cfg)
         step = max(0.0001, float(cfg.grid_step_pct))
         sl_pct = max(0.002, float(cfg.grid_stop_loss_pct))
-        n = max(2, int(cfg.grid_levels))
+        n = max(1, int(cfg.grid_levels))
         base_usdt = float(cfg.order_usdt)
         c_px = round(self.center_price, prec)
+
+        l_ratios = parse_level_pct_ratios(
+            getattr(cfg, "rev_l_pcts", "100,50,30,10,5"),
+            n,
+            DEFAULT_TREND_PCT_LIST,
+            min_first_pct=1.0,
+        )
+        s_ratios = parse_level_pct_ratios(
+            getattr(cfg, "rev_s_pcts", "100,100,50,30,20"),
+            n,
+            DEFAULT_OSC_PCT_LIST,
+            min_first_pct=0.0,
+        )
+        c_pct_val = max(0.0, min(1000.0, float(getattr(cfg, "rev_c_pct", 100.0) if getattr(cfg, "rev_c_pct", None) is not None else 100.0)))
+        c_ratio = round(c_pct_val / 100.0, 6)
+        cap_at_max = self._effective_cap_at_max(cfg)
+        trig_lvl = self.trail_trigger_level
 
         l_px = {i: round(self.center_price * (1.0 + i * step), prec) for i in range(1, n + 1)}
         s_px = {i: round(self.center_price * max(0.05, 1.0 - i * step), prec) for i in range(1, n + 1)}
@@ -343,10 +438,12 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         short_global_sl = round(l_px[n] * (1.0 + sl_pct), prec)
 
         new_levels: Dict[str, dict] = {}
+        base_ratio = l_ratios[0]
 
         if self.locked_mode == "NONE":
             self.full_tp_price = 0.0
             self.global_sl_price = 0.0
+            self.trail_trigger_price = 0.0
             self.group_trail_active = False
             self.group_vwap = 0.0
             self.group_floor_price = 0.0
@@ -365,8 +462,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     trigger_price=l_px[1],
                     tp_price=0.0,
                     sl_price=long_global_sl,
-                    order_usdt=base_usdt,
-                    weight_pct=100.0,
+                    order_usdt=base_usdt * base_ratio,
+                    weight_pct=base_ratio * 100.0,
                     sort_price=l_px[1],
                     armed=True,
                     cd_u=cd_u,
@@ -382,8 +479,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     trigger_price=s_px[1],
                     tp_price=0.0,
                     sl_price=short_global_sl,
-                    order_usdt=base_usdt,
-                    weight_pct=100.0,
+                    order_usdt=base_usdt * base_ratio,
+                    weight_pct=base_ratio * 100.0,
                     sort_price=s_px[1],
                     armed=True,
                     cd_u=cd_u,
@@ -391,9 +488,10 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 )
 
         elif self.locked_mode == "LONG":
-            self.full_tp_price = l_px[n]
+            self.full_tp_price = l_px[n] if cap_at_max else 0.0
             self.global_sl_price = long_global_sl
-            # Base slot Q (at L1, 100%, no fixed TP)
+            self.trail_trigger_price = l_px[trig_lvl]
+            # Base slot Q (at L1, l_ratios[0], no fixed TP)
             cd_u, last_c = old_cooldowns.get("Q", (0.0, 0.0))
             new_levels["Q"] = self._new_slot(
                 slot_id="Q",
@@ -403,17 +501,20 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 trigger_price=l_px[1],
                 tp_price=0.0,
                 sl_price=long_global_sl,
-                order_usdt=base_usdt,
-                weight_pct=100.0,
+                order_usdt=base_usdt * base_ratio,
+                weight_pct=base_ratio * 100.0,
                 sort_price=l_px[1],
                 armed=False,
                 cd_u=cd_u,
                 last_c=last_c,
             )
-            # Pyramid slots L2..L_{n-1} (50%, 30%, 10%..., no fixed TP; L_n is full L-group close!)
-            for i in range(2, n):
+            # Pyramid slots: L2..L_{n-1} when cap_at_max=True, or L2..L_n when uncapped TRAIL_ONLY!
+            upper_pyr_end = n if cap_at_max else (n + 1)
+            for i in range(2, upper_pyr_end):
+                ratio = l_ratios[i - 1]
+                if ratio <= 1e-6:
+                    continue
                 sid = f"L{i}"
-                ratio = self._pyramid_ratio(i)
                 cd_u, last_c = old_cooldowns.get(sid, (0.0, 0.0))
                 new_levels[sid] = self._new_slot(
                     slot_id=sid,
@@ -430,28 +531,31 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     cd_u=cd_u,
                     last_c=last_c,
                 )
-            # Oscillation dip-buy slot C (buy at C, sell at L1, 100%)
-            cd_u, last_c = old_cooldowns.get("C", (0.0, 0.0))
-            new_levels["C"] = self._new_slot(
-                slot_id="C",
-                side="LONG",
-                level_idx=0,
-                role="OSC",
-                trigger_price=c_px,
-                tp_price=l_px[1],
-                sl_price=long_global_sl,
-                order_usdt=base_usdt,
-                weight_pct=100.0,
-                sort_price=c_px,
-                armed=True,
-                cd_u=cd_u,
-                last_c=last_c,
-            )
-            # Oscillation dip-buy slots S1..S_n (S1/S2=100%, S3=50%, S4=30%, S5+=20%; sell at C / S_{i-1})
+            # Oscillation dip-buy slot C (buy at C, sell at L1)
+            if c_ratio > 1e-6:
+                cd_u, last_c = old_cooldowns.get("C", (0.0, 0.0))
+                new_levels["C"] = self._new_slot(
+                    slot_id="C",
+                    side="LONG",
+                    level_idx=0,
+                    role="OSC",
+                    trigger_price=c_px,
+                    tp_price=l_px[1],
+                    sl_price=long_global_sl,
+                    order_usdt=base_usdt * c_ratio,
+                    weight_pct=c_ratio * 100.0,
+                    sort_price=c_px,
+                    armed=True,
+                    cd_u=cd_u,
+                    last_c=last_c,
+                )
+            # Oscillation dip-buy slots S1..S_n (customizable s_ratios; sell at C / S_{i-1})
             for i in range(1, n + 1):
+                osc_ratio = s_ratios[i - 1]
+                if osc_ratio <= 1e-6:
+                    continue
                 sid = f"S{i}"
                 sell_tp = c_px if i == 1 else s_px[i - 1]
-                osc_ratio = self._osc_ratio(i)
                 cd_u, last_c = old_cooldowns.get(sid, (0.0, 0.0))
                 new_levels[sid] = self._new_slot(
                     slot_id=sid,
@@ -470,9 +574,10 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 )
 
         elif self.locked_mode == "SHORT":
-            self.full_tp_price = s_px[n]
+            self.full_tp_price = s_px[n] if cap_at_max else 0.0
             self.global_sl_price = short_global_sl
-            # Base slot QS (Q' at S1, 100%, no fixed TP)
+            self.trail_trigger_price = s_px[trig_lvl]
+            # Base slot QS (Q' at S1, l_ratios[0], no fixed TP)
             cd_u, last_c = old_cooldowns.get("QS", (0.0, 0.0))
             new_levels["QS"] = self._new_slot(
                 slot_id="QS",
@@ -482,17 +587,19 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 trigger_price=s_px[1],
                 tp_price=0.0,
                 sl_price=short_global_sl,
-                order_usdt=base_usdt,
-                weight_pct=100.0,
+                order_usdt=base_usdt * base_ratio,
+                weight_pct=base_ratio * 100.0,
                 sort_price=s_px[1],
                 armed=False,
                 cd_u=cd_u,
                 last_c=last_c,
             )
-            # Pyramid slots S2..S_{n-1} (50%, 30%, 10%..., no fixed TP; S_n is full S-group close!)
-            for i in range(2, n):
+            upper_pyr_end = n if cap_at_max else (n + 1)
+            for i in range(2, upper_pyr_end):
+                ratio = l_ratios[i - 1]
+                if ratio <= 1e-6:
+                    continue
                 sid = f"S{i}"
-                ratio = self._pyramid_ratio(i)
                 cd_u, last_c = old_cooldowns.get(sid, (0.0, 0.0))
                 new_levels[sid] = self._new_slot(
                     slot_id=sid,
@@ -509,28 +616,29 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     cd_u=cd_u,
                     last_c=last_c,
                 )
-            # Oscillation bounce-short slot CS (C': short at C, cover at S1, 100%)
-            cd_u, last_c = old_cooldowns.get("CS", (0.0, 0.0))
-            new_levels["CS"] = self._new_slot(
-                slot_id="CS",
-                side="SHORT",
-                level_idx=0,
-                role="OSC",
-                trigger_price=c_px,
-                tp_price=s_px[1],
-                sl_price=short_global_sl,
-                order_usdt=base_usdt,
-                weight_pct=100.0,
-                sort_price=c_px,
-                armed=True,
-                cd_u=cd_u,
-                last_c=last_c,
-            )
-            # Oscillation bounce-short slots L1..L_n (L1/L2=100%, L3=50%, L4=30%, L5+=20%; cover at C / L_{i-1})
+            if c_ratio > 1e-6:
+                cd_u, last_c = old_cooldowns.get("CS", (0.0, 0.0))
+                new_levels["CS"] = self._new_slot(
+                    slot_id="CS",
+                    side="SHORT",
+                    level_idx=0,
+                    role="OSC",
+                    trigger_price=c_px,
+                    tp_price=s_px[1],
+                    sl_price=short_global_sl,
+                    order_usdt=base_usdt * c_ratio,
+                    weight_pct=c_ratio * 100.0,
+                    sort_price=c_px,
+                    armed=True,
+                    cd_u=cd_u,
+                    last_c=last_c,
+                )
             for i in range(1, n + 1):
+                osc_ratio = s_ratios[i - 1]
+                if osc_ratio <= 1e-6:
+                    continue
                 sid = f"L{i}"
                 cover_tp = c_px if i == 1 else l_px[i - 1]
-                osc_ratio = self._osc_ratio(i)
                 cd_u, last_c = old_cooldowns.get(sid, (0.0, 0.0))
                 new_levels[sid] = self._new_slot(
                     slot_id=sid,
@@ -628,14 +736,17 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
 
         if self.locked_mode == "LONG":
             max_entry = max(float(lv.get("entry_price") or 0.0) for lv in group_slots)
-            # Add calibrated slippage + net-profit cushion (+0.08%~+0.10%) above RT fee so live Taker exit
-            # slippage at the group floor still settles strictly net-profitable (while never crossing L2 entry!)
             headroom_pct = max(0.0, (max_entry - vwap) / max(1e-12, vwap))
             slip_buf = min(0.0010, max(0.0005, headroom_pct * 0.35)) if headroom_pct > rt_fee + 0.0006 else 0.0004
             raw_floor = round(vwap * (1.0 + rt_fee + slip_buf), prec)
-            self.group_floor_price = max(self.group_floor_price, raw_floor) if self.group_floor_price > 0 else raw_floor
             self.long_peak_price = max(self.long_peak_price, max_entry, ref_price)
-            cand_trail = round(max(self.group_floor_price, self.long_peak_price * (1.0 - retr)), prec)
+            # Anti-suicide guard: under inverted/custom weights or L1 trigger, only lock raw_floor once peak
+            # has actually cleared raw_floor with a tiny breathing buffer so trailing never dumps above market!
+            min_clear = raw_floor * (1.0 + min(0.0015, retr * 0.25))
+            if self.long_peak_price >= min_clear:
+                self.group_floor_price = max(self.group_floor_price, raw_floor) if self.group_floor_price > 0 else raw_floor
+            raw_trail = round(self.long_peak_price * (1.0 - retr), prec)
+            cand_trail = max(self.group_floor_price, raw_trail) if self.group_floor_price > 0 else raw_trail
             self.long_trail_stop_price = (
                 max(self.long_trail_stop_price, cand_trail) if self.long_trail_stop_price > 0 else cand_trail
             )
@@ -643,7 +754,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             target_sl = self.long_trail_stop_price
             for lv in group_slots:
                 cur_sl = float(lv.get("sl_price") or 0.0)
-                if cur_sl < self.group_floor_price - 1e-9 or (
+                if (self.group_floor_price > 0 and cur_sl < self.group_floor_price - 1e-9) or (
                     cur_sl > 0 and target_sl >= cur_sl * 1.0020
                 ):
                     if ref_price <= 0 or ref_price >= target_sl * 1.0008:
@@ -654,17 +765,20 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             headroom_pct = max(0.0, (vwap - min_entry) / max(1e-12, vwap))
             slip_buf = min(0.0010, max(0.0005, headroom_pct * 0.35)) if headroom_pct > rt_fee + 0.0006 else 0.0004
             raw_floor = round(vwap * max(0.05, 1.0 - rt_fee - slip_buf), prec)
-            self.group_floor_price = min(self.group_floor_price, raw_floor) if self.group_floor_price > 0 else raw_floor
             trough_cands = [p for p in (self.short_trough_price, min_entry, ref_price) if p > 0]
             self.short_trough_price = min(trough_cands) if trough_cands else 0.0
-            cand_trail = round(min(self.group_floor_price, self.short_trough_price * (1.0 + retr)), prec)
+            max_clear = raw_floor * max(0.05, 1.0 - min(0.0015, retr * 0.25))
+            if 0 < self.short_trough_price <= max_clear:
+                self.group_floor_price = min(self.group_floor_price, raw_floor) if self.group_floor_price > 0 else raw_floor
+            raw_trail = round(self.short_trough_price * (1.0 + retr), prec)
+            cand_trail = min(self.group_floor_price, raw_trail) if self.group_floor_price > 0 else raw_trail
             self.short_trail_stop_price = (
                 min(self.short_trail_stop_price, cand_trail) if self.short_trail_stop_price > 0 else cand_trail
             )
             target_sl = self.short_trail_stop_price
             for lv in group_slots:
                 cur_sl = float(lv.get("sl_price") or 0.0)
-                if cur_sl <= 0 or cur_sl > self.group_floor_price + 1e-9 or target_sl <= cur_sl * 0.9980:
+                if cur_sl <= 0 or (self.group_floor_price > 0 and cur_sl > self.group_floor_price + 1e-9) or target_sl <= cur_sl * 0.9980:
                     if ref_price <= 0 or ref_price <= target_sl * 0.9992:
                         lv["sl_price"] = target_sl
                         lv["sl_needs_amend"] = True
@@ -676,11 +790,12 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         if self.locked_mode == "NONE":
             return
         self._last_cycle_ended_by_sl = bool(is_global_sl)
-        cd_ms = GLOBAL_SL_COOLDOWN_MS if is_global_sl else TP_CYCLE_COOLDOWN_MS
-        self.restart_cooldown_until_mono = max(self.restart_cooldown_until_mono, now_m + cd_ms)
+        cd_ms = self._sl_cooldown_ms if is_global_sl else self._tp_cooldown_ms
+        self._cooldown_started_mono = now_m
+        self.restart_cooldown_until_mono = now_m + cd_ms
         self.restart_reason = "GLOBAL_SL_COOLDOWN" if is_global_sl else "TP_COOLDOWN"
         if is_global_sl:
-            self._post_sl_cooldown_until_mono = max(self._post_sl_cooldown_until_mono, now_m + cd_ms)
+            self._post_sl_cooldown_until_mono = now_m + cd_ms
         self.cycle_phase = "PENDING_RECONCILE"
         self.needs_flat_reconcile = True
         self.reconcile_verified = False
@@ -697,6 +812,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
 
     def sync_config(self, cfg: SymbolStrategy, current_mid: float = 0.0, bbw_info: Optional[dict] = None):
         self.active_grid_mode = "REVERSE_OSCILLATING"
+        self._sync_cfg_scalars(cfg)
         sig_params = self._compute_sig_params(cfg)
 
         if self.center_price <= 0 and current_mid > 0:
@@ -714,20 +830,43 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             self._last_user_sig_params = sig_params
             self._last_sig_params = sig_params
             self.clear_cooldowns()
+        elif (
+            not self._has_active_slots()
+            and self.cycle_phase in ("PENDING_RECONCILE", "COOLDOWN")
+            and sig_params != self._last_sig_params
+        ):
+            # Immediately apply updated cooldown duration ONLY when user actually changed config parameters
+            if self._cooldown_started_mono > 0:
+                cd_ms = self._sl_cooldown_ms if self.restart_reason == "GLOBAL_SL_COOLDOWN" else self._tp_cooldown_ms
+                self.restart_cooldown_until_mono = self._cooldown_started_mono + cd_ms
+                if self.restart_reason == "GLOBAL_SL_COOLDOWN":
+                    self._post_sl_cooldown_until_mono = self._cooldown_started_mono + cd_ms
+            self._last_user_sig_params = sig_params
+            self._last_sig_params = sig_params
+            self._update_regime_reason()
         elif self._has_active_slots() and self.locked_mode in ("LONG", "SHORT"):
-            # Dynamically sync global_sl_price if user updates grid_stop_loss_pct while cycle is active
+            # Dynamically sync global_sl_price, trail_trigger_price, and full_tp_price while cycle is active
             prec = self._calc_prec(cfg)
             step = max(0.0001, float(cfg.grid_step_pct))
             sl_pct = max(0.002, float(cfg.grid_stop_loss_pct))
-            n = max(2, int(cfg.grid_levels))
+            n = max(1, int(cfg.grid_levels))
+            cap_at_max = self._effective_cap_at_max(cfg)
+            trig_lvl = self.trail_trigger_level
             if self.locked_mode == "LONG":
                 sn = round(self.center_price * max(0.05, 1.0 - n * step), prec)
+                ln = round(self.center_price * (1.0 + n * step), prec)
                 self.global_sl_price = round(sn * max(0.05, 1.0 - sl_pct), prec)
+                self.full_tp_price = ln if cap_at_max else 0.0
+                self.trail_trigger_price = round(self.center_price * (1.0 + trig_lvl * step), prec)
             else:
                 ln = round(self.center_price * (1.0 + n * step), prec)
+                sn = round(self.center_price * max(0.05, 1.0 - n * step), prec)
                 self.global_sl_price = round(ln * (1.0 + sl_pct), prec)
+                self.full_tp_price = sn if cap_at_max else 0.0
+                self.trail_trigger_price = round(self.center_price * max(0.05, 1.0 - trig_lvl * step), prec)
             self._last_user_sig_params = sig_params
             self._last_sig_params = sig_params
+            self._update_regime_reason()
 
     def recenter(self, new_center: float, cfg: SymbolStrategy, bbw_info: Optional[dict] = None) -> bool:
         if new_center <= 0 or self._has_active_slots():
@@ -779,16 +918,22 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         if force_exit_all:
             return [], self._evaluate_kill_switch_exits(bid, ask, now_m)
 
+        self._sync_cfg_scalars(cfg)
         exits: List[dict] = []
         entries: List[dict] = []
         prec = self._calc_prec(cfg)
         step = max(0.0001, float(cfg.grid_step_pct))
-        n = max(2, int(cfg.grid_levels))
+        n = max(1, int(cfg.grid_levels))
         sl_pct = max(0.002, float(cfg.grid_stop_loss_pct))
+        cap_at_max = self._effective_cap_at_max(cfg)
+        trig_lvl = self.trail_trigger_level
 
-        # Keep global_sl_price responsive to live user parameter edits
+        # Keep global_sl_price, trail_trigger_price & full_tp_price responsive to live user parameter edits
         if self.locked_mode == "LONG":
             s_n = round(self.center_price * max(0.05, 1.0 - n * step), prec)
+            l_n = round(self.center_price * (1.0 + n * step), prec)
+            self.full_tp_price = l_n if cap_at_max else 0.0
+            self.trail_trigger_price = round(self.center_price * (1.0 + trig_lvl * step), prec)
             new_gsl = round(s_n * max(0.05, 1.0 - sl_pct), prec)
             if abs(new_gsl - self.global_sl_price) > 1e-9:
                 self.global_sl_price = new_gsl
@@ -799,6 +944,9 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                             lv["sl_needs_amend"] = True
         elif self.locked_mode == "SHORT":
             l_n = round(self.center_price * (1.0 + n * step), prec)
+            s_n = round(self.center_price * max(0.05, 1.0 - n * step), prec)
+            self.full_tp_price = s_n if cap_at_max else 0.0
+            self.trail_trigger_price = round(self.center_price * max(0.05, 1.0 - trig_lvl * step), prec)
             new_gsl = round(l_n * (1.0 + sl_pct), prec)
             if abs(new_gsl - self.global_sl_price) > 1e-9:
                 self.global_sl_price = new_gsl
@@ -849,11 +997,33 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 if exits:
                     return [], exits
 
-            # 1b. Update L-group trailing stop if active
+            # 1b. Activate or update L-group trailing stop (supports both pyramid-fill activation AND price-crossing activation when L_k has 0% weight)
+            q_open_now = bool(self.levels.get("Q") and self.levels["Q"]["status"] == "OPEN")
+            osc_busy_now = any(
+                lv.get("role") == "OSC" and lv["status"] in ("OPEN", "ENTERING", "EXITING")
+                for lv in self.levels.values()
+            )
+            has_pending_pyr_at_or_below_trig = any(
+                lv.get("role") == "PYRAMID"
+                and lv["status"] in ("IDLE", "ENTERING")
+                and lv.get("armed", True)
+                and int(lv.get("level_idx") or 0) <= trig_lvl
+                for lv in self.levels.values()
+            )
+            if (
+                not self.group_trail_active
+                and q_open_now
+                and not osc_busy_now
+                and not has_pending_pyr_at_or_below_trig
+                and self.trail_trigger_price > 0
+                and bid >= self.trail_trigger_price
+            ):
+                self.group_trail_active = True
+                self.long_peak_price = max(self.long_peak_price, bid)
             if self.group_trail_active:
                 self._recompute_group_trailing(cfg, round_trip_fee, ref_price=bid)
 
-            # 1c. L_N (L5 = 103.00) Full Take-Profit -> close ENTIRE L-group (and any open LONG slots)
+            # 1c. L_N Full Take-Profit (active ONLY when max_level_mode == CAP_TP)
             if self.full_tp_price > 0 and bid >= self.full_tp_price:
                 for lv in self.levels.values():
                     if lv["status"] != "OPEN" or lv["side"] != "LONG":
@@ -866,9 +1036,11 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 if exits:
                     return [], exits
 
-            # 1d. L-Group Trailing Stop Hit -> close ENTIRE L-group (Q, L2..L_{N-1})
+            # 1d. L-Group Trailing Stop Hit -> close 100% of ALL open LONG slots cleanly so cycle reconciles & cools down
             if self.group_trail_active and self.long_trail_stop_price > 0 and bid <= self.long_trail_stop_price:
-                for lv in self._group_open_slots():
+                for lv in self.levels.values():
+                    if lv["status"] != "OPEN" or lv["side"] != "LONG":
+                        continue
                     if now_m < float(lv.get("exit_retry_until_mono") or 0.0):
                         continue
                     lv["status"] = "EXITING"
@@ -927,11 +1099,35 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 if exits:
                     return [], exits
 
-            # 1b. Update S-group trailing stop if active
+            # 1b. Activate or update S-group trailing stop
+            qs_open_now = bool(self.levels.get("QS") and self.levels["QS"]["status"] == "OPEN")
+            osc_busy_now = any(
+                lv.get("role") == "OSC" and lv["status"] in ("OPEN", "ENTERING", "EXITING")
+                for lv in self.levels.values()
+            )
+            has_pending_pyr_at_or_below_trig = any(
+                lv.get("role") == "PYRAMID"
+                and lv["status"] in ("IDLE", "ENTERING")
+                and lv.get("armed", True)
+                and int(lv.get("level_idx") or 0) <= trig_lvl
+                for lv in self.levels.values()
+            )
+            if (
+                not self.group_trail_active
+                and qs_open_now
+                and not osc_busy_now
+                and not has_pending_pyr_at_or_below_trig
+                and self.trail_trigger_price > 0
+                and ask <= self.trail_trigger_price
+            ):
+                self.group_trail_active = True
+                self.short_trough_price = (
+                    min(self.short_trough_price, ask) if self.short_trough_price > 0 else ask
+                )
             if self.group_trail_active:
                 self._recompute_group_trailing(cfg, round_trip_fee, ref_price=ask)
 
-            # 1c. S_N (S5 = 97.00) Full Take-Profit -> close ENTIRE S-group (and any open SHORT slots)
+            # 1c. S_N Full Take-Profit (active ONLY when max_level_mode == CAP_TP)
             if self.full_tp_price > 0 and ask <= self.full_tp_price:
                 for lv in self.levels.values():
                     if lv["status"] != "OPEN" or lv["side"] != "SHORT":
@@ -944,9 +1140,11 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 if exits:
                     return [], exits
 
-            # 1d. S-Group Trailing Stop Hit -> close ENTIRE S-group (QS, S2..S_{N-1})
+            # 1d. S-Group Trailing Stop Hit -> close 100% of ALL open SHORT slots cleanly
             if self.group_trail_active and self.short_trail_stop_price > 0 and ask >= self.short_trail_stop_price:
-                for lv in self._group_open_slots():
+                for lv in self.levels.values():
+                    if lv["status"] != "OPEN" or lv["side"] != "SHORT":
+                        continue
                     if now_m < float(lv.get("exit_retry_until_mono") or 0.0):
                         continue
                     lv["status"] = "EXITING"
@@ -1124,8 +1322,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     entries.append({**chosen, "reservation_price": res_px, "trigger_exec_price": ask})
                     return entries, exits
 
-            # 4b. Oscillation dip-buys (C, S1..S_N) — buy when ask drops to/below trigger, above global SL
-            if self.global_sl_price <= 0 or bid > self.global_sl_price:
+            # 4b. Oscillation dip-buys (C, S1..S_N) — disabled once group trailing TP harvest phase is active!
+            if not self.group_trail_active and (self.global_sl_price <= 0 or bid > self.global_sl_price):
                 osc_cands = [
                     lv
                     for lv in self.levels.values()
@@ -1167,8 +1365,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     entries.append({**chosen, "reservation_price": res_px, "trigger_exec_price": bid})
                     return entries, exits
 
-            # 4b. Oscillation bounce-shorts (CS, L1..L_N) — short when bid rises to/above trigger, below global SL
-            if self.global_sl_price <= 0 or ask < self.global_sl_price:
+            # 4b. Oscillation bounce-shorts (CS, L1..L_N) — disabled once group trailing TP harvest phase is active!
+            if not self.group_trail_active and (self.global_sl_price <= 0 or ask < self.global_sl_price):
                 osc_cands = [
                     lv
                     for lv in self.levels.values()
@@ -1201,6 +1399,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         q_lv["filled_qty"] = float(c_lv.get("filled_qty") or 0.0)
         q_lv["contracts"] = float(c_lv.get("contracts") or 0.0)
         q_lv["ct_val"] = float(c_lv.get("ct_val") or 1.0)
+        q_lv["order_usdt"] = float(c_lv.get("order_usdt") or q_lv.get("order_usdt") or 0.0)
+        q_lv["weight_pct"] = float(c_lv.get("weight_pct") or q_lv.get("weight_pct") or 100.0)
         q_lv["mgn_mode"] = str(c_lv.get("mgn_mode") or "cross")
         q_lv["opened_mono_ms"] = float(c_lv.get("opened_mono_ms") or now_m)
         q_lv["tp_price"] = 0.0
@@ -1275,13 +1475,15 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             )
             return
 
+        self._sync_cfg_scalars(cfg)
         lv = self.levels.get(slot_id)
         if not lv:
             return
         role = str(lv.get("role") or "")
         if role == "PYRAMID":
-            # L2 (or S2) activates group trailing TP; L3/L4 (or S3/S4) join group & recalculate monotonic VWAP floor!
-            if not self.group_trail_active:
+            # Activate group trailing TP ONLY when reaching/crossing configured trail_trigger_level (e.g. L2 or Ln)!
+            lvl_idx = int(lv.get("level_idx") or 2)
+            if not self.group_trail_active and lvl_idx >= self.trail_trigger_level:
                 self.group_trail_active = True
                 if self.locked_mode == "LONG":
                     self.long_peak_price = max(self.long_peak_price, entry_price)
@@ -1290,15 +1492,28 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                         min(self.short_trough_price, entry_price) if self.short_trough_price > 0 else entry_price
                     )
             self._recompute_group_trailing(cfg, round_trip_fee, ref_price=entry_price)
-            # Ensure newly filled pyramid slot itself receives the group's trailing stop SL
+            # Ensure newly filled pyramid slot receives trailing SL if active, otherwise global SL
             lv["sl_price"] = (
-                self.long_trail_stop_price if self.locked_mode == "LONG" else self.short_trail_stop_price
+                (self.long_trail_stop_price if self.locked_mode == "LONG" else self.short_trail_stop_price)
+                if self.group_trail_active
+                else 0.0
             ) or self.global_sl_price
         elif role == "BASE":
             lv["tp_price"] = 0.0
             lv["sl_price"] = self.global_sl_price
+            if not self.group_trail_active and self.trail_trigger_level <= 1:
+                self.group_trail_active = True
+                if self.locked_mode == "LONG":
+                    self.long_peak_price = max(self.long_peak_price, entry_price)
+                else:
+                    self.short_trough_price = (
+                        min(self.short_trough_price, entry_price) if self.short_trough_price > 0 else entry_price
+                    )
             if self.group_trail_active:
                 self._recompute_group_trailing(cfg, round_trip_fee, ref_price=entry_price)
+                lv["sl_price"] = (
+                    self.long_trail_stop_price if self.locked_mode == "LONG" else self.short_trail_stop_price
+                ) or self.global_sl_price
         elif role == "OSC":
             # Oscillation scalp slot keeps its exact adjacent grid-line TP and global SL
             lv["sl_price"] = self.global_sl_price
@@ -1604,6 +1819,12 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             "group_floor_price": float(self.group_floor_price or 0.0),
             "full_tp_price": float(self.full_tp_price or 0.0),
             "global_sl_price": float(self.global_sl_price or 0.0),
+            "trail_trigger_level": int(self.trail_trigger_level or 2),
+            "trail_trigger_price": float(self.trail_trigger_price or 0.0),
+            "trail_retracement_pct": float(self.trail_retracement_pct or 0.0080),
+            "max_level_mode": self.max_level_mode,
+            "tp_cooldown_min": round(self._tp_cooldown_ms / 60_000.0, 2),
+            "sl_cooldown_min": round(self._sl_cooldown_ms / 60_000.0, 2),
             "cycle_phase": self.cycle_phase,
             "restart_cooldown_rem_sec": cd_rem_sec,
             "restart_reason": self.restart_reason,

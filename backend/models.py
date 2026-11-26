@@ -147,6 +147,43 @@ class SymbolStrategy(BaseModel):
     bbw_squeeze_percentile: float = Field(
         default=20.0, ge=1.0, le=50.0, allow_inf_nan=False, description="Historical BBW percentile threshold to trigger adaptive trend grid mode"
     )
+    # Reverse Oscillating Grid (REVERSE_GRID) customizable sizing, trailing TP & cooldown parameters
+    rev_l_pcts: str = Field(
+        default="100,50,30,10,5",
+        max_length=320,
+        description="Comma-separated trend-side slot percentages L1..Ln (mirrored S1..Sn in SHORT mode)",
+    )
+    rev_s_pcts: str = Field(
+        default="100,100,50,30,20",
+        max_length=320,
+        description="Comma-separated counter-oscillation slot percentages S1..Sn (mirrored L1..Ln in SHORT mode)",
+    )
+    rev_c_pct: float = Field(
+        default=100.0, ge=0.0, le=1000.0, allow_inf_nan=False, description="Center oscillation slot C/CS size percentage"
+    )
+    rev_tp_cooldown_min: float = Field(
+        default=30.0, ge=0.0, le=10080.0, allow_inf_nan=False, description="Post-TP cycle restart cooldown in minutes"
+    )
+    rev_sl_cooldown_min: float = Field(
+        default=60.0, ge=0.0, le=10080.0, allow_inf_nan=False, description="Post-Global-SL cycle restart cooldown in minutes"
+    )
+    rev_trail_start_level: int = Field(
+        default=2,
+        ge=0,
+        le=30,
+        description="Level index k (1..N, or 0 = outermost Ln/Sn) whose crossing activates group trailing TP",
+    )
+    rev_trail_retracement_pct: float = Field(
+        default=0.0080,
+        ge=0.0005,
+        le=0.50,
+        allow_inf_nan=False,
+        description="Group trailing TP retracement ratio from peak/trough (0.0080 = 0.80%)",
+    )
+    rev_max_level_mode: Literal["CAP_TP", "TRAIL_ONLY"] = Field(
+        default="CAP_TP",
+        description="Outermost Ln/Sn behavior: CAP_TP (close 100% at Ln/Sn) or TRAIL_ONLY (uncapped trailing TP)",
+    )
     is_running: bool = True
     auto_disabled_reason: Optional[str] = None
 
@@ -182,6 +219,14 @@ class BatchSymbolUpdateRequest(BaseModel):
     trend_trailing_mult: Optional[float] = Field(default=None, ge=0.3, le=10.0, allow_inf_nan=False)
     use_post_only_tp: Optional[bool] = None
     sl_trigger_px_type: Optional[Literal["mark", "last"]] = None
+    rev_l_pcts: Optional[str] = Field(default=None, max_length=320)
+    rev_s_pcts: Optional[str] = Field(default=None, max_length=320)
+    rev_c_pct: Optional[float] = Field(default=None, ge=0.0, le=1000.0, allow_inf_nan=False)
+    rev_tp_cooldown_min: Optional[float] = Field(default=None, ge=0.0, le=10080.0, allow_inf_nan=False)
+    rev_sl_cooldown_min: Optional[float] = Field(default=None, ge=0.0, le=10080.0, allow_inf_nan=False)
+    rev_trail_start_level: Optional[int] = Field(default=None, ge=0, le=30)
+    rev_trail_retracement_pct: Optional[float] = Field(default=None, ge=0.0005, le=0.50, allow_inf_nan=False)
+    rev_max_level_mode: Optional[Literal["CAP_TP", "TRAIL_ONLY"]] = None
     auto_fix_anomalies: bool = True
 
 

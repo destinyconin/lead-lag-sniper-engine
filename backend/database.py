@@ -93,6 +93,14 @@ CREATE TABLE IF NOT EXISTS symbol_configs (
     trend_use_bb_breakout BOOLEAN DEFAULT 1,
     bbw_timeframe VARCHAR(8) DEFAULT '15m',
     bbw_squeeze_percentile DECIMAL(6, 2) DEFAULT 20.00,
+    rev_l_pcts TEXT DEFAULT '100,50,30,10,5',
+    rev_s_pcts TEXT DEFAULT '100,100,50,30,20',
+    rev_c_pct DECIMAL(8, 2) DEFAULT 100.00,
+    rev_tp_cooldown_min DECIMAL(10, 2) DEFAULT 30.00,
+    rev_sl_cooldown_min DECIMAL(10, 2) DEFAULT 60.00,
+    rev_trail_start_level INTEGER DEFAULT 2,
+    rev_trail_retracement_pct DECIMAL(8, 6) DEFAULT 0.0080,
+    rev_max_level_mode VARCHAR(16) DEFAULT 'CAP_TP',
     is_running BOOLEAN DEFAULT 1,
     auto_disabled_reason TEXT DEFAULT NULL,
     UNIQUE(user_id, symbol)
@@ -385,6 +393,14 @@ class AsyncDatabaseManager:
             ("bbw_timeframe", "ALTER TABLE symbol_configs ADD COLUMN bbw_timeframe VARCHAR(8) DEFAULT '15m'"),
             ("bbw_squeeze_percentile", "ALTER TABLE symbol_configs ADD COLUMN bbw_squeeze_percentile DECIMAL(6, 2) DEFAULT 20.00"),
             ("sl_trigger_px_type", "ALTER TABLE symbol_configs ADD COLUMN sl_trigger_px_type VARCHAR(8) DEFAULT 'mark'"),
+            ("rev_l_pcts", "ALTER TABLE symbol_configs ADD COLUMN rev_l_pcts TEXT DEFAULT '100,50,30,10,5'"),
+            ("rev_s_pcts", "ALTER TABLE symbol_configs ADD COLUMN rev_s_pcts TEXT DEFAULT '100,100,50,30,20'"),
+            ("rev_c_pct", "ALTER TABLE symbol_configs ADD COLUMN rev_c_pct DECIMAL(8, 2) DEFAULT 100.00"),
+            ("rev_tp_cooldown_min", "ALTER TABLE symbol_configs ADD COLUMN rev_tp_cooldown_min DECIMAL(10, 2) DEFAULT 30.00"),
+            ("rev_sl_cooldown_min", "ALTER TABLE symbol_configs ADD COLUMN rev_sl_cooldown_min DECIMAL(10, 2) DEFAULT 60.00"),
+            ("rev_trail_start_level", "ALTER TABLE symbol_configs ADD COLUMN rev_trail_start_level INTEGER DEFAULT 2"),
+            ("rev_trail_retracement_pct", "ALTER TABLE symbol_configs ADD COLUMN rev_trail_retracement_pct DECIMAL(8, 6) DEFAULT 0.0080"),
+            ("rev_max_level_mode", "ALTER TABLE symbol_configs ADD COLUMN rev_max_level_mode VARCHAR(16) DEFAULT 'CAP_TP'"),
         ]
         for col, ddl in additions:
             if col not in existing:
@@ -727,6 +743,12 @@ class AsyncDatabaseManager:
                     d["bbw_timeframe"] = "15m"
                 if d.get("sl_trigger_px_type") not in ("mark", "last"):
                     d["sl_trigger_px_type"] = "mark"
+                if d.get("rev_max_level_mode") not in ("CAP_TP", "TRAIL_ONLY"):
+                    d["rev_max_level_mode"] = "CAP_TP"
+                if not d.get("rev_l_pcts"):
+                    d["rev_l_pcts"] = "100,50,30,10,5"
+                if not d.get("rev_s_pcts"):
+                    d["rev_s_pcts"] = "100,100,50,30,20"
                 for k, dv in (
                     ("grid_levels", 3),
                     ("grid_step_pct", 0.0080),
@@ -736,6 +758,11 @@ class AsyncDatabaseManager:
                     ("trend_dead_zone_mult", 1.25),
                     ("trend_trailing_mult", 1.25),
                     ("bbw_squeeze_percentile", 20.0),
+                    ("rev_c_pct", 100.0),
+                    ("rev_tp_cooldown_min", 30.0),
+                    ("rev_sl_cooldown_min", 60.0),
+                    ("rev_trail_start_level", 2),
+                    ("rev_trail_retracement_pct", 0.0080),
                 ):
                     if d.get(k) is None:
                         d[k] = dv
@@ -760,8 +787,10 @@ class AsyncDatabaseManager:
                     grid_take_profit_pct, grid_range_pct, grid_stop_loss_pct,
                     grid_recenter_enabled, trend_dead_zone_mult, trend_trailing_mult,
                     trend_pyramid_decay, trend_use_bb_breakout, bbw_timeframe,
-                    bbw_squeeze_percentile, is_running, auto_disabled_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    bbw_squeeze_percentile, rev_l_pcts, rev_s_pcts, rev_c_pct,
+                    rev_tp_cooldown_min, rev_sl_cooldown_min, rev_trail_start_level,
+                    rev_trail_retracement_pct, rev_max_level_mode, is_running, auto_disabled_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, symbol) DO UPDATE SET
                     exchange_id=excluded.exchange_id,
                     strategy_type=excluded.strategy_type,
@@ -803,6 +832,14 @@ class AsyncDatabaseManager:
                     trend_use_bb_breakout=excluded.trend_use_bb_breakout,
                     bbw_timeframe=excluded.bbw_timeframe,
                     bbw_squeeze_percentile=excluded.bbw_squeeze_percentile,
+                    rev_l_pcts=excluded.rev_l_pcts,
+                    rev_s_pcts=excluded.rev_s_pcts,
+                    rev_c_pct=excluded.rev_c_pct,
+                    rev_tp_cooldown_min=excluded.rev_tp_cooldown_min,
+                    rev_sl_cooldown_min=excluded.rev_sl_cooldown_min,
+                    rev_trail_start_level=excluded.rev_trail_start_level,
+                    rev_trail_retracement_pct=excluded.rev_trail_retracement_pct,
+                    rev_max_level_mode=excluded.rev_max_level_mode,
                     is_running=excluded.is_running,
                     auto_disabled_reason=excluded.auto_disabled_reason
                 """,
@@ -849,6 +886,14 @@ class AsyncDatabaseManager:
                     1 if cfg.trend_use_bb_breakout else 0,
                     cfg.bbw_timeframe,
                     cfg.bbw_squeeze_percentile,
+                    str(getattr(cfg, "rev_l_pcts", "100,50,30,10,5") or "100,50,30,10,5"),
+                    str(getattr(cfg, "rev_s_pcts", "100,100,50,30,20") or "100,100,50,30,20"),
+                    float(getattr(cfg, "rev_c_pct", 100.0)),
+                    float(getattr(cfg, "rev_tp_cooldown_min", 30.0)),
+                    float(getattr(cfg, "rev_sl_cooldown_min", 60.0)),
+                    int(getattr(cfg, "rev_trail_start_level", 2)),
+                    float(getattr(cfg, "rev_trail_retracement_pct", 0.0080)),
+                    str(getattr(cfg, "rev_max_level_mode", "CAP_TP") or "CAP_TP"),
                     1 if cfg.is_running else 0,
                     cfg.auto_disabled_reason,
                 ),

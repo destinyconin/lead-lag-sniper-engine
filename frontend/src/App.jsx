@@ -189,23 +189,49 @@ function resolveStrategyStateMachine(cfg, tel) {
     else activeKey = 'ANCHOR';
 
     const lockLabel = lockedMode === 'LONG' ? '多头模式(锁定)' : lockedMode === 'SHORT' ? '空头模式(锁定)' : '待锁定方向';
-    subtitle = `${lockLabel} · 步长 ${stepPct}% · 全局止损 ${slPct}% · 递减 50/30/10%`;
+    const nLvls = Math.max(1, Math.round(Number(cfg?.grid_levels ?? 5) || 5));
+    const rawTrig = Number(cfg?.rev_trail_start_level ?? 2);
+    const effTrigLvl = rawTrig <= 0 || rawTrig > nLvls ? nLvls : Math.round(rawTrig);
+    const retrPctVal = Number(grid?.trail_retracement_pct ?? cfg?.rev_trail_retracement_pct ?? 0.008) * 100;
+    const tpCdMin = Number(grid?.tp_cooldown_min ?? cfg?.rev_tp_cooldown_min ?? 30);
+    const slCdMin = Number(grid?.sl_cooldown_min ?? cfg?.rev_sl_cooldown_min ?? 60);
+    const dynPipeline = pipeline.map((stItem) => {
+      if (stItem.key === 'TRAILING') {
+        return { ...stItem, desc: `过L${effTrigLvl}/S${effTrigLvl}·回撤${retrPctVal.toFixed(2)}%` };
+      }
+      if (stItem.key === 'COOLDOWN') {
+        return { ...stItem, desc: `止盈${tpCdMin}m·止损${slCdMin}m` };
+      }
+      return stItem;
+    });
+    subtitle = `${lockLabel} · 步长 ${stepPct}% · 过L${effTrigLvl}/S${effTrigLvl}启移动止盈(${retrPctVal.toFixed(2)}%) · 全局止损 ${slPct}%`;
     metrics = [
       { label: '网格中枢 / 锁定', value: `${fmtPx(centerPx)} · ${lockedMode === 'LONG' ? '多' : lockedMode === 'SHORT' ? '空' : 'NONE'}`, tone: lockedMode !== 'NONE' ? 'emerald' : 'main' },
       { label: '在途槽位 (多/空)', value: `${openLong} 多 / ${openShort} 空`, tone: openLong + openShort > 0 ? 'emerald' : 'main' },
       {
-        label: groupTrailActive ? 'L/S组追踪线 / 均价' : cdRemSec > 0 ? '重启冷却倒计时' : '顶格全平 / 全局止损',
+        label: groupTrailActive ? 'L/S组追踪线 / 均价' : cdRemSec > 0 ? '重启冷却倒计时' : fullTpPx > 0 ? '顶格全平 / 全局止损' : '追踪触发 / 全局止损',
         value: groupTrailActive
           ? `${fmtPx(liveTrailPx)} (均 ${fmtPx(groupVwap || groupFloor)})`
           : cdRemSec > 0
-          ? `${Math.ceil(cdRemSec)}s (${grid?.restart_reason === 'GLOBAL_SL_COOLDOWN' ? '止损长冷' : '止盈冷却'})`
-          : fullTpPx > 0
-          ? `${fmtPx(fullTpPx)} / ${fmtPx(globalSlPx)}`
+          ? `${Math.ceil(cdRemSec)}s (${grid?.restart_reason === 'GLOBAL_SL_COOLDOWN' ? '止损冷却' : '止盈冷却'})`
+          : lockedMode !== 'NONE'
+          ? `${fullTpPx > 0 ? fmtPx(fullTpPx) : `${ fmtPx(grid?.trail_trigger_price) }(不封顶)`} / ${fmtPx(globalSlPx)}`
           : `L1/S1 待触发`,
         tone: groupTrailActive ? 'emerald' : cdRemSec > 0 ? 'amber' : 'sky',
       },
       { label: `套利闭环 (${cycles}轮)`, value: fmtSigned(gridNetPnl), tone: gridNetPnl >= 0 ? 'emerald' : 'rose' },
     ];
+    const activeIdxRev = Math.max(0, dynPipeline.findIndex((p) => p.key === activeKey));
+    return {
+      strategyType: st,
+      pipeline: dynPipeline,
+      activeKey,
+      activeIdx: activeIdxRev,
+      isUncertain: rawState === 'EXIT_UNCERTAIN',
+      gridColsClass: 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-6',
+      subtitle,
+      metrics,
+    };
   } else if (st === 'TREND_GRID') {
     const hasBeProtected = openSlots.some((lv) => {
       const ep = Number(lv.entry_price || 0);
@@ -369,6 +395,33 @@ const suggestLinkedGridRange = (levels, stepRatio) => {
   return Math.min(0.8, Math.ceil(buffered * 1000) / 1000);
 };
 
+const DEFAULT_REV_L_PCTS = [100, 50, 30, 10, 5];
+const DEFAULT_REV_S_PCTS = [100, 100, 50, 30, 20];
+
+const parseLevelPctArray = (rawStr, count, fallbackArr, minFirst = 0) => {
+  const n = Math.max(1, Math.min(30, Math.round(Number(count) || 1)));
+  const out = [];
+  if (rawStr !== undefined && rawStr !== null && String(rawStr).trim() !== '') {
+    String(rawStr)
+      .trim()
+      .split(/[,;，；\s]+/)
+      .forEach((tok) => {
+        const clean = tok.replace('%', '').trim();
+        if (!clean) return;
+        const v = Number(clean);
+        if (Number.isFinite(v)) {
+          out.push(Math.max(0, Math.min(1000, Number(v.toFixed(2)))));
+        }
+      });
+  }
+  const base = out.length > 0 ? out : [...fallbackArr];
+  base[0] = Math.max(minFirst, base[0]);
+  while (base.length < n) {
+    base.push(base[base.length - 1]);
+  }
+  return base.slice(0, n);
+};
+
 const buildGridPreviewAndDiagnostics = (cfg, okxMinNotional = 0, followerMid = 0) => {
   const n = Math.max(1, Math.min(30, Math.round(Number(cfg.grid_levels ?? 3) || 3)));
   const step = Math.max(0.0001, Number(cfg.grid_step_pct ?? 0.008) || 0.008);
@@ -380,44 +433,127 @@ const buildGridPreviewAndDiagnostics = (cfg, okxMinNotional = 0, followerMid = 0
   const dzMult = Math.max(0.5, Number(cfg.trend_dead_zone_mult ?? 1.25) || 1.25);
   const st = cfg.strategy_type || 'LONG_SHORT_GRID';
   const isTrendLike = st === 'TREND_GRID' || st === 'ADAPTIVE_GRID';
+  const isRev = st === 'REVERSE_GRID';
   const decay = Boolean(cfg.trend_pyramid_decay ?? true);
   const usePo = Boolean(cfg.use_post_only_tp ?? true);
   const effRtFee = usePo && st !== 'TREND_GRID' ? 0.0007 : 0.001;
 
   const totalSpan = n * step;
-  const sideBudget = orderUsdt * n;
+  const revLPcts = parseLevelPctArray(cfg.rev_l_pcts, n, DEFAULT_REV_L_PCTS, 1);
+  const revSPcts = parseLevelPctArray(cfg.rev_s_pcts, n, DEFAULT_REV_S_PCTS, 0);
+  const revCPct = Math.max(0, Math.min(1000, Number(cfg.rev_c_pct ?? 100)));
+  const rawRevStart = Number(cfg.rev_trail_start_level ?? 2);
+  const revEffTrigLvl = rawRevStart <= 0 || rawRevStart > n ? n : Math.round(rawRevStart);
+  const revCapAtMax = (cfg.rev_max_level_mode || 'CAP_TP') === 'CAP_TP' && revEffTrigLvl < n && n >= 2;
+
+  let legs = [];
+  let sideBudget = orderUsdt * n;
+  if (isRev) {
+    // Build combined preview of Q/L2..Ln and C/S1..Sn active non-zero legs
+    const pyrEnd = revCapAtMax ? n - 1 : n;
+    for (let i = 1; i <= pyrEnd; i += 1) {
+      const pct = revLPcts[i - 1];
+      if (pct <= 0) continue;
+      const legUsdt = Number(((orderUsdt * pct) / 100).toFixed(2));
+      legs.push({
+        slot: i === 1 ? 'Q(L1)' : `L${i}`,
+        levelIdx: i,
+        weightPct: pct,
+        usdt: legUsdt,
+        mrDistPct: i * step,
+        clippedInMr: false,
+        belowMin: okxMinNotional > 0 && legUsdt < okxMinNotional * 1.02,
+      });
+    }
+    if (revCPct > 0) {
+      const cUsdt = Number(((orderUsdt * revCPct) / 100).toFixed(2));
+      legs.push({
+        slot: 'C',
+        levelIdx: 0,
+        weightPct: revCPct,
+        usdt: cUsdt,
+        mrDistPct: 0,
+        clippedInMr: false,
+        belowMin: okxMinNotional > 0 && cUsdt < okxMinNotional * 1.02,
+      });
+    }
+    for (let i = 1; i <= n; i += 1) {
+      const pct = revSPcts[i - 1];
+      if (pct <= 0) continue;
+      const legUsdt = Number(((orderUsdt * pct) / 100).toFixed(2));
+      legs.push({
+        slot: `S${i}`,
+        levelIdx: i,
+        weightPct: pct,
+        usdt: legUsdt,
+        mrDistPct: i * step,
+        clippedInMr: false,
+        belowMin: okxMinNotional > 0 && legUsdt < okxMinNotional * 1.02,
+      });
+    }
+    // Max simultaneous dip exposure = Q(L1) + C + S1..Sn (plus any L2..L_{trig-1} if trig > 2)
+    const oscSumPct =
+      revLPcts[0] +
+      revCPct +
+      revSPcts.reduce((a, b) => a + b, 0) +
+      revLPcts.slice(1, Math.max(1, revEffTrigLvl - 1)).reduce((a, b) => a + b, 0);
+    sideBudget = (orderUsdt * oscSumPct) / 100;
+  } else {
+    const weights = isTrendLike ? calcPyramidWeights(n, decay) : Array.from({ length: n }, () => 1 / n);
+    legs = weights.map((w, idx) => {
+      const levelIdx = idx + 1;
+      const legUsdt = isTrendLike && decay ? Number((sideBudget * w).toFixed(2)) : Number(orderUsdt.toFixed(2));
+      const mrDistPct = levelIdx * step;
+      const clippedInMr = st !== 'TREND_GRID' && levelIdx > 1 && mrDistPct > rng + 1e-6;
+      const belowMin = okxMinNotional > 0 && legUsdt < okxMinNotional * 1.02;
+      return {
+        slot: `L${levelIdx}`,
+        levelIdx,
+        weightPct: Number((w * 100).toFixed(1)),
+        usdt: legUsdt,
+        mrDistPct,
+        clippedInMr,
+        belowMin,
+      };
+    });
+  }
+  if (legs.length === 0) {
+    legs.push({ slot: 'L1', levelIdx: 1, weightPct: 100, usdt: orderUsdt, mrDistPct: step, clippedInMr: false, belowMin: false });
+  }
   const sideMargin = sideBudget / lev;
-  const weights = isTrendLike ? calcPyramidWeights(n, decay) : Array.from({ length: n }, () => 1 / n);
-  const legs = weights.map((w, idx) => {
-    const levelIdx = idx + 1;
-    const legUsdt = isTrendLike && decay ? Number((sideBudget * w).toFixed(2)) : Number(orderUsdt.toFixed(2));
-    const mrDistPct = levelIdx * step;
-    const clippedInMr = st !== 'TREND_GRID' && levelIdx > 1 && mrDistPct > rng + 1e-6;
-    const belowMin = okxMinNotional > 0 && legUsdt < okxMinNotional * 1.02;
-    return {
-      slot: `L${levelIdx}`,
-      levelIdx,
-      weightPct: Number((w * 100).toFixed(1)),
-      usdt: legUsdt,
-      mrDistPct,
-      clippedInMr,
-      belowMin,
-    };
-  });
 
   const activeMrLegs = legs.filter((l) => !l.clippedInMr);
   const thinnestLeg = legs.reduce((minL, l) => (l.usdt < minL.usdt ? l : minL), legs[0]);
-  // Estimate worst-case full-side stop-loss loss in USDT (average entry to center +/- SL in MR mode, per-slot SL in REVERSE_GRID, or full budget * SL)
+  // Exact worst-case Global SL loss for REVERSE_GRID (all dip slots + Q + any un-trailed pyramid legs stopping at S_n*(1-sl))
+  let revWorstLoss = 0;
+  if (isRev) {
+    const gslRatio = Math.max(0.05, 1 - n * step) * Math.max(0.05, 1 - sl);
+    // Q at 1 + step
+    const qNotional = (orderUsdt * revLPcts[0]) / 100;
+    revWorstLoss += qNotional * Math.max(0, (1 + step - gslRatio) / (1 + step) + 0.001);
+    // Any L2..L_{trig-1} that could open before trailing starts and ride down to Global SL
+    for (let i = 2; i < revEffTrigLvl; i += 1) {
+      const u = (orderUsdt * (revLPcts[i - 1] || 0)) / 100;
+      const ep = 1 + i * step;
+      revWorstLoss += u * Math.max(0, (ep - gslRatio) / ep + 0.001);
+    }
+    // C at 1.0
+    if (revCPct > 0) {
+      const u = (orderUsdt * revCPct) / 100;
+      revWorstLoss += u * Math.max(0, 1 - gslRatio + 0.001);
+    }
+    // S1..Sn at 1 - i*step
+    for (let i = 1; i <= n; i += 1) {
+      const u = (orderUsdt * (revSPcts[i - 1] || 0)) / 100;
+      const ep = Math.max(0.05, 1 - i * step);
+      revWorstLoss += u * Math.max(0, (ep - gslRatio) / ep + 0.001);
+    }
+  }
   const worstSlLossUsdt =
     st === 'TREND_GRID'
-      ? Number((orderUsdt * n * weights[0] * Math.min(sl, dzMult * step) + sideBudget * 0.001).toFixed(2))
-      : st === 'REVERSE_GRID'
-      ? Number(
-          (
-            activeMrLegs.reduce((acc, l) => acc + l.usdt * sl, 0) +
-            activeMrLegs.reduce((acc, l) => acc + l.usdt, 0) * 0.001
-          ).toFixed(2)
-        )
+      ? Number((orderUsdt * n * calcPyramidWeights(n, decay)[0] * Math.min(sl, dzMult * step) + sideBudget * 0.001).toFixed(2))
+      : isRev
+      ? Number(revWorstLoss.toFixed(2))
       : Number(
           (
             activeMrLegs.reduce((acc, l) => acc + l.usdt * Math.max(0, sl - l.mrDistPct), 0) +
@@ -425,15 +561,18 @@ const buildGridPreviewAndDiagnostics = (cfg, okxMinNotional = 0, followerMid = 0
           ).toFixed(2)
         );
   const slRoePct = Number((sl * lev * 100).toFixed(1));
+  const minWeightRatio = Math.max(0.0001, (thinnestLeg?.weightPct || 100) / 100);
   const minSuggestedOrderUsdt =
-    okxMinNotional > 0 && isTrendLike && decay && weights.length > 0
-      ? Math.ceil((okxMinNotional * 1.08) / (n * Math.min(...weights)))
+    okxMinNotional > 0 && isRev
+      ? Math.ceil((okxMinNotional * 1.08) / minWeightRatio)
+      : okxMinNotional > 0 && isTrendLike && decay
+      ? Math.ceil((okxMinNotional * 1.08) / (n * Math.min(...calcPyramidWeights(n, decay))))
       : okxMinNotional > 0
       ? Math.ceil(okxMinNotional * 1.08)
       : 0;
 
   const alerts = [];
-  if (st !== 'TREND_GRID' && totalSpan > rng + 1e-6) {
+  if (st !== 'TREND_GRID' && st !== 'REVERSE_GRID' && totalSpan > rng + 1e-6) {
     alerts.push({
       severity: 'error',
       msg: `层数×间距 (${n}×${(step * 100).toFixed(2)}%=${(totalSpan * 100).toFixed(2)}%) 超出区间总跨度 ±${(
@@ -441,16 +580,22 @@ const buildGridPreviewAndDiagnostics = (cfg, okxMinNotional = 0, followerMid = 0
       ).toFixed(2)}%，外层 ${n - activeMrLegs.length} 格会被裁切不铺`,
     });
   }
-  if (st !== 'TREND_GRID' && tp < step - 1e-6) {
+  if (st !== 'TREND_GRID' && st !== 'REVERSE_GRID' && tp < step - 1e-6) {
     alerts.push({
       severity: 'error',
       msg: `单格止盈 (${(tp * 100).toFixed(2)}%) 低于每格间距 (${(step * 100).toFixed(2)}%)，存在止盈倒挂`,
     });
   }
-  if (st !== 'TREND_GRID' && tp <= effRtFee) {
+  if (st !== 'TREND_GRID' && st !== 'REVERSE_GRID' && tp <= effRtFee) {
     alerts.push({
       severity: 'error',
       msg: `单格止盈 (${(tp * 100).toFixed(2)}%) 未覆盖双边手续费 (${(effRtFee * 100).toFixed(2)}%)`,
+    });
+  }
+  if (isRev && step <= effRtFee) {
+    alerts.push({
+      severity: 'error',
+      msg: `每格间距 (${(step * 100).toFixed(2)}%) 未覆盖双边手续费 (${(effRtFee * 100).toFixed(2)}%)，逆向格卖出一格将净亏损`,
     });
   }
   if ((st === 'LONG_SHORT_GRID' || st === 'ADAPTIVE_GRID') && sl <= rng + 1e-6) {
@@ -462,7 +607,19 @@ const buildGridPreviewAndDiagnostics = (cfg, okxMinNotional = 0, followerMid = 0
   if (st === 'REVERSE_GRID' && sl <= step + 1e-6) {
     alerts.push({
       severity: 'error',
-      msg: `单格硬止损 (${(sl * 100).toFixed(2)}%) ≤ 每格间距 (${(step * 100).toFixed(2)}%)，轻微回撤即触发止损`,
+      msg: `全局止损距离 (${(sl * 100).toFixed(2)}%) ≤ 每格间距 (${(step * 100).toFixed(2)}%)，距离 S${n}/L${n} 过近易误扫清仓`,
+    });
+  }
+  if (isRev && revEffTrigLvl > 2 && revLPcts.slice(1, revEffTrigLvl - 1).some((p) => p > 0)) {
+    alerts.push({
+      severity: 'warn',
+      msg: `当前设为穿过 L${revEffTrigLvl}/S${revEffTrigLvl} 才启动移动止盈：若行情冲至 L2~L${revEffTrigLvl - 1} 加仓后未触及 L${revEffTrigLvl} 即掉头回落，高位顺势加仓单将无追踪保护并与下方 C/S 抄底仓叠加（若不想高位叠加，可将 L2~L${revEffTrigLvl - 1} 设为 0% 或改回 L2 启动）`,
+    });
+  }
+  if (isRev && n >= 2 && revLPcts[1] > revLPcts[0]) {
+    alerts.push({
+      severity: 'warn',
+      msg: `顺势档 L2 (${revLPcts[1]}%) 高于底仓 L1 (${revLPcts[0]}%) 属倒金字塔加仓，会显著抬高整组加权均价`,
     });
   }
   if (isTrendLike && dzMult * step > rng + 1e-6) {
@@ -5158,9 +5315,9 @@ export default function App() {
                       const isAdaptiveGrid = st === 'ADAPTIVE_GRID';
                       const isReverseGrid = st === 'REVERSE_GRID';
                       const isLongShortGrid = st === 'LONG_SHORT_GRID';
-                      const showFixedTpInput = !isTrendGrid;
-                      const showRangeInput = !isTrendGrid || Boolean(currentStrategy.grid_recenter_enabled ?? true);
-                      const showMrRangeFittingButtons = !isTrendGrid;
+                      const showFixedTpInput = isLongShortGrid || isAdaptiveGrid;
+                      const showRangeInput = (!isTrendGrid && !isReverseGrid) || Boolean(currentStrategy.grid_recenter_enabled ?? true);
+                      const showMrRangeFittingButtons = isLongShortGrid || isAdaptiveGrid;
                       const showMakerPostOnlySwitch = !isTrendGrid;
                       const showBbwSqueezePercentile = isAdaptiveGrid;
                       const symTel = snapshot?.telemetry?.[currentStrategy.symbol] || {};
@@ -5301,11 +5458,7 @@ export default function App() {
                           {showFixedTpInput && (
                             <div>
                               <label className="font-bold text-main block mb-2">
-                                {isReverseGrid
-                                  ? '多空震荡单格止盈目标 (%)'
-                                  : isAdaptiveGrid
-                                  ? '震荡阶段单格止盈目标 (%)'
-                                  : '传统网格单格止盈目标 (%)'}
+                                {isAdaptiveGrid ? '震荡阶段单格止盈目标 (%)' : '传统网格单格止盈目标 (%)'}
                               </label>
                               <PercentNumberInput
                                 step="0.05"
@@ -5320,10 +5473,29 @@ export default function App() {
                             </div>
                           )}
 
+                          {isReverseGrid && (
+                            <div>
+                              <label className="font-bold text-main block mb-2">
+                                组移动止盈回撤百分比 (%)
+                              </label>
+                              <PercentNumberInput
+                                step="0.05"
+                                valueRatio={currentStrategy.rev_trail_retracement_pct ?? 0.008}
+                                defaultRatio={0.008}
+                                onChangeRatio={(v) =>
+                                  updateCurrentStrategyField({ rev_trail_retracement_pct: v })
+                                }
+                              />
+                              <div className="text-[10px] text-dim mt-1 leading-snug">
+                                激活移动止盈后从极值回撤该比例（且不破组加权保底价）即 100% 全平
+                              </div>
+                            </div>
+                          )}
+
                           {showRangeInput && (
                             <div>
                               <label className="font-bold text-main block mb-2">
-                                {isTrendGrid ? '空仓自动重锚触发跨度 ±(%)' : '铺网区间总跨度 ±(%)'}
+                                {isTrendGrid || isReverseGrid ? '空仓自动重锚触发跨度 ±(%)' : '铺网区间总跨度 ±(%)'}
                               </label>
                               <PercentNumberInput
                                 step="0.1"
@@ -5369,7 +5541,7 @@ export default function App() {
                           <div>
                             <label className="font-bold text-main block mb-2">
                               {isReverseGrid
-                                ? '单格硬止损上限 (% · 相对开仓价)'
+                                ? `全局止损距离 (% · 最末档 S${gridDiag.n}下方 / L${gridDiag.n}上方)`
                                 : isTrendGrid
                                 ? '首格硬止损 (% · 相对开仓价)'
                                 : '破网硬止损上限 (% · 相对中枢价)'}
@@ -5377,13 +5549,13 @@ export default function App() {
                             <PercentNumberInput
                               step="0.2"
                               valueRatio={currentStrategy.grid_stop_loss_pct}
-                              defaultRatio={isTrendGrid ? 0.03 : 0.038}
+                              defaultRatio={isReverseGrid ? 0.05 : isTrendGrid ? 0.03 : 0.038}
                               onChangeRatio={(v) => updateGridParamWithLinkage('grid_stop_loss_pct', v)}
                             />
                             <div className="text-[10px] text-amber-600 dark:text-amber-300 mt-1 leading-snug">
-                              当前 {currentStrategy.leverage ?? 5}x 杠杆 → 保证金止损 ≈{' '}
-                              {gridDiag.slRoePct.toFixed(1)}%
-                              （如欲控制保证金止损 15%，此处设 {(15 / Math.max(1, currentStrategy.leverage ?? 5)).toFixed(2)}%）
+                              {isReverseGrid
+                                ? `触发时 100% 清空在途槽位并进入 ${currentStrategy.rev_sl_cooldown_min ?? 60} 分钟止损冷却（${currentStrategy.leverage ?? 5}x 杠杆外推幅度≈${gridDiag.slRoePct.toFixed(1)}%）`
+                                : `当前 ${currentStrategy.leverage ?? 5}x 杠杆 → 保证金止损 ≈ ${gridDiag.slRoePct.toFixed(1)}%（如欲控制保证金止损 15%，此处设 ${(15 / Math.max(1, currentStrategy.leverage ?? 5)).toFixed(2)}%）`}
                             </div>
                           </div>
 
@@ -5493,7 +5665,7 @@ export default function App() {
                           </div>
 
                           <div className="flex flex-wrap gap-1.5 pt-0.5">
-                            {gridDiag.legs.slice(0, 10).map((lg) => (
+                            {gridDiag.legs.slice(0, 12).map((lg) => (
                               <span
                                 key={lg.slot}
                                 className={`px-2.5 py-1 rounded-full font-mono text-[11px] font-semibold ${
@@ -5503,19 +5675,371 @@ export default function App() {
                                 }`}
                               >
                                 {lg.slot}: {lg.usdt.toFixed(1)}U
-                                {(isTrendGrid || isAdaptiveGrid) && (currentStrategy.trend_pyramid_decay ?? true)
+                                {isReverseGrid || ((isTrendGrid || isAdaptiveGrid) && (currentStrategy.trend_pyramid_decay ?? true))
                                   ? ` (${lg.weightPct}%)`
                                   : ` (±${(lg.mrDistPct * 100).toFixed(2)}%)`}
                                 {lg.clippedInMr ? ' [被裁切]' : lg.belowMin ? ' [不足最小额]' : ''}
                               </span>
                             ))}
-                            {gridDiag.legs.length > 10 && (
+                            {gridDiag.legs.length > 12 && (
                               <span className="px-2 py-1 text-[11px] text-dim">
-                                ...共 {gridDiag.legs.length} 层
+                                ...共 {gridDiag.legs.length} 个有效槽位
                               </span>
                             )}
                           </div>
                         </div>
+
+                        {/* Reverse Oscillating Grid Dedicated Customizable Parameters Panel */}
+                        {isReverseGrid && (() => {
+                          const revN = Math.max(1, Math.min(30, Math.round(Number(currentStrategy.grid_levels ?? 5) || 5)));
+                          const curLPcts = parseLevelPctArray(
+                            currentStrategy.rev_l_pcts,
+                            revN,
+                            DEFAULT_REV_L_PCTS,
+                            1
+                          );
+                          const curSPcts = parseLevelPctArray(
+                            currentStrategy.rev_s_pcts,
+                            revN,
+                            DEFAULT_REV_S_PCTS,
+                            0
+                          );
+                          const rawTrigVal = Number(currentStrategy.rev_trail_start_level ?? 2);
+                          const effTrig = rawTrigVal <= 0 || rawTrigVal > revN ? revN : Math.round(rawTrigVal);
+                          const effMaxMode =
+                            effTrig >= revN ? 'TRAIL_ONLY' : currentStrategy.rev_max_level_mode || 'CAP_TP';
+
+                          const updateLevelPctAt = (fieldKey, curArr, idx, nextNum, minZeroIdx = 0) => {
+                            const updated = [...curArr];
+                            const safeVal = Math.max(
+                              idx === 0 ? minZeroIdx : 0,
+                              Math.min(1000, Number.isFinite(nextNum) ? Number(nextNum.toFixed(1)) : 0)
+                            );
+                            updated[idx] = safeVal;
+                            updateCurrentStrategyField({ [fieldKey]: updated.join(',') });
+                          };
+
+                          return (
+                            <div className="p-4 rounded-2xl border border-teal-500/25 bg-teal-500/[0.04] space-y-4 text-xs">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <div>
+                                  <div className="font-bold text-main flex items-center gap-1.5">
+                                    <Sliders className="w-3.5 h-3.5 shrink-0 text-teal-600 dark:text-teal-400" strokeWidth={1.75} />
+                                    <span>
+                                      多空震荡网格自定义参数（L1~L{revN} 与 S1~S{revN} 百分比 · 穿过启动移动止盈 · 止盈/止损冷却）
+                                    </span>
+                                  </div>
+                                  <div className="text-[11px] text-dim mt-0.5">
+                                    做多与做空模式完全镜像：先破 L1 锁多（或先破 S1 锁空）；支持自定义每一档仓位比例、穿过指定档位（如 L{revN}/S{revN} 或 L2/S2）启动移动止盈及周期结束冷却时间
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Row 1: Trailing Start Level, Max-Level Mode, Center C%, Cooldowns */}
+                              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3.5">
+                                <div>
+                                  <label className="font-bold text-main block mb-1.5">
+                                    穿过哪一档启动移动止盈
+                                  </label>
+                                  <select
+                                    value={rawTrigVal <= 0 ? 0 : effTrig}
+                                    onChange={(e) => {
+                                      const v = Number(e.target.value);
+                                      const patch = { rev_trail_start_level: v };
+                                      if (v === 0 || v >= revN) {
+                                        patch.rev_max_level_mode = 'TRAIL_ONLY';
+                                      }
+                                      updateCurrentStrategyField(patch);
+                                    }}
+                                    className="input-field font-semibold"
+                                  >
+                                    <option value={0}>
+                                      穿过最末档 L{revN} / S{revN} 启动 (跟随顶格·不封顶)
+                                    </option>
+                                    {Array.from({ length: revN }, (_, i) => i + 1).map((k) => (
+                                      <option key={k} value={k}>
+                                        穿过第 {k} 档 (L{k} / S{k}) 启动移动止盈
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <div className="text-[10px] text-dim mt-1">
+                                    当前生效：穿过{' '}
+                                    <span className="font-mono font-bold text-main">
+                                      L{effTrig} / S{effTrig} (±{(effTrig * (currentStrategy.grid_step_pct ?? 0.006) * 100).toFixed(2)}%)
+                                    </span>{' '}
+                                    激活
+                                  </div>
+                                </div>
+
+                                <div>
+                                  <label className="font-bold text-main block mb-1.5">
+                                    顶格 L{revN} / S{revN} 止盈模式
+                                  </label>
+                                  <select
+                                    disabled={effTrig >= revN}
+                                    value={effMaxMode}
+                                    onChange={(e) =>
+                                      updateCurrentStrategyField({ rev_max_level_mode: e.target.value })
+                                    }
+                                    className="input-field font-semibold disabled:opacity-60"
+                                  >
+                                    <option value="TRAIL_ONLY">
+                                      突破顶格不封顶 · 按移动止盈回撤 100% 全平
+                                    </option>
+                                    <option value="CAP_TP">
+                                      触及顶格 L{revN}/S{revN} 立即 100% 止盈全平
+                                    </option>
+                                  </select>
+                                  <div className="text-[10px] text-dim mt-1">
+                                    {effMaxMode === 'TRAIL_ONLY'
+                                      ? `L1~L${revN} 均可建仓，利润上不封顶，回撤 ${((currentStrategy.rev_trail_retracement_pct ?? 0.008) * 100).toFixed(2)}% 全平`
+                                      : `L2~L${Math.max(2, revN - 1)} 建仓，涨到 L${revN} 直接止盈清仓`}
+                                  </div>
+                                </div>
+
+                                <div>
+                                  <label className="font-bold text-main block mb-1.5">
+                                    中枢 C / C&apos; 档仓位 (%)
+                                  </label>
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    max={1000}
+                                    step={5}
+                                    value={currentStrategy.rev_c_pct ?? 100}
+                                    onChange={(e) =>
+                                      updateCurrentStrategyField({
+                                        rev_c_pct: Math.max(0, Math.min(1000, Number(e.target.value) || 0)),
+                                      })
+                                    }
+                                    className="input-field font-mono"
+                                  />
+                                  <div className="text-[10px] text-dim mt-1">
+                                    约 {(((currentStrategy.order_usdt ?? 100) * (currentStrategy.rev_c_pct ?? 100)) / 100).toFixed(1)}U（无底仓回升 L1 原地转 Q）
+                                  </div>
+                                </div>
+
+                                <div>
+                                  <label className="font-bold text-main block mb-1.5">
+                                    止盈结束冷却时间 (分钟)
+                                  </label>
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    max={10080}
+                                    step={1}
+                                    value={currentStrategy.rev_tp_cooldown_min ?? 30}
+                                    onChange={(e) =>
+                                      updateCurrentStrategyField({
+                                        rev_tp_cooldown_min: Math.max(0, Number(e.target.value) || 0),
+                                      })
+                                    }
+                                    className="input-field font-mono"
+                                  />
+                                  <div className="flex flex-wrap gap-1 mt-1">
+                                    {[0, 5, 15, 30, 60].map((m) => (
+                                      <button
+                                        key={m}
+                                        type="button"
+                                        onClick={() => updateCurrentStrategyField({ rev_tp_cooldown_min: m })}
+                                        className="px-1.5 py-0.5 rounded surface-card text-[10px] font-mono text-sub hover:text-main"
+                                      >
+                                        {m}m
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+
+                                <div>
+                                  <label className="font-bold text-main block mb-1.5">
+                                    全局止损结束冷却 (分钟)
+                                  </label>
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    max={10080}
+                                    step={5}
+                                    value={currentStrategy.rev_sl_cooldown_min ?? 60}
+                                    onChange={(e) =>
+                                      updateCurrentStrategyField({
+                                        rev_sl_cooldown_min: Math.max(0, Number(e.target.value) || 0),
+                                      })
+                                    }
+                                    className="input-field font-mono"
+                                  />
+                                  <div className="flex flex-wrap gap-1 mt-1">
+                                    {[15, 30, 60, 180, 360].map((m) => (
+                                      <button
+                                        key={m}
+                                        type="button"
+                                        onClick={() => updateCurrentStrategyField({ rev_sl_cooldown_min: m })}
+                                        className="px-1.5 py-0.5 rounded surface-card text-[10px] font-mono text-sub hover:text-main"
+                                      >
+                                        {m >= 60 ? `${m / 60}h` : `${m}m`}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Row 2: L1..Ln Trend-Side Slot Percentages */}
+                              <div className="surface-card p-3.5 rounded-xl space-y-2.5">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <div>
+                                    <span className="font-bold text-main">
+                                      顺势方向 L1 ~ L{revN} 各档仓位百分比 (%)
+                                    </span>
+                                    <span className="text-[11px] text-dim ml-2">
+                                      （做多为 L1 底仓 Q + L2..L{revN} 加仓；做空镜像为 S1 底仓 Q&apos; + S2..S{revN} 加空；设 0% 则该档不加仓）
+                                    </span>
+                                  </div>
+                                  <div className="flex flex-wrap gap-1.5">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateCurrentStrategyField({ rev_l_pcts: '100,50,30,10,5' })
+                                      }
+                                      className="px-2.5 py-1 rounded-full surface-subtle text-[10px] font-semibold text-sub hover:text-main"
+                                    >
+                                      默认递减 (100/50/30/10/5%)
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateCurrentStrategyField({ rev_l_pcts: '100,0' })
+                                      }
+                                      className="px-2.5 py-1 rounded-full surface-subtle text-[10px] font-semibold text-sub hover:text-main"
+                                    >
+                                      仅底仓不追单 (100/0%...)
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateCurrentStrategyField({ rev_l_pcts: '100' })
+                                      }
+                                      className="px-2.5 py-1 rounded-full surface-subtle text-[10px] font-semibold text-sub hover:text-main"
+                                    >
+                                      全部 100%
+                                    </button>
+                                  </div>
+                                </div>
+                                <div className="grid grid-cols-2 sm:grid-cols-5 lg:grid-cols-10 gap-2">
+                                  {curLPcts.map((pctVal, idx) => {
+                                    const lvlNum = idx + 1;
+                                    const isCappedTop = effMaxMode === 'CAP_TP' && lvlNum === revN && revN >= 2;
+                                    return (
+                                      <div key={`rev-l-${lvlNum}`} className="surface-subtle p-2 rounded-xl">
+                                        <div className="flex items-center justify-between text-[10px] font-mono mb-1">
+                                          <span className="font-bold text-main">
+                                            {lvlNum === 1 ? 'L1(底Q)' : `L${lvlNum}`}
+                                          </span>
+                                          <span className="text-dim">
+                                            {isCappedTop
+                                              ? '顶格平'
+                                              : `${(((currentStrategy.order_usdt ?? 100) * pctVal) / 100).toFixed(0)}U`}
+                                          </span>
+                                        </div>
+                                        <input
+                                          type="number"
+                                          min={lvlNum === 1 ? 1 : 0}
+                                          max={1000}
+                                          step={5}
+                                          disabled={isCappedTop}
+                                          value={isCappedTop ? 0 : pctVal}
+                                          onChange={(e) =>
+                                            updateLevelPctAt(
+                                              'rev_l_pcts',
+                                              curLPcts,
+                                              idx,
+                                              Number(e.target.value),
+                                              1
+                                            )
+                                          }
+                                          className="w-full input-field !py-1.5 !px-2 font-mono text-xs disabled:opacity-50"
+                                        />
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+
+                              {/* Row 3: S1..Sn Counter-Oscillation Slot Percentages */}
+                              <div className="surface-card p-3.5 rounded-xl space-y-2.5">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <div>
+                                    <span className="font-bold text-main">
+                                      逆向震荡 S1 ~ S{revN} 各档仓位百分比 (%)
+                                    </span>
+                                    <span className="text-[11px] text-dim ml-2">
+                                      （做多为下方 S1..S{revN} 抄底吃一格；做空镜像为上方 L1..L{revN} 反弹空吃一格）
+                                    </span>
+                                  </div>
+                                  <div className="flex flex-wrap gap-1.5">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateCurrentStrategyField({ rev_s_pcts: '100,100,50,30,20' })
+                                      }
+                                      className="px-2.5 py-1 rounded-full surface-subtle text-[10px] font-semibold text-sub hover:text-main"
+                                    >
+                                      推荐递减 (100/100/50/30/20%)
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateCurrentStrategyField({ rev_s_pcts: '100' })
+                                      }
+                                      className="px-2.5 py-1 rounded-full surface-subtle text-[10px] font-semibold text-sub hover:text-main"
+                                    >
+                                      全部 100%
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateCurrentStrategyField({ rev_s_pcts: '100,50,30,20,10' })
+                                      }
+                                      className="px-2.5 py-1 rounded-full surface-subtle text-[10px] font-semibold text-sub hover:text-main"
+                                    >
+                                      保守递减 (100/50/30/20/10%)
+                                    </button>
+                                  </div>
+                                </div>
+                                <div className="grid grid-cols-2 sm:grid-cols-5 lg:grid-cols-10 gap-2">
+                                  {curSPcts.map((pctVal, idx) => {
+                                    const lvlNum = idx + 1;
+                                    return (
+                                      <div key={`rev-s-${lvlNum}`} className="surface-subtle p-2 rounded-xl">
+                                        <div className="flex items-center justify-between text-[10px] font-mono mb-1">
+                                          <span className="font-bold text-main">S{lvlNum}</span>
+                                          <span className="text-dim">
+                                            {(((currentStrategy.order_usdt ?? 100) * pctVal) / 100).toFixed(0)}U
+                                          </span>
+                                        </div>
+                                        <input
+                                          type="number"
+                                          min={0}
+                                          max={1000}
+                                          step={5}
+                                          value={pctVal}
+                                          onChange={(e) =>
+                                            updateLevelPctAt(
+                                              'rev_s_pcts',
+                                              curSPcts,
+                                              idx,
+                                              Number(e.target.value),
+                                              0
+                                            )
+                                          }
+                                          className="w-full input-field !py-1.5 !px-2 font-mono text-xs"
+                                        />
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })()}
 
                         {/* Trend Breakout & VCP Adaptive Parameters (Only Effective Fields for TREND_GRID or ADAPTIVE_GRID) */}
                         {(isTrendGrid || isAdaptiveGrid) && (

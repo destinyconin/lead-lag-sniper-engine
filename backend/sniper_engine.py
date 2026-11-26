@@ -2087,7 +2087,7 @@ class BidirectionalSniperEngine:
                         f"止盈未覆盖双边费率 ({new_cfg.grid_take_profit_pct*100:.2f}% ≤ {eff_rt_fee*100:.2f}%)"
                     )
                 total_span = int(new_cfg.grid_levels) * float(new_cfg.grid_step_pct)
-                if new_cfg.strategy_type != "TREND_GRID" and total_span > new_cfg.grid_range_pct + 1e-6:
+                if new_cfg.strategy_type not in ("TREND_GRID", "REVERSE_GRID") and total_span > new_cfg.grid_range_pct + 1e-6:
                     issues.append(
                         f"层数×步长超出区间会裁层 ({new_cfg.grid_levels}层×{new_cfg.grid_step_pct*100:.2f}%={total_span*100:.2f}% > 区间±{new_cfg.grid_range_pct*100:.1f}%)"
                     )
@@ -2211,6 +2211,22 @@ class BidirectionalSniperEngine:
                         new_cfg.trend_trailing_mult = round(float(req.trend_trailing_mult), 3)
                         fixes.append(f"追踪倍率→{new_cfg.trend_trailing_mult:g}x")
                         changed = True
+                    if new_cfg.strategy_type == "REVERSE_GRID":
+                        for attr_k, lbl_k in (
+                            ("rev_l_pcts", "顺势L比例"),
+                            ("rev_s_pcts", "逆向S比例"),
+                            ("rev_c_pct", "C档比例"),
+                            ("rev_tp_cooldown_min", "止盈冷却"),
+                            ("rev_sl_cooldown_min", "止损冷却"),
+                            ("rev_trail_start_level", "追踪触发档"),
+                            ("rev_trail_retracement_pct", "追踪回撤"),
+                            ("rev_max_level_mode", "顶格模式"),
+                        ):
+                            req_v = getattr(req, attr_k, None)
+                            if req_v is not None and getattr(new_cfg, attr_k, None) != req_v:
+                                setattr(new_cfg, attr_k, req_v)
+                                fixes.append(f"{lbl_k}→已更新")
+                                changed = True
                     if req.auto_fix_anomalies:
                         eff_rt_fee = maker_rt_fee if (new_cfg.use_post_only_tp and new_cfg.strategy_type != "TREND_GRID") else taker_rt_fee
                         min_safe_tp = round(max(new_cfg.grid_step_pct, eff_rt_fee + 0.0005), 6)
