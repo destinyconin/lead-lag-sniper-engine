@@ -138,6 +138,7 @@ BASE_PRICES: Dict[str, float] = {
     "MSTR/USDT:USDT": 395.00,
     "UBER/USDT:USDT": 72.60,
     "GS/USDT:USDT": 594.00,
+    "ANT/USDT:USDT": 84.60,
 }
 
 SP500_SYMBOL_NAMES: Dict[str, str] = {
@@ -183,6 +184,7 @@ SP500_SYMBOL_NAMES: Dict[str, str] = {
     "MSTR": "MicroStrategy",
     "UBER": "Uber Technologies",
     "GS": "高盛 (Goldman Sachs)",
+    "ANT": "Anthropic (AI 大模型龙头)",
 }
 
 # Crypto-only index perpetual aliases that do NOT exist as US stock tickers on Futu/moomoo/IBKR/Schwab
@@ -237,16 +239,32 @@ def get_binance_price_divisor(unified_sym: str) -> float:
     return 1000.0 if base in BINANCE_1000X_BASES else 1.0
 
 
+# Cross-venue / OKX UI vs V5 SWAP API base remapping:
+# e.g. OKX UI displays "ANTUSDT 永续" (spot xANT-USDT) and Binance lists "ANTUSDT",
+# while OKX V5 SWAP API uses underlying instId "ANTHROPIC-USDT-SWAP".
+OKX_SWAP_BASE_REMAP: Dict[str, str] = {
+    "ANT": "ANTHROPIC",
+}
+OKX_INST_BASE_TO_UNIFIED: Dict[str, str] = {v: k for k, v in OKX_SWAP_BASE_REMAP.items()}
+
+
 def to_okx_inst_id(unified_sym: str) -> str:
-    """Converts 'XRP/USDT:USDT' -> 'XRP-USDT-SWAP'."""
+    """Converts 'XRP/USDT:USDT' -> 'XRP-USDT-SWAP', 'ANT/USDT:USDT' -> 'ANTHROPIC-USDT-SWAP'."""
     base_quote = unified_sym.split(":")[0]
+    parts = base_quote.split("/")
+    if len(parts) == 2:
+        base_u = parts[0].strip().upper()
+        quote_u = parts[1].strip().upper()
+        mapped_base = OKX_SWAP_BASE_REMAP.get(base_u, base_u)
+        return f"{mapped_base}-{quote_u}-SWAP"
     return base_quote.replace("/", "-") + "-SWAP"
 
 
 def okx_inst_id_to_unified(inst_id: str) -> str:
-    """Converts 'XRP-USDT-SWAP' -> 'XRP/USDT:USDT'."""
+    """Converts 'XRP-USDT-SWAP' -> 'XRP/USDT:USDT', 'ANTHROPIC-USDT-SWAP' -> 'ANT/USDT:USDT'."""
     if inst_id.endswith("-USDT-SWAP"):
-        base = inst_id[:-len("-USDT-SWAP")]
+        raw_base = inst_id[:-len("-USDT-SWAP")]
+        base = OKX_INST_BASE_TO_UNIFIED.get(raw_base, raw_base)
         return f"{base}/USDT:USDT"
     return inst_id
 
@@ -561,7 +579,11 @@ class MarketDataGateway:
             self._symbols_version += 1
         for sym in self.symbols:
             if sym not in self._sim_mid:
-                self._sim_mid[sym] = get_default_base_price(sym)
+                f_bbo_seed = self.real_follower_bbo.get(sym)
+                if f_bbo_seed and f_bbo_seed[0] > 0 and f_bbo_seed[1] > 0:
+                    self._sim_mid[sym] = (f_bbo_seed[0] + f_bbo_seed[1]) * 0.5
+                else:
+                    self._sim_mid[sym] = get_default_base_price(sym)
                 self._sim_basis_ratio[sym] = random.uniform(-0.00045, 0.00045)
         if added:
             self._resubscribe_flag = True
@@ -577,14 +599,21 @@ class MarketDataGateway:
         if self._has_mode_subscriber("REAL_WS"):
             l_bbo = self.real_leader_bbo.get(sym)
             f_bbo = self.real_follower_bbo.get(sym)
-            if l_bbo and f_bbo:
+            if f_bbo:
                 self._dispatch_follower_bbo("REAL_WS", sym, f_bbo[0], f_bbo[1], f_bbo[2], f_bbo[3])
+            if l_bbo:
                 self._dispatch_leader_bbo("REAL_WS", sym, l_bbo[0], l_bbo[1], l_bbo[2], l_bbo[3])
-            elif self._running:
+            if (not l_bbo or not f_bbo) and self._running:
                 asyncio.create_task(self.fetch_real_bbo_snapshot([sym], emit_immediately=True))
 
         if self._has_mode_subscriber("SIMULATOR"):
-            base_mid = self._sim_mid.get(sym, get_default_base_price(sym))
+            f_bbo_sim = self.real_follower_bbo.get(sym)
+            base_mid = self._sim_mid.get(
+                sym,
+                (f_bbo_sim[0] + f_bbo_sim[1]) * 0.5
+                if (f_bbo_sim and f_bbo_sim[0] > 0 and f_bbo_sim[1] > 0)
+                else get_default_base_price(sym),
+            )
             self._sim_mid[sym] = base_mid
             basis_ratio = self._sim_basis_ratio.get(sym, -0.00035)
             half_spread = base_mid * 0.00015
@@ -597,6 +626,126 @@ class MarketDataGateway:
 
     def get_binance_instrument_spec(self, sym: str) -> Optional[dict]:
         return get_binance_instrument_spec(sym)
+
+    @staticmethod
+    def _parse_okx_swap_row(r: dict) -> Optional[dict]:
+        inst_id = str(r.get("instId") or "")
+        if not inst_id.endswith("-USDT-SWAP"):
+            return None
+        return {
+            "instId": inst_id,
+            "unified_sym": okx_inst_id_to_unified(inst_id),
+            "state": str(r.get("state", "")),
+            "instCategory": str(r.get("instCategory", "1")),
+            "ctVal": float(r.get("ctVal") or 1.0),
+            "ctVal_str": str(r.get("ctVal") or "1"),
+            "lotSz": float(r.get("lotSz") or 1.0),
+            "lotSz_str": str(r.get("lotSz") or "1"),
+            "minSz": float(r.get("minSz") or r.get("lotSz") or 1.0),
+            "minSz_str": str(r.get("minSz") or r.get("lotSz") or "1"),
+            "tickSz": float(r.get("tickSz") or 0.0001),
+            "tickSz_str": str(r.get("tickSz") or "0.0001"),
+            "maxLmtSz": float(r.get("maxLmtSz") or 0.0),
+            "maxMktSz": float(r.get("maxMktSz") or 0.0),
+            "maxLever": float(r.get("lever") or 50.0),
+        }
+
+    async def probe_okx_swap_and_ticker(self, unified_sym: str) -> dict:
+        """
+        On-demand single-contract OKX V5 lookup for `/api/symbol/verify`:
+        1. On `_OKX_INSTRUMENT_CACHE` miss, probes `/api/v5/public/instruments?instType=SWAP&instId=...`
+           directly so newly listed OKX perpetuals work 0-second upon listing without waiting for cache TTL,
+           and also checks OKX SPOT (`{BASE}-USDT` / `X{BASE}-USDT`) to distinguish Spot-only listings.
+        2. Warms `real_follower_bbo[unified_sym]` via `/api/v5/market/ticker?instId=...` when missing so
+           newly added coins get real-time market price & accurate `min_notional_usdt`.
+        """
+        inst_id = to_okx_inst_id(unified_sym)
+        base = _extract_symbol_base(unified_sym)
+        spec = _OKX_INSTRUMENT_CACHE.get(inst_id)
+        f_bbo = self.real_follower_bbo.get(unified_sym)
+        ticker_mid = (f_bbo[0] + f_bbo[1]) * 0.5 if (f_bbo and f_bbo[0] > 0 and f_bbo[1] > 0) else 0.0
+        spot_inst_id: Optional[str] = None
+
+        need_spec = spec is None
+        need_ticker = ticker_mid <= 0 and (need_spec or self._running)
+        if not need_spec and not need_ticker:
+            return {"okx_spec": spec, "spot_inst_id": None, "ticker_mid": ticker_mid}
+
+        self.proxy_url = get_system_proxy()
+        try:
+            async with httpx.AsyncClient(proxy=self.proxy_url, timeout=3.0) as client:
+                tasks: Dict[str, Any] = {}
+                if need_spec:
+                    tasks["swap"] = client.get(
+                        f"https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId={inst_id}"
+                    )
+                    tasks["spot"] = client.get(
+                        f"https://www.okx.com/api/v5/public/instruments?instType=SPOT&instId={base}-USDT"
+                    )
+                if need_ticker:
+                    tasks["ticker"] = client.get(f"https://www.okx.com/api/v5/market/ticker?instId={inst_id}")
+                bn_sym = to_binance_stream_sym(unified_sym).upper()
+                if need_spec and bn_sym not in _BINANCE_INSTRUMENT_CACHE:
+                    tasks["bn_ticker"] = client.get(
+                        f"https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol={bn_sym}"
+                    )
+
+                keys = list(tasks.keys())
+                results = await asyncio.gather(*(tasks[k] for k in keys), return_exceptions=True)
+                res_map = dict(zip(keys, results))
+
+                swap_resp = res_map.get("swap")
+                if isinstance(swap_resp, httpx.Response) and swap_resp.status_code == 200:
+                    rows = swap_resp.json().get("data", [])
+                    if rows:
+                        parsed = self._parse_okx_swap_row(rows[0])
+                        if parsed:
+                            _OKX_INSTRUMENT_CACHE[inst_id] = parsed
+                            spec = parsed
+
+                if spec is None:
+                    spot_resp = res_map.get("spot")
+                    if isinstance(spot_resp, httpx.Response) and spot_resp.status_code == 200:
+                        s_rows = spot_resp.json().get("data", [])
+                        if s_rows and s_rows[0].get("instId"):
+                            spot_inst_id = str(s_rows[0]["instId"])
+
+                bn_resp = res_map.get("bn_ticker")
+                if isinstance(bn_resp, httpx.Response) and bn_resp.status_code == 200:
+                    bj = bn_resp.json()
+                    if isinstance(bj, dict) and bj.get("symbol") == bn_sym and bj.get("bidPrice"):
+                        _BINANCE_INSTRUMENT_CACHE[bn_sym] = {
+                            "symbol": bn_sym,
+                            "status": "TRADING",
+                            "contractType": "PERPETUAL",
+                            "tickSize": 0.0001,
+                            "stepSize": 0.001,
+                            "minQty": 0.001,
+                        }
+
+                tk_resp = res_map.get("ticker")
+                if isinstance(tk_resp, httpx.Response) and tk_resp.status_code == 200:
+                    t_rows = tk_resp.json().get("data", [])
+                    if t_rows:
+                        tr = t_rows[0]
+                        bid = float(tr.get("bidPx") or tr.get("last") or 0.0)
+                        ask = float(tr.get("askPx") or tr.get("last") or 0.0)
+                        last_px = float(tr.get("last") or 0.0)
+                        if bid <= 0 and last_px > 0:
+                            bid = last_px
+                        if ask <= 0 and last_px > 0:
+                            ask = last_px
+                        if bid > 0 and ask > 0 and ask >= bid:
+                            ct_val = float(spec["ctVal"]) if (spec and float(spec.get("ctVal") or 0) > 0) else 1.0
+                            bid_q = float(tr.get("bidSz") or 100.0) * ct_val
+                            ask_q = float(tr.get("askSz") or 100.0) * ct_val
+                            self.real_follower_bbo[unified_sym] = (bid, ask, bid_q, ask_q)
+                            self.real_follower_ts[unified_sym] = mono_ms()
+                            ticker_mid = (bid + ask) * 0.5
+        except Exception:
+            pass
+
+        return {"okx_spec": spec, "spot_inst_id": spot_inst_id, "ticker_mid": ticker_mid}
 
     async def fetch_exchange_instruments(self, force: bool = False) -> bool:
         """
@@ -618,25 +767,9 @@ class MarketDataGateway:
 
                 if isinstance(okx_resp, httpx.Response) and okx_resp.status_code == 200:
                     for r in okx_resp.json().get("data", []):
-                        inst_id = r.get("instId", "")
-                        if not inst_id.endswith("-USDT-SWAP"):
-                            continue
-                        _OKX_INSTRUMENT_CACHE[inst_id] = {
-                            "instId": inst_id,
-                            "unified_sym": okx_inst_id_to_unified(inst_id),
-                            "state": str(r.get("state", "")),
-                            "ctVal": float(r.get("ctVal") or 1.0),
-                            "ctVal_str": str(r.get("ctVal") or "1"),
-                            "lotSz": float(r.get("lotSz") or 1.0),
-                            "lotSz_str": str(r.get("lotSz") or "1"),
-                            "minSz": float(r.get("minSz") or r.get("lotSz") or 1.0),
-                            "minSz_str": str(r.get("minSz") or r.get("lotSz") or "1"),
-                            "tickSz": float(r.get("tickSz") or 0.0001),
-                            "tickSz_str": str(r.get("tickSz") or "0.0001"),
-                            "maxLmtSz": float(r.get("maxLmtSz") or 0.0),
-                            "maxMktSz": float(r.get("maxMktSz") or 0.0),
-                            "maxLever": float(r.get("lever") or 50.0),
-                        }
+                        parsed = self._parse_okx_swap_row(r)
+                        if parsed:
+                            _OKX_INSTRUMENT_CACHE[parsed["instId"]] = parsed
                     ok = True
 
                 if isinstance(bn_resp, httpx.Response) and bn_resp.status_code == 200:

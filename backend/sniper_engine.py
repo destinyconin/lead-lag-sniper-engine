@@ -1914,7 +1914,11 @@ class BidirectionalSniperEngine:
             if not is_usd_equity_symbol(sym, getattr(cfg, "exchange_id", "okx")) and get_okx_instrument_spec(sym) is not None:
                 return
 
-        base_px = get_default_base_price(sym)
+        f_bbo_fallback = self.gateway.real_follower_bbo.get(sym)
+        if f_bbo_fallback and f_bbo_fallback[0] > 0 and f_bbo_fallback[1] > 0:
+            base_px = (f_bbo_fallback[0] + f_bbo_fallback[1]) * 0.5
+        else:
+            base_px = get_default_base_price(sym)
         now_m = mono_ms()
         half_sp = base_px * 0.00015
         basis_r = -0.00035

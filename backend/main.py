@@ -215,11 +215,12 @@ SP500_ALIASES: Dict[str, str] = {
     "BRK-B": "BRKB",
     "BRK/B": "BRKB",
     "GOOG": "GOOGL",
+    "ANTHROPIC": "ANT",
 }
 
 
 OKX_STOCK_PERP_BASES = {
-    "NVDA", "TSLA", "SNDK", "SPCX", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "COIN", "MSTR", "SP500"
+    "NVDA", "TSLA", "SNDK", "SPCX", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "COIN", "MSTR", "SP500", "ANT"
 }
 
 TRADITIONAL_BROKER_LABEL_MAP: Dict[str, str] = {
@@ -522,7 +523,12 @@ async def verify_symbol(
         or raw_orig.endswith("/USD")
         or raw_orig.endswith(":USD")
     )
-    explicit_usdt = "/USDT" in raw_orig or ":USDT" in raw_orig or raw_orig.endswith("-USDT-SWAP")
+    explicit_usdt = (
+        "/USDT" in raw_orig
+        or ":USDT" in raw_orig
+        or raw_orig.endswith("-USDT-SWAP")
+        or (raw_orig.endswith("USDT") and len(raw_orig) > 4)
+    )
     raw = raw_orig
     for prefix in ("US.", "HK.", "$", "^"):
         if raw.startswith(prefix):
@@ -541,6 +547,9 @@ async def verify_symbol(
     else:
         base_clean = raw[:-4].strip() if raw.endswith("USDT") and len(raw) > 4 else raw.strip()
     base_clean = SP500_ALIASES.get(base_clean, base_clean).replace(".", "")
+
+    if base_clean == "XANT" and not is_traditional_broker(req_ex_id):
+        base_clean = "ANT"
 
     if base_clean.startswith("1000") and base_clean[4:] in BINANCE_1000X_BASES:
         base_clean = base_clean[4:]
@@ -658,9 +667,27 @@ async def verify_symbol(
         None,
     )
     okx_spec = okx_spec_probe
+    spot_only_inst_id: Optional[str] = None
+
+    # On-demand OKX V5 instrument & live ticker probe:
+    # - Refresh immediately on cache miss so 0-second newly listed OKX contracts work without waiting for cache TTL
+    # - Fetch real-time ticker price when `norm_sym` is not yet subscribed on WebSocket
+    if (okx_spec is None and match is None) or (
+        okx_spec is not None and norm_sym not in eng.gateway.real_follower_bbo and eng.gateway._running
+    ):
+        probe_res = await eng.gateway.probe_okx_swap_and_ticker(norm_sym)
+        if probe_res.get("okx_spec") is not None:
+            okx_spec = probe_res["okx_spec"]
+        spot_only_inst_id = probe_res.get("spot_inst_id")
+
     bn_spec = get_binance_instrument_spec(norm_sym)
 
     if _OKX_INSTRUMENT_CACHE and not okx_spec and match is None:
+        err_msg = (
+            f"添加失败：执行端 OKX 当前仅上线了 {spot_only_inst_id} 现货，未上线 {to_okx_inst_id(norm_sym)} 永续合约（本系统加密实盘通道交易标的为 USDT 永续合约）"
+            if spot_only_inst_id
+            else f"添加失败：执行端 OKX 未上线 {to_okx_inst_id(norm_sym)} 永续合约（若添加美股/标普500正股，请先在上方切换至富途/moomoo/IBKR/Schwab 传统券商通道）"
+        )
         return {
             "symbol": norm_sym,
             "verified": False,
@@ -668,10 +695,10 @@ async def verify_symbol(
             "already_monitored": already_monitored,
             "leader_supported": bool(bn_spec and bn_spec.get("status") == "TRADING"),
             "follower_supported": False,
-            "error": f"添加失败：执行端 OKX 未上线 {to_okx_inst_id(norm_sym)} 永续合约（若添加美股/标普500正股，请先在上方切换至富途/moomoo/IBKR/Schwab 传统券商通道）",
+            "error": err_msg,
         }
 
-    if okx_spec and okx_spec.get("state") not in (None, "live"):
+    if okx_spec and okx_spec.get("state") not in (None, "", "live", "preopen"):
         return {
             "symbol": norm_sym,
             "verified": False,
@@ -697,11 +724,22 @@ async def verify_symbol(
             ref_px = f_mid
 
     p_prec, q_prec, min_q = _infer_precision(ref_px)
+    if match:
+        q_prec = int(match["qty_prec"])
     min_notional_usdt = 0.0
     if okx_spec:
         tick_str = str(okx_spec.get("tickSz_str") or "")
         if "." in tick_str:
             p_prec = min(12, max(p_prec, len(tick_str.rstrip("0").split(".")[1])))
+        lot_str = str(okx_spec.get("lotSz_str") or okx_spec.get("lotSz") or "1")
+        ct_str = str(okx_spec.get("ctVal_str") or okx_spec.get("ctVal") or "1")
+        try:
+            from decimal import Decimal
+            step_dec_str = format((Decimal(lot_str) * Decimal(ct_str)).normalize(), "f")
+            if "." in step_dec_str:
+                q_prec = min(12, max(q_prec, len(step_dec_str.rstrip("0").split(".")[1])))
+        except Exception:
+            pass
         min_base = float(okx_spec.get("minSz") or 0.0) * float(okx_spec.get("ctVal") or 1.0)
         if min_base > 0:
             min_q = round(min_base, 8)
@@ -712,7 +750,7 @@ async def verify_symbol(
         if _BINANCE_INSTRUMENT_CACHE
         else True
     )
-    follower_supported = okx_spec is None or okx_spec.get("state") == "live"
+    follower_supported = okx_spec is None or okx_spec.get("state") in ("live", "preopen")
 
     # Infer sensible strategy & order_usdt defaults from the user's current portfolio
     existing = list(eng.strategies.values())
@@ -738,6 +776,8 @@ async def verify_symbol(
         warnings.append(f"美股永续合约 {sp_title} 已绑定加密交易所 [{target_exchange_id.upper()}]（{native_sym} · USDT 计价）")
     elif _BINANCE_INSTRUMENT_CACHE and not leader_supported:
         warnings.append(f"{norm_sym} 在主所 Binance 未上线，已自动设为 OKX「多空动态网格」策略")
+    if okx_spec and okx_spec.get("state") == "preopen":
+        warnings.append(f"提示：OKX 合约 {native_sym} 当前处于盘前预上线 (preopen) 阶段，待正式开盘后将自动触发深度与实盘委托")
     if min_notional_usdt > base_order_usdt * 1.35:
         warnings.append(
             f"{norm_sym} 在 OKX 最小下单量 ({okx_spec.get('minSz')} 张) 约需 {min_notional_usdt:.2f} USDT，已自动调整建议下单额为 {rec_order_usdt:g} USDT"
@@ -747,7 +787,7 @@ async def verify_symbol(
         "symbol": norm_sym,
         "base": base_clean,
         "native_symbol": native_sym,
-        "asset_type": "STOCK_PERP" if is_sp500_sym else "CRYPTO_PERP",
+        "asset_type": "STOCK_PERP" if (is_sp500_sym or (okx_spec and okx_spec.get("instCategory") == "3")) else "CRYPTO_PERP",
         "quote_ccy": "USDT",
         "live_execution_supported": target_exchange_id == "okx",
         "name_cn": SP500_SYMBOL_NAMES.get(base_clean, ""),
@@ -770,7 +810,7 @@ async def verify_symbol(
         "warning": "；".join(warnings) if warnings else "",
         "recommended_precision": {
             "price_precision": min(12, match["price_prec"] if (match and not okx_spec) else p_prec),
-            "qty_precision": min(12, match["qty_prec"] if match else q_prec),
+            "qty_precision": min(12, q_prec),
             "min_qty": min_q,
         },
     }

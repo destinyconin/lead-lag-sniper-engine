@@ -364,7 +364,7 @@ const formatBrokerNativeSymbol = (symbol, exchangeId) => {
   const normBase = base === 'BRKB' ? 'BRK.B' : base;
   if (ex === 'futu' || ex === 'moomoo') return `US.${normBase}`;
   if (ex === 'ibkr' || ex === 'schwab') return normBase;
-  if (ex === 'okx') return `${base}-USDT-SWAP`;
+  if (ex === 'okx') return `${base === 'ANT' ? 'ANTHROPIC' : base}-USDT-SWAP`;
   return raw;
 };
 

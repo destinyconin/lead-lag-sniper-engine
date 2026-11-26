@@ -6404,6 +6404,120 @@ def test_reverse_grid_custom_pcts_ln_sn_trail_start_cooldowns_and_edge_guards():
     assert trk_inv.strategy.group_floor_price >= 101.20
 
 
+def test_okx_antusdt_alias_and_live_cache_miss_probe():
+    """
+    Verifies:
+    1) OKX `antusdt` / `ant` / `anthropic` / `xant` cleanly map to unified `ANT/USDT:USDT`
+       with OKX V5 instId `ANTHROPIC-USDT-SWAP` and Binance USDM `antusdt`, while Futu maps `ANT` -> `US.ANT`.
+    2) Cache-miss on-demand OKX V5 probing discovers newly listed SWAP contracts immediately (including `preopen`
+       and `0.001` lotSz precision) and distinguishes Spot-only tokens from unlisted contracts.
+    """
+    import backend.main as main_mod
+    from backend.market_gateway import (
+        _BINANCE_INSTRUMENT_CACHE,
+        _OKX_INSTRUMENT_CACHE,
+        okx_inst_id_to_unified,
+        to_binance_stream_sym,
+        to_okx_inst_id,
+    )
+    from backend.executor import resolve_okx_spec
+
+    assert to_okx_inst_id("ANT/USDT:USDT") == "ANTHROPIC-USDT-SWAP"
+    assert okx_inst_id_to_unified("ANTHROPIC-USDT-SWAP") == "ANT/USDT:USDT"
+    assert to_binance_stream_sym("ANT/USDT:USDT") == "antusdt"
+    fb_spec = resolve_okx_spec("ANT/USDT:USDT")
+    assert fb_spec["instId"] == "ANTHROPIC-USDT-SWAP"
+    assert fb_spec["minSz"] == 0.001
+
+    _OKX_INSTRUMENT_CACHE["ANTHROPIC-USDT-SWAP"] = {
+        "instId": "ANTHROPIC-USDT-SWAP",
+        "unified_sym": "ANT/USDT:USDT",
+        "state": "live",
+        "instCategory": "3",
+        "ctVal": 1.0,
+        "ctVal_str": "1",
+        "lotSz": 0.001,
+        "lotSz_str": "0.001",
+        "minSz": 0.001,
+        "minSz_str": "0.001",
+        "tickSz": 0.01,
+        "tickSz_str": "0.01",
+        "maxLever": 50.0,
+    }
+    _BINANCE_INSTRUMENT_CACHE["ANTUSDT"] = {
+        "symbol": "ANTUSDT",
+        "status": "TRADING",
+        "contractType": "TRADIFI_PERPETUAL",
+        "tickSize": 0.01,
+        "stepSize": 0.01,
+        "minQty": 0.01,
+    }
+
+    async def fake_probe(unified_sym: str):
+        if unified_sym == "NEWLIST/USDT:USDT":
+            spec = {
+                "instId": "NEWLIST-USDT-SWAP",
+                "unified_sym": "NEWLIST/USDT:USDT",
+                "state": "preopen",
+                "instCategory": "1",
+                "ctVal": 1.0,
+                "ctVal_str": "1",
+                "lotSz": 0.001,
+                "lotSz_str": "0.001",
+                "minSz": 0.001,
+                "minSz_str": "0.001",
+                "tickSz": 0.01,
+                "tickSz_str": "0.01",
+                "maxLever": 20.0,
+            }
+            _OKX_INSTRUMENT_CACHE["NEWLIST-USDT-SWAP"] = spec
+            main_mod.engine_manager.gateway.real_follower_bbo["NEWLIST/USDT:USDT"] = (128.4, 128.6, 50.0, 50.0)
+            return {"okx_spec": spec, "spot_inst_id": None, "ticker_mid": 128.5}
+        if unified_sym == "SPOTCOIN/USDT:USDT":
+            return {"okx_spec": None, "spot_inst_id": "SPOTCOIN-USDT", "ticker_mid": 0.0}
+        return {"okx_spec": _OKX_INSTRUMENT_CACHE.get(to_okx_inst_id(unified_sym)), "spot_inst_id": None, "ticker_mid": 0.0}
+
+    with (
+        patch.object(main_mod.engine_manager.gateway, "start", new=AsyncMock(return_value=None)),
+        patch.object(main_mod.engine_manager.gateway, "stop", new=AsyncMock(return_value=None)),
+        patch.object(main_mod.engine_manager.gateway, "probe_okx_swap_and_ticker", side_effect=fake_probe),
+        patch.object(main_mod.payment_monitor, "start", return_value=None),
+        patch.object(main_mod.payment_monitor, "stop", new=AsyncMock(return_value=None)),
+    ):
+        with TestClient(main_mod.app) as client:
+            for q_sym in ("antusdt", "ant", "ANTHROPIC", "xant", "ANTHROPIC-USDT-SWAP"):
+                r = client.get(f"/api/symbol/verify?symbol={q_sym}&exchange_id=okx").json()
+                assert r["verified"] is True, f"Failed for {q_sym}: {r}"
+                assert r["symbol"] == "ANT/USDT:USDT"
+                assert r["native_symbol"] == "ANTHROPIC-USDT-SWAP"
+                assert r["leader_supported"] is True
+                assert r["follower_supported"] is True
+                assert r["recommended_precision"]["min_qty"] == 0.001
+                assert r["recommended_precision"]["qty_precision"] >= 3
+
+            # Traditional US broker routes ANT to US.ANT (USD equity)
+            r_futu = client.get("/api/symbol/verify?symbol=ANT&exchange_id=futu").json()
+            assert r_futu["verified"] is True
+            assert r_futu["symbol"] == "ANT/USD"
+            assert r_futu["native_symbol"] == "US.ANT"
+
+            # Cache-miss newly listed OKX SWAP (preopen) succeeds immediately with live ticker price
+            _OKX_INSTRUMENT_CACHE.pop("NEWLIST-USDT-SWAP", None)
+            r_new = client.get("/api/symbol/verify?symbol=newlistusdt&exchange_id=okx").json()
+            assert r_new["verified"] is True
+            assert r_new["symbol"] == "NEWLIST/USDT:USDT"
+            assert abs(r_new["ref_price"] - 128.5) < 1e-6
+            assert r_new["recommended_precision"]["qty_precision"] >= 3
+            assert "preopen" in r_new["warning"]
+
+            # Spot-only coin explains clearly that only Spot is listed on OKX, not USDT-SWAP
+            r_spot = client.get("/api/symbol/verify?symbol=spotcoinusdt&exchange_id=okx").json()
+            assert r_spot["verified"] is False
+            assert "SPOTCOIN-USDT 现货" in r_spot["error"]
+            assert "未上线" in r_spot["error"]
+
+
+
 
 
 

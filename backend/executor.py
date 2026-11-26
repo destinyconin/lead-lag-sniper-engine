@@ -91,6 +91,7 @@ _FALLBACK_OKX_SPECS: Dict[str, dict] = {
     "WIF-USDT-SWAP": {"ctVal": 1.0, "ctVal_str": "1", "lotSz": 1.0, "lotSz_str": "1", "minSz": 1.0, "minSz_str": "1", "tickSz": 0.0001, "tickSz_str": "0.0001"},
     "TSLA-USDT-SWAP": {"ctVal": 0.01, "ctVal_str": "0.01", "lotSz": 0.01, "lotSz_str": "0.01", "minSz": 0.01, "minSz_str": "0.01", "tickSz": 0.01, "tickSz_str": "0.01"},
     "SPCX-USDT-SWAP": {"ctVal": 1.0, "ctVal_str": "1", "lotSz": 0.01, "lotSz_str": "0.01", "minSz": 0.01, "minSz_str": "0.01", "tickSz": 0.01, "tickSz_str": "0.01"},
+    "ANTHROPIC-USDT-SWAP": {"ctVal": 1.0, "ctVal_str": "1", "lotSz": 0.001, "lotSz_str": "0.001", "minSz": 0.001, "minSz_str": "0.001", "tickSz": 0.01, "tickSz_str": "0.01"},
 }
 
 
