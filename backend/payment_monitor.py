@@ -20,6 +20,12 @@ import httpx
 import qrcode
 import qrcode.image.svg
 
+
+def _get_proxy():
+    from backend.market_gateway import get_system_proxy
+
+    return get_system_proxy()
+
 logger = logging.getLogger("sniper.payment_monitor")
 
 PAYMENT_WALLET_ADDRESS = "0x8D550B8c462310126BA26d85A4a1f779Cd56A9e0"
@@ -368,10 +374,10 @@ class OnChainPaymentMonitor:
         clean_hash = tx_hash.strip()
         if not clean_hash.startswith("0x") or len(clean_hash) != 66:
             return None
-        if self.user_manager.is_tx_hash_already_used(clean_hash):
+        if await asyncio.to_thread(self.user_manager.is_tx_hash_already_used, clean_hash):
             return None
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(proxy=_get_proxy(), timeout=8.0) as client:
             tasks = [
                 self._check_tx_on_chain(client, chain_cfg, clean_hash, pending_orders)
                 for chain_cfg in SUPPORTED_CHAINS
@@ -442,7 +448,11 @@ class OnChainPaymentMonitor:
             if tx_blk_hex and chain_id in self._last_head_block:
                 tx_blk = int(tx_blk_hex, 16)
                 if self._last_head_block[chain_id] - tx_blk < min_conf:
-                    return None
+                    head_hex = await self._rpc_call(client, chain_cfg["rpc"], "eth_blockNumber", [])
+                    if isinstance(head_hex, str) and head_hex.startswith("0x"):
+                        self._last_head_block[chain_id] = max(self._last_head_block[chain_id], int(head_hex, 16))
+                    if self._last_head_block[chain_id] - tx_blk < min_conf:
+                        return None
 
             blk_ts = await self._get_block_timestamp(
                 client, chain_cfg["rpc"], chain_id, tx_blk_hex

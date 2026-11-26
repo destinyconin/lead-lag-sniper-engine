@@ -230,8 +230,10 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         self.restart_cooldown_until_mono = 0.0
         self._cooldown_started_mono = 0.0
         self.restart_reason = ""
-        if self.cycle_phase == "COOLDOWN" and self.reconcile_verified:
-            self.cycle_phase = "ACTIVE"
+        if self.cycle_phase == "COOLDOWN" and self.reconcile_verified and not self._has_active_slots():
+            # Keep cycle_phase == "COOLDOWN" with restart_cooldown_until_mono == 0.0 so the very next tick
+            # cleanly re-anchors to NONE at live mid instead of re-triggering a new 30m/60m restart timer!
+            pass
 
     def reset_runtime_state(self):
         super().reset_runtime_state()

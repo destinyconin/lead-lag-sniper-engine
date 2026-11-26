@@ -16,6 +16,7 @@ import {
   LogOut,
   Menu,
   Moon,
+  PauseCircle,
   Percent,
   Plus,
   Power,
@@ -1205,7 +1206,11 @@ export default function App() {
 
   useEffect(() => {
     fetchMarketSentiment(false);
-    const timer = setInterval(() => fetchMarketSentiment(false), 60000);
+    const timer = setInterval(() => {
+      if (typeof document === 'undefined' || !document.hidden) {
+        fetchMarketSentiment(false);
+      }
+    }, 180000);
     return () => clearInterval(timer);
   }, [fetchMarketSentiment]);
 
@@ -1244,12 +1249,30 @@ export default function App() {
         }
       };
 
-      let lastHiddenApplyMs = 0;
       let latestPendingData = null;
+      let latestPendingRaw = null;
+      let sessionRevoked = false;
+      const flushPendingRaw = () => {
+        if (latestPendingRaw && !unmounted) {
+          try {
+            latestPendingData = JSON.parse(latestPendingRaw);
+          } catch {}
+          latestPendingRaw = null;
+        }
+      };
 
       const handleVisibilityChange = () => {
-        if (!unmounted && typeof document !== 'undefined' && !document.hidden && latestPendingData) {
-          setSnapshot(latestPendingData);
+        const hiddenNow = typeof document !== 'undefined' && document.hidden;
+        try {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'visibility', hidden: !!hiddenNow }));
+          }
+        } catch {}
+        if (!unmounted && !hiddenNow) {
+          flushPendingRaw();
+          if (latestPendingData && latestPendingData.type !== 'session_revoked') {
+            setSnapshot(latestPendingData);
+          }
           latestPendingData = null;
         }
       };
@@ -1260,16 +1283,22 @@ export default function App() {
       ws.onmessage = (ev) => {
         if (unmounted) return;
         try {
-          const data = JSON.parse(ev.data);
           if (typeof document !== 'undefined' && document.hidden) {
-            latestPendingData = data;
-            const now = Date.now();
-            if (now - lastHiddenApplyMs < 2500) {
-              return;
-            }
-            lastHiddenApplyMs = now;
+            // Hidden tab: buffer raw payload only; skip JSON.parse + React re-render entirely
+            latestPendingRaw = ev.data;
+            return;
+          }
+          const data = JSON.parse(ev.data);
+          if (data && data.type === 'session_revoked') {
+            sessionRevoked = true;
+            localStorage.removeItem('sniper_auth_token');
+            setAuthToken('');
+            setCurrentUser(null);
+            showToast('登录状态已失效（账号被禁用/删除或密码已重置），请重新登录', 'error');
+            return;
           }
           latestPendingData = null;
+          latestPendingRaw = null;
           setSnapshot(data);
         } catch (e) {
           console.error('WS parse error:', e);
@@ -1281,7 +1310,7 @@ export default function App() {
           document.removeEventListener('visibilitychange', handleVisibilityChange);
         }
         if (wsRef.current === ws) wsRef.current = null;
-        if (!unmounted) {
+        if (!unmounted && !sessionRevoked) {
           setWsConnected(false);
           reconnectTimer = setTimeout(connect, 1500);
         }
@@ -1771,6 +1800,38 @@ export default function App() {
       showToast('清零统计请求失败，请检查网络连接', 'error');
     } finally {
       setResettingStats(false);
+    }
+  };
+
+  const [pausingSymbol, setPausingSymbol] = useState('');
+
+  const handlePauseAndCloseSymbol = async (item) => {
+    const sym = item?.symbol;
+    if (!sym || pausingSymbol) return;
+    const hasPos = Number(item.open_positions_count || 0) > 0 || Number(item.unrealized_pnl || 0) !== 0;
+    const tip = hasPos
+      ? `确认暂停 ${sym.split(':')[0]} 吗？\n\n将立即：\n1. 停止该币种策略运行（不再开新仓）\n2. 市价平掉该币种全部多/空持仓\n3. 撤销该币种所有普通挂单与止盈止损/策略委托`
+      : `确认暂停 ${sym.split(':')[0]} 吗？\n\n将停止该币种策略运行，并撤销其所有在途挂单。`;
+    if (!window.confirm(tip)) return;
+    setPausingSymbol(sym);
+    try {
+      const res = await fetch('/api/symbol/pause-close', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        body: JSON.stringify({ symbol: sym }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (Array.isArray(data.strategies)) setStrategies(data.strategies);
+      if (data.snapshot) setSnapshot(data.snapshot);
+      if (res.ok && data.ok !== false) {
+        showToast(data.message || `已暂停 ${sym}`, 'success');
+      } else {
+        showToast(data.message || data.detail || `暂停 ${sym} 失败，请检查持仓`, 'error');
+      }
+    } catch (e) {
+      showToast('暂停请求异常，请稍后重试', 'error');
+    } finally {
+      setPausingSymbol('');
     }
   };
 
@@ -7369,6 +7430,44 @@ export default function App() {
                             <span>均值持仓: {item.avg_hold_ms || 0}ms</span>
                           </div>
                         </div>
+
+                        {/* Pause Running + Close All Positions & Cancel All Orders Button */}
+                        {item.is_monitored && (
+                          <div className="mt-3 pt-2.5 border-t border-line">
+                            {item.is_running || Number(item.open_positions_count || 0) > 0 || isHolding ? (
+                              <button
+                                type="button"
+                                disabled={pausingSymbol === item.symbol}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handlePauseAndCloseSymbol(item);
+                                }}
+                                className="w-full py-1.5 px-3 rounded-full text-xs font-bold transition flex items-center justify-center gap-1.5 bg-rose-500/12 text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 disabled:opacity-60 disabled:cursor-wait"
+                              >
+                                <PauseCircle className="w-3.5 h-3.5 shrink-0" />
+                                <span>
+                                  {pausingSymbol === item.symbol
+                                    ? '暂停中 · 平仓撤单...'
+                                    : !item.is_running
+                                    ? `全平并撤单 (${item.open_positions_count || 1}仓)`
+                                    : Number(item.open_positions_count || 0) > 0
+                                    ? `暂停运行 (平${item.open_positions_count}仓并撤单)`
+                                    : '暂停运行 (平仓并撤单)'}
+                                </span>
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                disabled
+                                onClick={(e) => e.stopPropagation()}
+                                className="w-full py-1.5 px-3 rounded-full text-xs font-semibold surface-card text-dim opacity-75 cursor-default flex items-center justify-center gap-1.5"
+                              >
+                                <PauseCircle className="w-3.5 h-3.5 shrink-0" />
+                                <span>已暂停运行</span>
+                              </button>
+                            )}
+                          </div>
+                        )}
                       </div>
                     );
                   })}

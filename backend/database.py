@@ -230,13 +230,21 @@ class AsyncDatabaseManager:
         self._write_queue: asyncio.Queue[tuple[str, tuple]] = asyncio.Queue(maxsize=10000)
         self._worker_task: asyncio.Task | None = None
         self._running = False
+        self._wal_initialized = False
+        self._initialized_workspaces: set[int] = set()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=15.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA temp_store=MEMORY")
+        try:
+            conn.execute("PRAGMA busy_timeout=15000")
+            if not self._wal_initialized:
+                conn.execute("PRAGMA journal_mode=WAL")
+                self._wal_initialized = True
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+        except Exception:
+            conn.close()
+            raise
         return conn
 
     def _migrate_legacy_single_tenant_tables(self, conn: sqlite3.Connection):
@@ -424,14 +432,18 @@ class AsyncDatabaseManager:
         Idempotently initializes clean default exchanges & starter symbols for `user_id`
         if that user has no existing rows yet.
         """
+        uid = int(user_id)
+        if uid in self._initialized_workspaces:
+            return
         conn = self._connect()
         try:
             cur = conn.cursor()
             existing_ex = {
                 r[0]
-                for r in cur.execute("SELECT exchange_id FROM exchanges WHERE user_id = ?", (user_id,)).fetchall()
+                for r in cur.execute("SELECT exchange_id FROM exchanges WHERE user_id = ?", (uid,)).fetchall()
             }
             is_brand_new = len(existing_ex) == 0
+            need_commit = False
             for ex_id, name, role, vip, taker, maker, active in DEFAULT_EXCHANGES:
                 if ex_id not in existing_ex:
                     eff_role = role if is_brand_new else "follower"
@@ -440,9 +452,10 @@ class AsyncDatabaseManager:
                         """INSERT OR IGNORE INTO exchanges
                            (user_id, exchange_id, display_name, role, vip_level, taker_fee, maker_fee, is_active)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (user_id, ex_id, name, eff_role, vip, taker, maker, eff_active),
+                        (uid, ex_id, name, eff_role, vip, taker, maker, eff_active),
                     )
-            sym_cnt = cur.execute("SELECT COUNT(*) FROM symbol_configs WHERE user_id = ?", (user_id,)).fetchone()[0]
+                    need_commit = True
+            sym_cnt = cur.execute("SELECT COUNT(*) FROM symbol_configs WHERE user_id = ?", (uid,)).fetchone()[0]
             if sym_cnt == 0:
                 for row in DEFAULT_SYMBOLS:
                     cur.execute(
@@ -451,29 +464,38 @@ class AsyncDatabaseManager:
                             take_profit_pct, stop_loss_pct, max_hold_ms, slippage_pct,
                             beta_coeff, qty_precision, price_precision, is_running)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
-                        (user_id, *row),
+                        (uid, *row),
                     )
-            conn.commit()
+                need_commit = True
+            if need_commit:
+                conn.commit()
+            self._initialized_workspaces.add(uid)
         finally:
             conn.close()
 
     async def start_worker(self):
         if self._running:
             return
+        # Rebind asyncio.Queue to the active running event loop across TestClient / server restarts
+        old_q = self._write_queue
+        new_q: asyncio.Queue[tuple[str, tuple]] = asyncio.Queue(maxsize=10000)
+        while not old_q.empty():
+            try:
+                new_q.put_nowait(old_q.get_nowait())
+            except Exception:
+                break
+        self._write_queue = new_q
         self._running = True
         self._worker_task = asyncio.create_task(self._batch_writer_loop())
 
     async def stop_worker(self):
         self._running = False
         if self._worker_task:
+            self._worker_task.cancel()
             try:
-                await asyncio.wait_for(self._worker_task, timeout=3.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                self._worker_task.cancel()
-                try:
-                    await self._worker_task
-                except asyncio.CancelledError:
-                    pass
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
             self._worker_task = None
         await self._flush_remaining()
 
@@ -485,15 +507,16 @@ class AsyncDatabaseManager:
             logger.warning("[DB] Async write queue full (10000); dropping write: %s", sql[:80])
 
     async def _batch_writer_loop(self):
+        """Event-driven batch writer: zero idle wakeups when queue is empty; coalesces micro-bursts in 30ms."""
         while self._running:
             try:
-                first_item = await asyncio.wait_for(self._write_queue.get(), timeout=0.25)
+                first_item = await self._write_queue.get()
+                if self._write_queue.empty():
+                    await asyncio.sleep(0.03)
                 batch = [first_item]
                 while len(batch) < 128 and not self._write_queue.empty():
                     batch.append(self._write_queue.get_nowait())
                 await asyncio.to_thread(self._execute_batch_sync, batch)
-            except asyncio.TimeoutError:
-                continue
             except asyncio.CancelledError:
                 break
             except Exception as exc:

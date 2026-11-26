@@ -267,7 +267,7 @@ class OkxPrivateWsClient:
             creds = self._get_creds()
             if not creds:
                 self.connected = False
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(10.0)
                 continue
             api_key, api_secret, passphrase, is_demo = creds
             url = (
@@ -406,6 +406,28 @@ class ExecutionAdapter:
         self._leverage_configured: Dict[Tuple[str, str, int, str, str], float] = {}
         self._http_clients: Dict[Tuple[int, Optional[str]], httpx.AsyncClient] = {}
         self._retired_http_clients: List[Tuple[int, httpx.AsyncClient]] = []
+
+    def migrate_slot_orders(self, old_key: str, new_key: str):
+        """Migrates tracked protective order metadata on zero-order slot conversion (e.g. REVERSE_GRID C -> Q)."""
+        if old_key == new_key:
+            return
+        old_tp = self._active_maker_tp_orders.pop(old_key, None)
+        if old_tp is not None:
+            self._active_maker_tp_orders[new_key] = old_tp
+        old_sl = self._active_cond_sl_orders.pop(old_key, None)
+        if old_sl is not None:
+            self._active_cond_sl_orders[new_key] = old_sl
+
+    def clear_tracked_symbol_orders(self, symbol: str) -> int:
+        """Removes all local tracked Maker TP and Conditional SL records for `symbol` and returns total removed."""
+        removed = 0
+        for k in [k for k in list(self._active_maker_tp_orders.keys()) if k == symbol or k.startswith(f"{symbol}:")]:
+            if self._active_maker_tp_orders.pop(k, None) is not None:
+                removed += 1
+        for k in [k for k in list(self._active_cond_sl_orders.keys()) if k == symbol or k.startswith(f"{symbol}:")]:
+            if self._active_cond_sl_orders.pop(k, None) is not None:
+                removed += 1
+        return removed
 
     def _record_live_rtt(self, rtt_ms: float):
         if rtt_ms <= 0:
@@ -3315,6 +3337,135 @@ class ExecutionAdapter:
         except Exception as e:
             return {"ok": False, "message": f"连接 OKX 平仓接口异常 ({type(e).__name__})"}
 
+    async def cancel_all_symbol_orders_on_exchange(
+        self,
+        symbol: str,
+        exchange_cfg: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        """
+        Sweeps and cancels EVERY open order on OKX V5 for `symbol`:
+        1) All paginated regular pending orders (`limit`, `post_only`, etc.) via `cancel-batch-orders` (<= 20/batch).
+        2) All pending standard algo orders (`conditional`, `oco`, `trigger`, `move_order_stop`) via `cancel-algos` (<= 10/batch).
+        3) All pending advanced algo orders (`iceberg`, `twap`) via `cancel-advance-algos` (<= 10/batch).
+        """
+        risk = self._get_risk_cfg()
+        creds = self._extract_okx_creds(exchange_cfg) if risk.trading_mode == "LIVE" else None
+        local_cleared = self.clear_tracked_symbol_orders(symbol)
+        if not creds:
+            return {
+                "ok": True,
+                "has_live_creds": False,
+                "canceled_normal": 0,
+                "canceled_algo": 0,
+                "canceled_total": local_cleared,
+                "message": "本地保护挂单已清理",
+            }
+
+        inst_id = to_okx_inst_id(symbol)
+        proxy = get_system_proxy()
+        canceled_normal = 0
+        canceled_algo = 0
+        errors: List[str] = []
+
+        try:
+            async with self._borrow_http_client(proxy, timeout=8.0) as client:
+                # 1) Paginate & cancel all normal pending orders for `inst_id`
+                pend_ords: List[dict] = []
+                after_ord = ""
+                for _ in range(5):
+                    qs = f"/api/v5/trade/orders-pending?instType=SWAP&instId={inst_id}&limit=100" + (
+                        f"&after={after_ord}" if after_ord else ""
+                    )
+                    ord_r = await self._okx_request(client, creds, "GET", qs)
+                    if str(ord_r.get("code", "")) != "0":
+                        errors.append(f"查询普通挂单异常({ord_r.get('code')})")
+                        break
+                    chunk = list(ord_r.get("data", []) or [])
+                    pend_ords.extend(chunk)
+                    if len(chunk) < 100 or not chunk[-1].get("ordId"):
+                        break
+                    after_ord = str(chunk[-1]["ordId"])
+
+                ord_cancel_batch = [
+                    {"instId": inst_id, "ordId": str(o.get("ordId"))}
+                    for o in pend_ords
+                    if o.get("ordId")
+                ]
+                for i in range(0, len(ord_cancel_batch), 20):
+                    sub = ord_cancel_batch[i : i + 20]
+                    c_res = await self._okx_request(client, creds, "POST", "/api/v5/trade/cancel-batch-orders", sub)
+                    if str(c_res.get("code", "")) == "0":
+                        for row in c_res.get("data", []) or []:
+                            if str(row.get("sCode", "0")) in ("0", "51400", "51401"):
+                                canceled_normal += 1
+                    else:
+                        errors.append(f"批量撤单失败({c_res.get('code')})")
+
+                # 2) Query & cancel all standard algo orders (`conditional`, `oco`, `trigger`, `move_order_stop`)
+                std_algos: List[dict] = []
+                for ord_type in ("conditional", "oco", "trigger", "move_order_stop"):
+                    algo_r = await self._okx_request(
+                        client,
+                        creds,
+                        "GET",
+                        f"/api/v5/trade/orders-algo-pending?instType=SWAP&ordType={ord_type}&instId={inst_id}",
+                    )
+                    if str(algo_r.get("code", "")) == "0":
+                        for a in algo_r.get("data", []) or []:
+                            if a.get("algoId"):
+                                std_algos.append({"instId": inst_id, "algoId": str(a["algoId"])})
+
+                for i in range(0, len(std_algos), 10):
+                    sub = std_algos[i : i + 10]
+                    ca_res = await self._okx_request(client, creds, "POST", "/api/v5/trade/cancel-algos", sub)
+                    if str(ca_res.get("code", "")) == "0":
+                        for row in ca_res.get("data", []) or []:
+                            if str(row.get("sCode", "0")) in ("0", "51400", "51401"):
+                                canceled_algo += 1
+                    else:
+                        errors.append(f"策略单撤单失败({ca_res.get('code')})")
+
+                # 3) Query & cancel advanced algo orders (`iceberg`, `twap`)
+                adv_algos: List[dict] = []
+                for ord_type in ("iceberg", "twap"):
+                    adv_r = await self._okx_request(
+                        client,
+                        creds,
+                        "GET",
+                        f"/api/v5/trade/orders-algo-pending?instType=SWAP&ordType={ord_type}&instId={inst_id}",
+                    )
+                    if str(adv_r.get("code", "")) == "0":
+                        for a in adv_r.get("data", []) or []:
+                            if a.get("algoId"):
+                                adv_algos.append({"instId": inst_id, "algoId": str(a["algoId"])})
+
+                for i in range(0, len(adv_algos), 10):
+                    sub = adv_algos[i : i + 10]
+                    cadv_res = await self._okx_request(client, creds, "POST", "/api/v5/trade/cancel-advance-algos", sub)
+                    if str(cadv_res.get("code", "")) == "0":
+                        for row in cadv_res.get("data", []) or []:
+                            if str(row.get("sCode", "0")) in ("0", "51400", "51401"):
+                                canceled_algo += 1
+        except Exception as e:
+            return {
+                "ok": False,
+                "has_live_creds": True,
+                "canceled_normal": canceled_normal,
+                "canceled_algo": canceled_algo,
+                "canceled_total": max(local_cleared, canceled_normal + canceled_algo),
+                "message": f"撤销 OKX 挂单异常 ({type(e).__name__})",
+            }
+
+        total_canceled = max(local_cleared, canceled_normal + canceled_algo)
+        return {
+            "ok": len(errors) == 0,
+            "has_live_creds": True,
+            "canceled_normal": canceled_normal,
+            "canceled_algo": canceled_algo,
+            "canceled_total": total_canceled,
+            "message": "；".join(errors) if errors else f"已撤销 {inst_id} 全部在途挂单 ({total_canceled} 笔)",
+        }
+
     async def reconcile_and_cleanup_symbol_flat(
         self,
         symbol: str,
@@ -3348,18 +3499,19 @@ class ExecutionAdapter:
             ord_r = await self._okx_request(
                 client, creds, "GET", f"/api/v5/trade/orders-pending?instType=SWAP&instId={inst_id}"
             )
-            algo_r = await self._okx_request(
-                client,
-                creds,
-                "GET",
-                f"/api/v5/trade/orders-algo-pending?instType=SWAP&ordType=conditional&instId={inst_id}",
-            )
-            if (
-                str(pos_r.get("code", "")) != "0"
-                or str(ord_r.get("code", "")) != "0"
-                or str(algo_r.get("code", "")) != "0"
-            ):
+            if str(pos_r.get("code", "")) != "0" or str(ord_r.get("code", "")) != "0":
                 return None, None, None
+            all_algos = []
+            for ot in ("conditional", "oco", "trigger", "move_order_stop"):
+                algo_r = await self._okx_request(
+                    client,
+                    creds,
+                    "GET",
+                    f"/api/v5/trade/orders-algo-pending?instType=SWAP&ordType={ot}&instId={inst_id}",
+                )
+                if str(algo_r.get("code", "")) != "0":
+                    return None, None, None
+                all_algos.extend(list(algo_r.get("data", []) or []))
             open_pos = []
             for row in pos_r.get("data", []):
                 try:
@@ -3368,7 +3520,7 @@ class ExecutionAdapter:
                     rp = 0.0
                 if abs(rp) > 0.0:
                     open_pos.append(row)
-            return open_pos, list(ord_r.get("data", []) or []), list(algo_r.get("data", []) or [])
+            return open_pos, list(ord_r.get("data", []) or []), all_algos
 
         try:
             async with self._borrow_http_client(proxy, timeout=8.0) as client:

@@ -354,16 +354,23 @@ class UserMembershipManager:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self._default_admin_pwd_cached: Optional[bool] = None
+        self._wal_initialized: bool = False
 
     def _connect(self, isolation_level: Optional[str] = "") -> sqlite3.Connection:
         if isolation_level is None:
             conn = sqlite3.connect(self.db_path, timeout=15.0, isolation_level=None)
         else:
             conn = sqlite3.connect(self.db_path, timeout=15.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA temp_store=MEMORY")
+        try:
+            conn.execute("PRAGMA busy_timeout=15000")
+            if not self._wal_initialized:
+                conn.execute("PRAGMA journal_mode=WAL")
+                self._wal_initialized = True
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+        except Exception:
+            conn.close()
+            raise
         return conn
 
     def init_sync(self):
@@ -1443,18 +1450,22 @@ class UserMembershipManager:
             conn.close()
 
     def admin_update_user(self, req: AdminUpdateUserRequest) -> Dict[str, Any]:
-        conn = self._connect()
+        conn = self._connect(isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:
             cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
             row = cur.execute("SELECT * FROM users WHERE id = ?", (req.user_id,)).fetchone()
             if not row:
+                conn.rollback()
                 return {"ok": False, "message": "用户不存在"}
 
             if row["username"] == "admin":
                 if req.role is not None and req.role != "admin":
+                    conn.rollback()
                     return {"ok": False, "message": "系统默认超级管理员账号不可降级"}
                 if req.is_active is not None and not req.is_active:
+                    conn.rollback()
                     return {"ok": False, "message": "系统默认超级管理员账号不可封禁"}
 
             email = req.email.strip() if req.email is not None else row["email"]
@@ -1462,6 +1473,7 @@ class UserMembershipManager:
             is_active = (1 if req.is_active else 0) if req.is_active is not None else row["is_active"]
             if req.new_password is not None and req.new_password.strip() != "":
                 if len(req.new_password.strip()) < 6:
+                    conn.rollback()
                     return {"ok": False, "message": "重置的新密码长度至少为 6 位"}
                 pwd_hash = hash_password(req.new_password.strip())
             else:
@@ -1471,10 +1483,21 @@ class UserMembershipManager:
                 "UPDATE users SET email = ?, role = ?, is_active = ?, password_hash = ? WHERE id = ?",
                 (email, role, is_active, pwd_hash, req.user_id),
             )
+            if is_active == 0:
+                cur.execute(
+                    "UPDATE membership_orders SET status = 'EXPIRED', tx_hash = '账号封禁自动关闭未支付订单' WHERE user_id = ? AND status = 'PENDING'",
+                    (req.user_id,),
+                )
             conn.commit()
             if row["username"] == "admin" and req.new_password:
                 self._default_admin_pwd_cached = None
             return {"ok": True, "message": f"用户 {row['username']} 信息已更新"}
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
 
@@ -1493,7 +1516,7 @@ class UserMembershipManager:
             now_s = int(time.time())
             add_days = int(getattr(req, "add_days", 0) or 0)
             add_hours = int(getattr(req, "add_hours", 0) or 0)
-            if req.revoke or add_days < 0:
+            if req.revoke:
                 if row["username"] == "admin":
                     conn.rollback()
                     return {"ok": False, "message": "系统默认超级管理员不可收回实盘权限"}
@@ -1502,9 +1525,23 @@ class UserMembershipManager:
                 return {"ok": True, "message": f"已取消用户 {row['username']} 的会员资格"}
 
             total_add_sec = add_days * 86400 + add_hours * 3600
-            if total_add_sec <= 0:
+            if total_add_sec == 0:
                 conn.rollback()
-                return {"ok": False, "message": "请设置大于 0 的开通天数或小时数（如需收回会员请点击「收回会员资格」）"}
+                return {"ok": False, "message": "请设置非 0 的开通/调整天数或小时数（如需收回会员请点击「收回会员资格」）"}
+
+            if total_add_sec < 0:
+                if row["username"] == "admin":
+                    conn.rollback()
+                    return {"ok": False, "message": "系统默认超级管理员不可缩减实盘权限"}
+                cur_exp = int(row["vip_expires_at"] or 0)
+                new_exp = max(0, cur_exp + total_add_sec)
+                if new_exp <= now_s:
+                    cur.execute("UPDATE users SET vip_tier = 'NONE', vip_expires_at = 0 WHERE id = ?", (req.user_id,))
+                    conn.commit()
+                    return {"ok": True, "message": f"调整后用户 {row['username']} 会员时长已归零到期"}
+                cur.execute("UPDATE users SET vip_expires_at = ? WHERE id = ?", (new_exp, req.user_id))
+                conn.commit()
+                return {"ok": True, "message": f"已调整用户 {row['username']} 的会员有效期"}
 
             self._extend_user_vip_seconds_in_tx(cur, req.user_id, total_add_sec, req.vip_tier or "专业版会员")
             order_no = f"ADM{time.strftime('%Y%m%d%H%M%S')}{secrets.randbelow(900)+100}"
@@ -1561,6 +1598,10 @@ class UserMembershipManager:
                 conn.rollback()
                 return {"ok": False, "message": "系统默认超级管理员账号不可删除"}
             cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            cur.execute(
+                "UPDATE membership_orders SET status = 'EXPIRED', tx_hash = '关联用户已删除自动关闭订单' WHERE user_id = ? AND status = 'PENDING'",
+                (user_id,),
+            )
             # Purge all tenant credentials, strategies, and runtime state so ghost engines can never resurrect!
             existing_tables = {
                 r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -1674,9 +1715,32 @@ class UserMembershipManager:
 
             now_str = _now_str()
             if action == "APPROVE":
-                note_tx = (tx_hash or "").strip() or o_row["tx_hash"] or "管理员后台手动确认收款"
-                if note_tx.startswith("等待链上") or note_tx.startswith("30分钟"):
-                    note_tx = "管理员后台手动核验通过"
+                u_exists = cur.execute("SELECT id FROM users WHERE id = ?", (int(o_row["user_id"]),)).fetchone()
+                if not u_exists:
+                    conn.rollback()
+                    return {"ok": False, "message": "该订单关联的用户已不存在，无法开通会员"}
+
+                explicit_tx = (tx_hash or "").strip()
+                existing_tx = str(o_row["tx_hash"] or "").strip()
+                cand_tx = explicit_tx or existing_tx
+                is_real_onchain_hash = cand_tx.lower().startswith("0x") and len(cand_tx) == 66
+                if is_real_onchain_hash:
+                    norm_hash = cand_tx.lower()
+                    used_row = cur.execute(
+                        "SELECT order_no FROM consumed_tx_hashes WHERE tx_hash = ?", (norm_hash,)
+                    ).fetchone()
+                    if used_row and str(used_row[0] or "") != str(o_row["order_no"]):
+                        conn.rollback()
+                        return {"ok": False, "message": "该链上交易哈希已被其他订单核销使用，拒绝重复入账"}
+                    cur.execute(
+                        "INSERT OR IGNORE INTO consumed_tx_hashes (tx_hash, order_no, archived_at) VALUES (?, ?, ?)",
+                        (norm_hash, str(o_row["order_no"]), now_str),
+                    )
+                    note_tx = cand_tx
+                else:
+                    # Unique audit tag per order_id so `idx_paid_onchain_tx_hash` never collides across manual approvals!
+                    note_tx = f"管理员后台手动核验通过#{order_id}"
+
                 cur.execute(
                     "UPDATE membership_orders SET status = 'PAID', paid_at = ?, tx_hash = ? WHERE id = ? AND status != 'PAID'",
                     (now_str, note_tx, order_id),

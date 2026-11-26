@@ -248,9 +248,25 @@ OKX_SWAP_BASE_REMAP: Dict[str, str] = {
 OKX_INST_BASE_TO_UNIFIED: Dict[str, str] = {v: k for k, v in OKX_SWAP_BASE_REMAP.items()}
 
 
+def canonicalize_unified_symbol(symbol: str) -> str:
+    """Normalizes cross-venue aliases (e.g. 'ANTHROPIC/USDT:USDT' -> 'ANT/USDT:USDT')."""
+    s = str(symbol or "").strip().upper()
+    if s.endswith("/USDT:USDT"):
+        raw_base = s[:-len("/USDT:USDT")]
+        mapped = OKX_INST_BASE_TO_UNIFIED.get(raw_base, raw_base)
+        return f"{mapped}/USDT:USDT"
+    return s
+
+
 def to_okx_inst_id(unified_sym: str) -> str:
-    """Converts 'XRP/USDT:USDT' -> 'XRP-USDT-SWAP', 'ANT/USDT:USDT' -> 'ANTHROPIC-USDT-SWAP'."""
-    base_quote = unified_sym.split(":")[0]
+    """Converts 'XRP/USDT:USDT' -> 'XRP-USDT-SWAP', 'ANT/USDT:USDT' -> 'ANTHROPIC-USDT-SWAP' (idempotent)."""
+    s = str(unified_sym or "").strip().upper()
+    if s.endswith("-SWAP"):
+        if s.endswith("-USDT-SWAP"):
+            b = s[:-len("-USDT-SWAP")]
+            return f"{OKX_SWAP_BASE_REMAP.get(b, b)}-USDT-SWAP"
+        return s
+    base_quote = s.split(":")[0]
     parts = base_quote.split("/")
     if len(parts) == 2:
         base_u = parts[0].strip().upper()
@@ -386,6 +402,11 @@ class MarketDataGateway:
             }
 
         self.symbols: List[str] = []
+        self.leader_symbols: Optional[List[str]] = None
+        self.leader_trade_symbols: Optional[List[str]] = None
+        self._leader_version: int = 0
+        self._rest_client: Optional[httpx.AsyncClient] = None
+        self._rest_client_proxy: Optional[str] = None
         self.binance_connected: bool = False
         self.okx_connected: bool = False
         self.active_source: str = "HIGH_FREQ_SIM"
@@ -473,10 +494,20 @@ class MarketDataGateway:
         if sub:
             sub["mode"] = mode
 
-    def set_subscriber_symbols(self, sub_id: str, symbols: List[str]):
+    def set_subscriber_symbols(
+        self,
+        sub_id: str,
+        symbols: List[str],
+        leader_symbols: Optional[List[str]] = None,
+        leader_trade_symbols: Optional[List[str]] = None,
+    ):
         sub = self._subscribers.get(sub_id)
         if sub:
             sub["symbols"] = set(symbols)
+            if leader_symbols is not None:
+                sub["leader_symbols"] = set(leader_symbols)
+            if leader_trade_symbols is not None:
+                sub["leader_trade_symbols"] = set(leader_trade_symbols)
         self._recompute_symbol_union()
 
     def _merge_symbols(self, symbols: List[str]):
@@ -498,6 +529,9 @@ class MarketDataGateway:
             return
         union: List[str] = []
         seen = set()
+        has_leader_scoped = False
+        leader_union: set[str] = set()
+        trade_union: set[str] = set()
         for sub in self._subscribers.values():
             syms = sub.get("symbols")
             if syms:
@@ -505,8 +539,29 @@ class MarketDataGateway:
                     if s not in seen:
                         seen.add(s)
                         union.append(s)
-        if union:
-            self.set_symbols(union)
+            if sub.get("mode") == "REAL_WS":
+                if "leader_symbols" in sub:
+                    has_leader_scoped = True
+                    leader_union.update(sub.get("leader_symbols") or set())
+                    trade_union.update(sub.get("leader_trade_symbols") or set())
+                elif syms:
+                    leader_union.update(syms)
+                    trade_union.update(syms)
+
+        if has_leader_scoped:
+            # Keep 1 lightweight anchor stream (BTC/USDT:USDT) when crypto symbols exist so `binance_connected` health stays live
+            crypto_union = [s for s in union if not is_usd_equity_sym(s)]
+            if not leader_union and crypto_union:
+                anchor = "BTC/USDT:USDT" if "BTC/USDT:USDT" in crypto_union else crypto_union[0]
+                leader_union.add(anchor)
+            next_l = sorted(s for s in leader_union if not is_usd_equity_sym(s))
+            next_t = sorted(s for s in trade_union if not is_usd_equity_sym(s))
+            if next_l != self.leader_symbols or next_t != self.leader_trade_symbols:
+                self.leader_symbols = next_l
+                self.leader_trade_symbols = next_t
+                self._leader_version += 1
+
+        self.set_symbols(union)
 
     def _has_mode_subscriber(self, mode: str) -> bool:
         if mode == "REAL_WS" and self._feed_mode != "SIMULATOR":
@@ -811,7 +866,16 @@ class MarketDataGateway:
         ok_any = False
 
         try:
-            async with httpx.AsyncClient(proxy=self.proxy_url, timeout=4.0) as client:
+            if self._rest_client is None or self._rest_client.is_closed or self._rest_client_proxy != self.proxy_url:
+                if self._rest_client is not None and not self._rest_client.is_closed:
+                    try:
+                        await self._rest_client.aclose()
+                    except Exception:
+                        pass
+                self._rest_client = httpx.AsyncClient(proxy=self.proxy_url, timeout=4.0)
+                self._rest_client_proxy = self.proxy_url
+            client = self._rest_client
+            if True:
                 t0 = mono_ms()
                 bn_task = client.get("https://fapi.binance.com/fapi/v1/ticker/bookTicker")
                 okx_task = client.get("https://www.okx.com/api/v5/market/tickers?instType=SWAP")
@@ -1152,6 +1216,12 @@ class MarketDataGateway:
         for t in self._tasks:
             t.cancel()
         self._tasks.clear()
+        if self._rest_client is not None and not self._rest_client.is_closed:
+            try:
+                await self._rest_client.aclose()
+            except Exception:
+                pass
+            self._rest_client = None
 
     def inject_pulse(self, req: PulseInjectionRequest):
         self.touch_simulator_demand()
@@ -1186,18 +1256,29 @@ class MarketDataGateway:
 
             self._resubscribe_flag = False
             sym_ver = self._symbols_version
+            l_ver = self._leader_version
             self.proxy_url = get_system_proxy()
-            crypto_syms = [s for s in self.symbols if not is_usd_equity_sym(s)]
-            sym_map = {to_binance_stream_sym(s).upper(): s for s in crypto_syms}
+            active_l_syms = (
+                [s for s in self.leader_symbols if not is_usd_equity_sym(s)]
+                if self.leader_symbols is not None
+                else [s for s in self.symbols if not is_usd_equity_sym(s)]
+            )
+            trade_set = (
+                set(self.leader_trade_symbols)
+                if self.leader_trade_symbols is not None
+                else set(active_l_syms)
+            )
+            sym_map = {to_binance_stream_sym(s).upper(): s for s in active_l_syms}
             streams = []
-            for s in crypto_syms:
+            for s in active_l_syms:
                 raw = to_binance_stream_sym(s)
                 if _BINANCE_INSTRUMENT_CACHE and raw.upper() not in _BINANCE_INSTRUMENT_CACHE:
                     continue
                 streams.append(f"{raw}@bookTicker")
-                streams.append(f"{raw}@aggTrade")
+                if s in trade_set:
+                    streams.append(f"{raw}@aggTrade")
             if not streams:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(1.5)
                 continue
             url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
 
@@ -1213,11 +1294,11 @@ class MarketDataGateway:
                     self.exchange_health["binanceusdm"]["ping_ms"] = round(min(42.0, (mono_ms() - t_conn) * 0.22), 1)
                     self.exchange_health["binanceusdm"]["status"] = "LIVE_WS"
 
-                    while self._running and sym_ver == self._symbols_version:
+                    while self._running and sym_ver == self._symbols_version and l_ver == self._leader_version:
                         try:
                             raw_msg = await asyncio.wait_for(ws.recv(), timeout=20.0)
                         except asyncio.TimeoutError:
-                            if sym_ver != self._symbols_version:
+                            if sym_ver != self._symbols_version or l_ver != self._leader_version:
                                 break
                             continue
                         self._last_binance_ws_mono = mono_ms()
@@ -1355,32 +1436,20 @@ class MarketDataGateway:
                 asyncio.create_task(self.fetch_exchange_instruments())
 
             if has_real:
-                await asyncio.sleep(0.35)
+                sleep_s = 5.0 if ws_healthy else 2.5
+                await asyncio.sleep(sleep_s)
                 if not self.symbols:
                     continue
                 now = mono_ms()
-                okx_ws_fresh = self.okx_connected and (now - self._last_okx_ws_mono < 5000.0)
-                bn_ws_fresh = self.binance_connected and (now - self._last_binance_ws_mono < 5000.0)
+                okx_ws_fresh = self.okx_connected and (now - self._last_okx_ws_mono < 15_000.0)
+                bn_ws_fresh = self.binance_connected and (now - self._last_binance_ws_mono < 15_000.0)
                 ws_healthy = okx_ws_fresh and bn_ws_fresh
-                rest_interval_ms = 12000.0 if ws_healthy else 1200.0
+                rest_interval_ms = 20_000.0 if ws_healthy else 2_500.0
                 if now - last_rest_fetch_mono >= rest_interval_ms:
                     last_rest_fetch_mono = now
-                    await self.fetch_real_bbo_snapshot(emit_immediately=True)
-                else:
-                    # Only re-stamp quiet contracts when that exchange's WS socket is alive AND symbol itself ticked within 15s
-                    for sym in list(self.symbols):
-                        f_age = now - self.real_follower_ts.get(sym, 0.0)
-                        if okx_ws_fresh and 300.0 < f_age <= 15_000.0:
-                            f_bbo = self.real_follower_bbo.get(sym)
-                            if f_bbo:
-                                self._dispatch_follower_bbo("REAL_WS", sym, f_bbo[0], f_bbo[1], f_bbo[2], f_bbo[3])
-                        l_age = now - self.real_leader_ts.get(sym, 0.0)
-                        if bn_ws_fresh and 300.0 < l_age <= 15_000.0:
-                            l_bbo = self.real_leader_bbo.get(sym)
-                            if l_bbo:
-                                self._dispatch_leader_bbo("REAL_WS", sym, l_bbo[0], l_bbo[1], l_bbo[2], l_bbo[3])
+                    await self.fetch_real_bbo_snapshot(emit_immediately=not ws_healthy)
             else:
-                sleep_sec = 30.0 if ws_healthy else 5.0
+                sleep_sec = 30.0 if ws_healthy else 10.0
                 await asyncio.sleep(sleep_sec)
                 if not self.symbols:
                     continue
@@ -1390,7 +1459,7 @@ class MarketDataGateway:
     async def _simulator_loop(self):
         """
         High-frequency (20ms tick interval) Lead-Lag market simulator for SIMULATOR subscribers.
-        Dispatches ONLY to SIMULATOR subscribers, keeping REAL_WS/LIVE engines 100% pure real data.
+        Dispatches ONLY to SIMULATOR subscribers' own symbols, keeping REAL_WS/LIVE engines 100% pure real data.
         """
         while self._running:
             now = mono_ms()
@@ -1402,7 +1471,7 @@ class MarketDataGateway:
                 self.active_source = "HIGH_FREQ_SIM"
 
             if not has_sim:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(1.0)
                 continue
 
             # Auto-idle simulator when no guest has connected for >45s and no pulse is active
@@ -1411,13 +1480,28 @@ class MarketDataGateway:
                 and "__default__" not in self._subscribers
                 and (now - self._last_sim_demand_mono > 45_000.0)
             ):
+                await asyncio.sleep(1.0)
+                continue
+
+            sim_syms_set: set[str] = set()
+            unscoped_sim = False
+            for sub in list(self._subscribers.values()):
+                if sub.get("mode") != "SIMULATOR":
+                    continue
+                ss = sub.get("symbols")
+                if ss is None:
+                    unscoped_sim = True
+                    break
+                sim_syms_set.update(ss)
+            sim_syms = list(self.symbols) if unscoped_sim else [s for s in self.symbols if s in sim_syms_set]
+            if not sim_syms:
                 await asyncio.sleep(0.5)
                 continue
 
             # Periodically generate an organic Lead-Lag pulse every ~9-14 seconds in simulator mode
-            if self.symbols and (now - self._last_auto_pulse_mono > random.uniform(8500, 13500)):
+            if sim_syms and (now - self._last_auto_pulse_mono > random.uniform(8500, 13500)):
                 self._last_auto_pulse_mono = now
-                cand_sym = random.choice(self.symbols)
+                cand_sym = random.choice(sim_syms)
                 if cand_sym not in self._active_pulses:
                     side = random.choice(["LONG", "SHORT"])
                     jump_mag = random.uniform(0.0068, 0.0098)
@@ -1434,7 +1518,7 @@ class MarketDataGateway:
                         "leader_peaked": False,
                     }
 
-            for sym in list(self.symbols):
+            for sym in sim_syms:
                 pulse = self._active_pulses.get(sym)
                 base_mid = self._sim_mid.get(sym, get_default_base_price(sym))
                 basis_ratio = self._sim_basis_ratio.get(sym, -0.0004)

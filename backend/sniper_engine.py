@@ -18,6 +18,7 @@ from backend.grid_engine import LongShortGridTracker, calc_pyramid_weights
 from backend.market_gateway import (
     MarketDataGateway,
     SP500_SYMBOL_NAMES,
+    canonicalize_unified_symbol,
     get_default_base_price,
     get_okx_instrument_spec,
     okx_inst_id_to_unified,
@@ -169,6 +170,12 @@ class BidirectionalSniperEngine:
         self._last_live_cred_warn_mono: float = 0.0
         self._grid_block_log_ts: Dict[str, float] = {}
         self._finalized_grid_order_ids: deque[str] = deque(maxlen=2000)
+        self._flat_reconcile_inflight: set[str] = set()
+        self._flat_reconcile_retry_until: Dict[str, float] = {}
+        self._last_grid_eval_bbo: Dict[str, tuple[float, float, float]] = {}
+        self._active_ws_clients: int = 0
+        self._last_activity_mono: float = mono_ms()
+        self._active_radar_symbols: set[str] = set()
 
         self.executor = ExecutionAdapter(
             get_math_state=lambda sym: self.math_states.get(sym),
@@ -221,14 +228,48 @@ class BidirectionalSniperEngine:
             return "REAL_WS"
         return "SIMULATOR"
 
+    def touch_activity(self, radar_symbol: Optional[str] = None):
+        self._last_activity_mono = mono_ms()
+        if radar_symbol:
+            rs = canonicalize_unified_symbol(radar_symbol)
+            if rs in self.strategies and rs not in self._active_radar_symbols:
+                self._active_radar_symbols = {rs}
+                self._sync_gateway_subscription()
+
     def _sync_gateway_subscription(self):
-        syms = list(self.strategies.keys())
-        if self._owns_gateway:
-            self.gateway.feed_mode = self._gateway_mode_for_self()
-            self.gateway.set_symbols(syms)
-        else:
-            self.gateway.set_subscriber_mode(self._subscriber_id, self._gateway_mode_for_self())
-            self.gateway.set_subscriber_symbols(self._subscriber_id, syms)
+        if self.is_guest_preview or self._owns_gateway:
+            syms = list(self.strategies.keys())
+            if self._owns_gateway:
+                self.gateway.feed_mode = self._gateway_mode_for_self()
+                self.gateway.set_symbols(syms)
+            else:
+                self.gateway.set_subscriber_mode(self._subscriber_id, self._gateway_mode_for_self())
+                self.gateway.set_subscriber_symbols(self._subscriber_id, syms)
+            return
+
+        # Only subscribe live WS streams for running symbols, symbols with open positions, or active UI view
+        open_grid_syms = {p.get("symbol") for p in self.active_grid_positions.values() if p.get("symbol")}
+        open_live_syms = {p.get("symbol") for p in self.exchange_live_positions.values() if p.get("symbol")}
+        has_ui = self._active_ws_clients > 0
+        syms: List[str] = []
+        leader_syms: List[str] = []
+        leader_trade_syms: List[str] = []
+        for sym, cfg in self.strategies.items():
+            is_open = sym in self.active_positions or sym in open_grid_syms or sym in open_live_syms
+            if cfg.is_running or is_open or has_ui or sym in self._active_radar_symbols:
+                syms.append(sym)
+            if (cfg.strategy_type == "LEAD_LAG" and (cfg.is_running or is_open)) or sym in self._active_radar_symbols:
+                leader_syms.append(sym)
+                if cfg.strategy_type == "LEAD_LAG" and cfg.require_volume_confirm:
+                    leader_trade_syms.append(sym)
+
+        self.gateway.set_subscriber_mode(self._subscriber_id, self._gateway_mode_for_self())
+        self.gateway.set_subscriber_symbols(
+            self._subscriber_id,
+            syms,
+            leader_symbols=leader_syms,
+            leader_trade_symbols=leader_trade_syms,
+        )
 
     def _get_symbol_exec_lock(self, sym: str) -> asyncio.Lock:
         lock = self._symbol_exec_locks.get(sym)
@@ -432,9 +473,10 @@ class BidirectionalSniperEngine:
                 mode="LIVE",
             )
 
-    async def stop(self):
-        self._save_open_strategy_state(sync=True)
-        self.persist_runtime_state(sync=True)
+    async def stop(self, skip_persist: bool = False):
+        if not skip_persist:
+            self._save_open_strategy_state(sync=True)
+            self.persist_runtime_state(sync=True)
         if self._okx_private_ws is not None:
             try:
                 await self._okx_private_ws.stop()
@@ -743,13 +785,15 @@ class BidirectionalSniperEngine:
         while True:
             try:
                 ws_ok = bool(self._okx_private_ws and self._okx_private_ws.connected)
-                await asyncio.sleep(5.0 if ws_ok else 2.5)
+                _, follower_ex_chk = self.get_leader_And_follower_cfg()
+                is_ver = self.risk_config.trading_mode == "LIVE" and follower_ex_chk.get("auth_status") == "VERIFIED"
+                await asyncio.sleep(5.0 if ws_ok else (3.0 if is_ver else 10.0))
                 tick_idx += 1
                 if self.risk_config.trading_mode == "LIVE":
                     _, follower_ex = self.get_leader_And_follower_cfg()
                     if follower_ex.get("auth_status") == "VERIFIED":
                         await self.poll_grid_protective_orders()
-                        sync_mod = 3 if ws_ok else 5
+                        sync_mod = 4 if ws_ok else 5
                         if tick_idx % sync_mod == 0:
                             await self.sync_live_exchange_positions(trigger="periodic")
             except asyncio.CancelledError:
@@ -1499,9 +1543,13 @@ class BidirectionalSniperEngine:
         if self.is_guest_preview:
             return {"ok": False, "message": "游客预览模式不可操作实盘持仓"}
 
+        symbol = canonicalize_unified_symbol(symbol)
         leader_ex, _ = self.get_leader_And_follower_cfg()
         follower_ex = self.get_execution_exchange_cfg(self.strategies.get(symbol))
+        sym_ex_id = str(follower_ex.get("exchange_id", "okx") or "okx").lower()
+        is_non_okx_route = is_usd_equity_symbol(symbol, sym_ex_id) or sym_ex_id != "okx"
         cur_mode = self.risk_config.trading_mode
+        use_live_okx = (cur_mode == "LIVE") and (not is_non_okx_route)
         manual_cd_ms = 180_000.0  # 3-minute anti-reopen cooldown after manual close
 
         m_state = self.math_states.get(symbol)
@@ -1548,7 +1596,7 @@ class BidirectionalSniperEngine:
             # 1) Reconcile & cancel protective orders BEFORE executing market close (unlocks OKX availPos!)
             remaining_slots: List[dict] = []
             already_settled_cnt = 0
-            if cur_mode == "LIVE" and tracker and cfg is not None and target_slots:
+            if use_live_okx and tracker and cfg is not None and target_slots:
                 for lv in target_slots:
                     sid = str(lv["slot_id"])
                     gk = f"{symbol}:{sid}"
@@ -1595,10 +1643,19 @@ class BidirectionalSniperEngine:
                     elif c_info.get("reconcile_uncertain"):
                         return {"ok": False, "message": f"{symbol} [{sid}] 交易所保护单状态未确认，请稍后重试防重复平仓"}
                     else:
-                        partial_ct = float(c_info.get("tp_filled_ct") or 0.0)
-                        rem_ct = float(max(Decimal("0"), Decimal(str(max(0.0, slot_ct))) - Decimal(str(max(0.0, partial_ct)))))
+                        prev_p_ct = float(lv.get("partial_maker_ct") or 0.0)
+                        prev_p_px = float(lv.get("partial_maker_px") or 0.0)
+                        now_p_ct = float(c_info.get("tp_filled_ct") or 0.0)
+                        now_p_px = float(c_info.get("tp_avg_px") or 0.0)
+                        partial_ct = prev_p_ct + now_p_ct
+                        partial_px = (
+                            (prev_p_ct * prev_p_px + now_p_ct * now_p_px) / partial_ct
+                            if (partial_ct > 0 and prev_p_ct > 0 and now_p_ct > 0)
+                            else (now_p_px or prev_p_px)
+                        )
+                        rem_ct = float(max(Decimal("0"), Decimal(str(max(0.0, slot_ct))) - Decimal(str(max(0.0, now_p_ct)))))
                         if slot_ct > 0 and rem_ct <= 0.0:
-                            avg_px = float(c_info.get("tp_avg_px") or lv.get("tp_price") or lv.get("entry_price") or live_exit_ref)
+                            avg_px = float(partial_px or lv.get("tp_price") or lv.get("entry_price") or live_exit_ref)
                             self._finalize_grid_slot_trade(
                                 cfg=cfg,
                                 tracker=tracker,
@@ -1615,7 +1672,7 @@ class BidirectionalSniperEngine:
                         else:
                             item_copy = dict(lv)
                             item_copy["_partial_maker_ct"] = partial_ct
-                            item_copy["_partial_maker_px"] = float(c_info.get("tp_avg_px") or 0.0)
+                            item_copy["_partial_maker_px"] = partial_px
                             item_copy["_partial_maker_fee"] = float(c_info.get("tp_fee_usdt") or 0.0)
                             item_copy["_rem_contracts"] = rem_ct if slot_ct > 0 else 0.0
                             item_copy["_rem_qty"] = (
@@ -1624,6 +1681,10 @@ class BidirectionalSniperEngine:
                             remaining_slots.append(item_copy)
             else:
                 for lv in target_slots:
+                    sid = str(lv["slot_id"])
+                    gk = f"{symbol}:{sid}"
+                    self.executor._active_maker_tp_orders.pop(gk, None)
+                    self.executor._active_cond_sl_orders.pop(gk, None)
                     item_copy = dict(lv)
                     item_copy["_partial_maker_ct"] = 0.0
                     item_copy["_partial_maker_px"] = 0.0
@@ -1643,7 +1704,7 @@ class BidirectionalSniperEngine:
                 eff_mgn = str(remaining_slots[0].get("mgn_mode") or real_mgn_mode)
                 ref_px = live_exit_ref or float(remaining_slots[0].get("entry_price") or 0.0)
 
-                if cur_mode == "LIVE":
+                if use_live_okx:
                     exit_res = await self.executor.execute_exit_with_retry(
                         cfg=cfg,
                         side=side,
@@ -1673,7 +1734,6 @@ class BidirectionalSniperEngine:
                     max(0.0, float(it.get("_rem_qty") or 0.0)) * max(1e-12, fill_avg) for it in remaining_slots
                 )
                 for it in remaining_slots:
-                    sid = str(it["slot_id"])
                     p_ct = float(it.get("_partial_maker_ct") or 0.0)
                     p_px = float(it.get("_partial_maker_px") or 0.0)
                     p_fee = float(it.get("_partial_maker_fee") or 0.0)
@@ -1713,18 +1773,18 @@ class BidirectionalSniperEngine:
                     lv_closed["cooldown_until_mono"] = max(float(lv_closed.get("cooldown_until_mono") or 0.0), now_after + manual_cd_ms)
                     res = {
                         "ok": True,
-                        "message": f"OKX {symbol} [{slot_id}] 已手动平仓并记入历史明细（该格暂停重开 3 分钟）",
+                        "message": f"{symbol} [{slot_id}] 已手动平仓并记入历史明细（该格暂停重开 3 分钟）",
                     }
                 else:
                     if tracker.active_grid_mode == "REVERSE_OSCILLATING":
-                        # Flat REVERSE_GRID cycle: keep verified clean + 3-min restart cooldown before re-anchoring to NONE
                         if not tracker._has_active_slots():
-                            tracker.mark_reconcile_verified_clean()
+                            if not use_live_okx:
+                                tracker.mark_reconcile_verified_clean()
                             tracker.strategy.restart_cooldown_until_mono = max(
                                 float(getattr(tracker.strategy, "restart_cooldown_until_mono", 0.0)),
                                 now_after + manual_cd_ms,
                             )
-                            tracker.strategy.cycle_phase = "COOLDOWN"
+                            tracker.strategy.cycle_phase = "COOLDOWN" if not use_live_okx else tracker.strategy.cycle_phase
                             tracker.strategy.restart_reason = "TP_COOLDOWN"
                     else:
                         if not tracker._has_active_slots() and live_mid > 0:
@@ -1736,7 +1796,7 @@ class BidirectionalSniperEngine:
                     self.exchange_live_positions.pop(f"{symbol}:{side}", None)
                     res = {
                         "ok": True,
-                        "message": f"OKX {symbol} ({'多' if side == 'LONG' else '空'}) 已手动平仓并记入历史明细（该标的暂停新开仓 3 分钟）",
+                        "message": f"{symbol} ({'多' if side == 'LONG' else '空'}) 已手动平仓并记入历史明细（该标的暂停新开仓 3 分钟）",
                     }
             elif already_settled_cnt > 0:
                 now_after = mono_ms()
@@ -1751,13 +1811,14 @@ class BidirectionalSniperEngine:
                 }
             else:
                 # Non-grid (LEAD_LAG or unmanaged exchange position) full market close
-                if cur_mode == "LIVE":
+                if use_live_okx:
                     res = await self.executor.close_exchange_position(
                         symbol=symbol, side=side, mgn_mode=real_mgn_mode, exchange_cfg=follower_ex
                     )
                     if not res.get("ok"):
                         return res
                 else:
+                    self.executor.clear_tracked_symbol_orders(symbol)
                     res = {"ok": True, "message": f"模拟持仓 {symbol} ({side}) 已平仓"}
 
                 ap = self.active_positions.get(symbol)
@@ -1828,11 +1889,186 @@ class BidirectionalSniperEngine:
                             user_id=self.user_id,
                         )
 
-        if cur_mode == "LIVE":
+        if use_live_okx:
             await self.sync_live_exchange_positions(trigger="manual_close")
         self._save_open_strategy_state()
         self.append_log("WARN", symbol, f"[手动平仓] {res.get('message', symbol)}", mode=cur_mode)
         return res
+
+    async def pause_and_close_symbol(
+        self,
+        symbol: str,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Atomically pauses a symbol's strategy (`is_running = False`), cancels ALL open/pending
+        regular + algo orders for `symbol`, and closes ALL open positions (`LONG` & `SHORT` across
+        Grid slots, `LEAD_LAG`, and unmanaged exchange positions) in both `SHADOW` and `LIVE` modes.
+        """
+        symbol = canonicalize_unified_symbol(symbol)
+        cur_mode = self.risk_config.trading_mode
+        cfg = self.strategies.get(symbol)
+
+        # 1) Immediate pre-await gate: set `is_running = False` synchronously so 0 new ticks trigger entries!
+        if cfg is not None:
+            cfg.is_running = False
+            if reason:
+                cfg.auto_disabled_reason = reason
+            if not self.is_guest_preview:
+                self.db.upsert_symbol_sync(cfg, user_id=self.user_id)
+
+        follower_ex = self.get_execution_exchange_cfg(cfg)
+        sym_ex_id = str(follower_ex.get("exchange_id", "okx") or "okx").lower()
+        is_non_okx_route = is_usd_equity_symbol(symbol, sym_ex_id) or sym_ex_id != "okx"
+        use_live_okx = (not self.is_guest_preview) and (cur_mode == "LIVE") and (not is_non_okx_route)
+
+        closed_positions = 0
+        canceled_orders = 0
+        errors: List[str] = []
+
+        # Pre-mark open grid slots EXITING and disarm ENTERING inside lock before any await
+        async with self._get_symbol_exec_lock(symbol):
+            tracker = self.grid_trackers.get(symbol)
+            if tracker is not None:
+                for lv in tracker.levels.values():
+                    st = lv.get("status")
+                    if st == "OPEN":
+                        lv["status"] = "EXITING"
+                    elif st == "ENTERING":
+                        lv["status"] = "IDLE"
+                        lv["armed"] = False
+
+        # 2) Close open positions on both LONG and SHORT sides (canceling slot protective orders first)
+        sides_to_close: List[str] = []
+        for chk_side in ("LONG", "SHORT"):
+            tracker_chk = self.grid_trackers.get(symbol)
+            has_grid_side = bool(
+                tracker_chk
+                and any(
+                    lv.get("side") == chk_side and lv.get("status") in ("OPEN", "EXITING")
+                    for lv in tracker_chk.levels.values()
+                )
+            ) or any(
+                k.startswith(f"{symbol}:") and p.get("side") == chk_side and p.get("mode", cur_mode) == cur_mode
+                for k, p in self.active_grid_positions.items()
+            )
+            ap_chk = self.active_positions.get(symbol)
+            has_ll_side = bool(ap_chk and ap_chk.get("side") == chk_side and ap_chk.get("mode", cur_mode) == cur_mode)
+            has_live_side = f"{symbol}:{chk_side}" in self.exchange_live_positions
+            if has_grid_side or has_ll_side or has_live_side:
+                sides_to_close.append(chk_side)
+
+        if self.is_guest_preview:
+            # Guest preview mode: settle shadow positions locally (manual_close_position blocks guest live safety)
+            leader_ex, _ = self.get_leader_And_follower_cfg()
+            m_state = self.math_states.get(symbol)
+            f_book = m_state.latest_follower if m_state else None
+            canceled_orders += self.executor.clear_tracked_symbol_orders(symbol)
+            async with self._get_symbol_exec_lock(symbol):
+                tracker = self.grid_trackers.get(symbol)
+                if tracker and cfg:
+                    for lv in list(tracker.levels.values()):
+                        if lv.get("status") in ("OPEN", "EXITING"):
+                            side_lv = str(lv.get("side") or "LONG")
+                            exit_px = (
+                                (float(f_book.bid) if side_lv == "LONG" else float(f_book.ask))
+                                if (f_book and f_book.bid > 0 and f_book.ask > 0)
+                                else float(lv.get("entry_price") or 0.0)
+                            )
+                            self._finalize_grid_slot_trade(
+                                cfg=cfg,
+                                tracker=tracker,
+                                lv=dict(lv),
+                                exit_avg=exit_px,
+                                is_maker=False,
+                                exit_reason="MANUAL_CLOSE",
+                                order_id=f"guest-pause-{wall_ms()}",
+                                latency_ms=0.0,
+                                exec_mode="SHADOW",
+                            )
+                            closed_positions += 1
+                ap_g = self.active_positions.pop(symbol, None)
+                if ap_g:
+                    closed_positions += 1
+                    self.symbol_states[symbol] = SniperState.IDLE
+        else:
+            for side_c in sides_to_close:
+                close_res = await self.manual_close_position(symbol=symbol, side=side_c, slot_id=None)
+                if close_res.get("ok"):
+                    closed_positions += 1
+                else:
+                    errors.append(close_res.get("message") or f"{side_c} 平仓未确认")
+
+        # 3) Sweep & cancel ALL remaining resting orders & algos (`conditional`, `oco`, `trigger`, `move_order_stop`, `iceberg`, `twap`)
+        if use_live_okx:
+            cancel_res = await self.executor.cancel_all_symbol_orders_on_exchange(symbol, exchange_cfg=follower_ex)
+            canceled_orders += int(cancel_res.get("canceled_total") or 0)
+            if not cancel_res.get("ok") and cancel_res.get("has_live_creds"):
+                errors.append(cancel_res.get("message") or "撤销挂单异常")
+            flat_res = await self.executor.reconcile_and_cleanup_symbol_flat(symbol, exchange_cfg=follower_ex)
+            if flat_res.get("cleaned"):
+                closed_positions = max(closed_positions, 1)
+            if not flat_res.get("is_flat") and self.executor._extract_okx_creds(follower_ex):
+                errors.append(flat_res.get("message") or "交易所残余仓位/挂单未清空")
+        else:
+            canceled_orders += self.executor.clear_tracked_symbol_orders(symbol)
+
+        # 4) Final state cleanup if no errors remain (fail-closed if live exchange close failed!)
+        async with self._get_symbol_exec_lock(symbol):
+            if not errors:
+                for gk in [k for k in list(self.active_grid_positions.keys()) if k.startswith(f"{symbol}:")]:
+                    self.active_grid_positions.pop(gk, None)
+                for uk in [k for k in list(self._uncertain_grid_notional.keys()) if k.startswith(f"{symbol}:")]:
+                    self._uncertain_grid_notional.pop(uk, None)
+                self.exchange_live_positions.pop(f"{symbol}:LONG", None)
+                self.exchange_live_positions.pop(f"{symbol}:SHORT", None)
+                if symbol in self.active_positions:
+                    self.active_positions.pop(symbol, None)
+                ev = self.book_events.get(symbol)
+                if ev:
+                    ev.set()
+                tracker_clean = self.grid_trackers.get(symbol)
+                if tracker_clean is not None:
+                    tracker_clean.reset_runtime_state()
+                    tracker_clean.mark_reconcile_verified_clean()
+                self._flat_reconcile_inflight.discard(symbol)
+                self._flat_reconcile_retry_until.pop(symbol, None)
+                self.symbol_states[symbol] = SniperState.IDLE
+            else:
+                self.symbol_states[symbol] = SniperState.EXIT_UNCERTAIN
+
+        if use_live_okx:
+            await self.sync_live_exchange_positions(trigger="pause_and_close")
+        self._sync_gateway_subscription()
+        self._save_open_strategy_state(sync=not self.is_guest_preview)
+
+        if errors:
+            err_summary = "；".join(errors)
+            msg = f"已暂停 {symbol} 策略运行，但部分平仓/撤单需复查：{err_summary}"
+            self.append_log("CRITICAL", symbol, f"[暂停并平仓告警] {msg}", mode=cur_mode)
+            return {
+                "ok": False,
+                "symbol": symbol,
+                "paused": True,
+                "closed_positions": closed_positions,
+                "canceled_orders": canceled_orders,
+                "message": msg,
+            }
+
+        msg = (
+            f"已暂停 {symbol} 运行 · 平仓 {closed_positions} 侧持仓 · 撤销挂单 {canceled_orders} 笔"
+            if (closed_positions > 0 or canceled_orders > 0)
+            else f"已暂停 {symbol} 策略运行（当前无在途持仓与挂单）"
+        )
+        self.append_log("WARN", symbol, f"[暂停运行并全平撤单] {msg}", mode=cur_mode)
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "paused": True,
+            "closed_positions": closed_positions,
+            "canceled_orders": canceled_orders,
+            "message": msg,
+        }
 
     async def adopt_exchange_position_into_grid(self, symbol: str) -> Dict[str, Any]:
         """Adds an unmanaged exchange open position (e.g., SNDK/NVDA) into LONG_SHORT_GRID strategy management."""
@@ -1938,6 +2174,7 @@ class BidirectionalSniperEngine:
             tracker.sync_config(cfg, current_mid=m_state.latest_follower.mid)
 
     def add_or_update_symbol(self, cfg: SymbolStrategy):
+        cfg.symbol = canonicalize_unified_symbol(cfg.symbol)
         is_new = cfg.symbol not in self.strategies
         prev_cfg = self.strategies.get(cfg.symbol)
         # Prevent switching between GRID and LEAD_LAG while positions/in-flight slots are open
@@ -2012,11 +2249,19 @@ class BidirectionalSniperEngine:
         self._save_open_strategy_state()
 
     def remove_symbol(self, symbol: str):
+        symbol = canonicalize_unified_symbol(symbol)
         tracker = self.grid_trackers.get(symbol)
         has_grid_active = bool(tracker and tracker._has_active_slots()) or any(
             k.startswith(f"{symbol}:") for k in self.active_grid_positions
         )
-        if symbol in self.strategies and self.symbol_states.get(symbol) == SniperState.IDLE and not has_grid_active:
+        has_live_ex = any(k.startswith(f"{symbol}:") for k in self.exchange_live_positions)
+        if (
+            symbol in self.strategies
+            and symbol not in self.active_positions
+            and not has_live_ex
+            and self.symbol_states.get(symbol) == SniperState.IDLE
+            and not has_grid_active
+        ):
             self.strategies.pop(symbol, None)
             self.math_states.pop(symbol, None)
             self.symbol_states.pop(symbol, None)
@@ -2025,14 +2270,18 @@ class BidirectionalSniperEngine:
             self.symbol_rolling_pnls.pop(("SHADOW", symbol), None)
             self.symbol_rolling_pnls.pop(("LIVE", symbol), None)
             self._grid_block_log_ts.pop(symbol, None)
+            self._last_grid_eval_bbo.pop(symbol, None)
+            self._active_radar_symbols.discard(symbol)
             self._symbol_exec_locks.pop(symbol, None)
             for uk in [k for k in self._uncertain_grid_notional.keys() if k.startswith(f"{symbol}:")]:
                 self._uncertain_grid_notional.pop(uk, None)
             for gk in [k for k in self.active_grid_positions.keys() if k.startswith(f"{symbol}:")]:
                 self.active_grid_positions.pop(gk, None)
+            self.executor.clear_tracked_symbol_orders(symbol)
             if not self.is_guest_preview:
                 self.db.delete_symbol_sync(symbol, user_id=self.user_id)
             self._sync_gateway_subscription()
+            self._save_open_strategy_state()
             self.append_log("WARN", symbol, f"[移除合约] 已停止并移除 {symbol} 实时监控")
 
     def validate_and_batch_update_symbols(self, req: BatchSymbolUpdateRequest) -> Dict[str, Any]:
@@ -2465,6 +2714,15 @@ class BidirectionalSniperEngine:
         _, follower_ex = self.get_leader_And_follower_cfg()
         if exchange_id == "ALL" or follower_ex.get("exchange_id") == exchange_id:
             self.trading_active_by_mode["LIVE"] = False
+            self.exchange_live_positions.clear()
+            if self._okx_private_ws is not None:
+                ws_ref = self._okx_private_ws
+                self._okx_private_ws = None
+                try:
+                    asyncio.get_running_loop()
+                    self._spawn_task(ws_ref.stop())
+                except RuntimeError:
+                    ws_ref._running = False
 
         msg = f"已清除 {disp} 本地加密保存的 API Key、Secret 及口令数据"
         self.append_log("WARN", "AUTH", f"[清除API密钥] {msg}", mode="LIVE")
@@ -2696,12 +2954,19 @@ class BidirectionalSniperEngine:
         m_state = self.math_states.get(sym)
         if not m_state:
             return
-        m_state.on_follower_tick(bid, ask, bid_qty, ask_qty)
+        cfg = self.strategies.get(sym)
+        use_full_math = (
+            self.is_guest_preview
+            or (cfg is not None and cfg.strategy_type == "LEAD_LAG")
+            or (sym in self._active_radar_symbols)
+        )
+        if use_full_math:
+            m_state.on_follower_tick(bid, ask, bid_qty, ask_qty)
+        else:
+            m_state.on_follower_tick_light(bid, ask, bid_qty, ask_qty)
         ev = self.book_events.get(sym)
         if ev:
             ev.set()
-
-        cfg = self.strategies.get(sym)
 
         # Keep exchange-authoritative live positions' mark price & USDT PnL updated tick-by-tick
         if not self.is_guest_preview and self.risk_config.trading_mode == "LIVE" and self.exchange_live_positions:
@@ -2750,6 +3015,19 @@ class BidirectionalSniperEngine:
         if not is_grid_strategy(cfg.strategy_type):
             return
 
+        # Deduplicate top-of-book size flickers on OKX `bbo-tbt` when `(bid, ask)` price is unchanged
+        now_tick_m = mono_ms()
+        prev_eval = self._last_grid_eval_bbo.get(sym)
+        if (
+            prev_eval is not None
+            and prev_eval[0] == bid
+            and prev_eval[1] == ask
+            and (now_tick_m - prev_eval[2] < 400.0)
+            and not self.risk_config.kill_switch_active
+        ):
+            return
+        self._last_grid_eval_bbo[sym] = (bid, ask, now_tick_m)
+
         tracker = self.grid_trackers.get(sym)
         if not tracker:
             tracker = LongShortGridTracker(sym, strategy_type=cfg.strategy_type)
@@ -2759,17 +3037,19 @@ class BidirectionalSniperEngine:
         tracker.sync_config(cfg, current_mid=mid, bbw_info=bbw_info)
 
         cur_mode = self.risk_config.trading_mode
-        if self.is_guest_preview or cur_mode == "SHADOW":
-            # Keep guest preview radar scan ticks alive cleanly for grid symbols too
+        if self.is_guest_preview or cur_mode == "SHADOW" or cfg.is_running:
             self.scan_ticks_by_mode[cur_mode] = self.scan_ticks_by_mode.get(cur_mode, 0) + 1
 
-        # Update live mark price & real-time unrealized PnL on all open grid positions
+        # Update live mark price & real-time unrealized PnL on open grid positions for `sym` only
         follower_ex = self.get_execution_exchange_cfg(cfg)
         sym_ex_id = str(follower_ex.get("exchange_id", "okx") or "okx").lower()
         is_trad_or_non_okx = is_usd_equity_symbol(sym, sym_ex_id) or sym_ex_id != "okx"
         grid_rt_fee = self._get_grid_rt_fee(cfg, tracker.active_grid_mode, follower_ex)
+        has_open_grid_for_sym = False
+        sym_prefix = f"{sym}:"
         for gk, gpos in list(self.active_grid_positions.items()):
-            if gpos.get("symbol") == sym:
+            if gk.startswith(sym_prefix):
+                has_open_grid_for_sym = True
                 e_px = float(gpos.get("entry_price") or 0.0)
                 if e_px > 0:
                     mark_px = bid if gpos["side"] == "LONG" else ask
@@ -2798,13 +3078,24 @@ class BidirectionalSniperEngine:
                 or not self._owner_vip_enforced_stop
             ):
                 self._spawn_task(self.enforce_vip_expired_stop())
-            return
+            # Never freeze software TP/SL/trailing exits on already-open positions when VIP expires!
+            if not has_open_grid_for_sym and not tracker._has_active_slots():
+                return
 
         allow_recenter = (
-            cfg.is_running
+            vip_ok_rt
+            and cfg.is_running
             and not self.risk_config.kill_switch_active
             and bool(self.trading_active_by_mode.get(cur_mode, False))
         )
+        if (
+            not allow_recenter
+            and not has_open_grid_for_sym
+            and not tracker._has_active_slots()
+            and not tracker.needs_post_cycle_flat_reconcile()
+            and not self.risk_config.kill_switch_active
+        ):
+            return
         allow_entries = allow_recenter and self._passes_grid_risk_checks(cfg)
         if cur_mode == "LIVE":
             if is_trad_or_non_okx:
@@ -2862,6 +3153,7 @@ class BidirectionalSniperEngine:
                             sym, old_gk, exchange_cfg=follower_ex, cancel_tp=True, cancel_sl=False
                         )
                     )
+                self.executor.migrate_slot_orders(old_gk, new_gk)
             self._save_open_strategy_state()
 
         # Post-cycle flat reconciliation & residual cleanup (REVERSE_GRID restart gate)
@@ -2927,6 +3219,9 @@ class BidirectionalSniperEngine:
             self._spawn_task(self._run_grid_entry(cfg, tracker, en_item, cur_mode))
 
     def _handle_leader_trade(self, sym: str, side: str, price: float, qty: float):
+        cfg = self.strategies.get(sym)
+        if not self.is_guest_preview and (not cfg or cfg.strategy_type != "LEAD_LAG") and sym not in self._active_radar_symbols:
+            return
         m_state = self.math_states.get(sym)
         if m_state:
             m_state.on_leader_trade(side, price, qty)
@@ -2938,6 +3233,10 @@ class BidirectionalSniperEngine:
             return
 
         cur_mode = self.risk_config.trading_mode
+        if cfg.strategy_type != "LEAD_LAG" and not self.is_guest_preview and sym not in self._active_radar_symbols:
+            # Pure-grid non-radar symbol: skip heavy 2400-sample bisect/log/radar math!
+            return
+
         self.scan_ticks_by_mode[cur_mode] = self.scan_ticks_by_mode.get(cur_mode, 0) + 1
 
         state = self.symbol_states.get(sym, SniperState.IDLE)
@@ -4088,7 +4387,12 @@ class BidirectionalSniperEngine:
                 if not self.is_owner_vip_valid_realtime():
                     await self.enforce_vip_expired_stop()
                     return
-                if self.risk_config.kill_switch_active or self.risk_config.trading_mode != exec_mode:
+                if (
+                    not cfg.is_running
+                    or self.risk_config.kill_switch_active
+                    or self.risk_config.trading_mode != exec_mode
+                ):
+                    self.symbol_states[sym] = SniperState.IDLE
                     return
                 entry_res = await self.executor.place_entry_ioc(
                     cfg=cfg,
@@ -5085,6 +5389,7 @@ class BidirectionalSniperEngine:
                     "fees": round(float(raw_st.get("fees", 0.0)), 4),
                     "net_pnl": round(float(raw_st.get("net_pnl", 0.0)), 4),
                     "unrealized_pnl": unrealized_usdt,
+                    "open_positions_count": len(open_pos_list),
                     "best_trade_pnl": round(float(raw_st.get("best_trade_pnl", 0.0)), 4),
                     "worst_trade_pnl": round(float(raw_st.get("worst_trade_pnl", 0.0)), 4),
                     "avg_hold_ms": int(raw_st.get("avg_hold_ms", 0)),

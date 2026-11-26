@@ -156,6 +156,34 @@ class SymbolMathState:
             del ts_list[:cut]
             del tick_list[:cut]
 
+    def on_follower_tick_light(
+        self,
+        bid: float,
+        ask: float,
+        bid_qty: float = 10.0,
+        ask_qty: float = 10.0,
+        now_mono: Optional[float] = None,
+    ) -> TickSample:
+        """
+        Lightweight O(1) top-of-book update for pure-grid symbols not currently opened in the Radar chart.
+        Avoids allocating 2,400-tick history lists and covariance math on every 10ms OKX `bbo-tbt` frame.
+        """
+        if now_mono is None:
+            now_mono = mono_ms()
+        if not (math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask >= bid):
+            return self.latest_follower or TickSample(now_mono, wall_ms(), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        prev = self.latest_follower
+        if prev is not None and prev.bid == bid and prev.ask == ask:
+            prev.mono_ts = now_mono
+            prev.bid_qty = bid_qty
+            prev.ask_qty = ask_qty
+            return prev
+        mid = (bid + ask) * 0.5
+        micro = self.compute_microprice(bid, ask, bid_qty, ask_qty)
+        sample = TickSample(now_mono, wall_ms(), bid, ask, bid_qty, ask_qty, mid, micro)
+        self.latest_follower = sample
+        return sample
+
     def on_follower_tick(self, bid: float, ask: float, bid_qty: float = 10.0, ask_qty: float = 10.0, now_mono: Optional[float] = None) -> TickSample:
         if now_mono is None:
             now_mono = mono_ms()

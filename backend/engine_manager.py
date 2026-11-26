@@ -127,12 +127,14 @@ class EngineManager:
             self.user_engines[uid] = eng
             return eng
 
-    async def stop_user_engine(self, user_id: int):
+    async def stop_user_engine(self, user_id: int, skip_persist: bool = False):
         uid = int(user_id)
         async with self._lock_for(uid):
             eng = self.user_engines.pop(uid, None)
             if eng is not None:
-                await eng.stop()
+                await eng.stop(skip_persist=skip_persist)
+        if skip_persist:
+            self.db._initialized_workspaces.discard(uid)
 
     def get_runtime_status_map(self) -> Dict[int, dict]:
         out: Dict[int, dict] = {}
@@ -155,27 +157,30 @@ class EngineManager:
         return out
 
     async def _vip_guard_loop(self):
-        """Enforces membership expiration every 5 seconds & prunes aged SQLite MISSED order/event logs every 6 hours."""
+        """Enforces membership expiration every 6s off the main loop, evicts idle flat engines, & prunes old DB logs."""
         tick = 0
         while self._running:
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(6.0)
             tick += 1
-            # Run DB housekeeping 1 min after boot and every 6 hours thereafter (non-blocking)
-            if tick == 12 or tick % 4320 == 0:
+            # Run DB housekeeping ~1 min after boot and every 6 hours thereafter (non-blocking)
+            if tick == 10 or tick % 3600 == 0:
                 try:
                     await asyncio.to_thread(self.db.cleanup_old_records_sync, 48, 14)
                 except Exception:
                     pass
             if not self._get_user_fn:
                 continue
+            from backend.math_engine import mono_ms
+            now_m = mono_ms()
             for uid, eng in list(self.user_engines.items()):
                 try:
-                    u = self._get_user_fn(uid)
+                    u = await asyncio.to_thread(self._get_user_fn, uid)
                     eng.sync_owner_vip_status(u)
                     if not u or not u.get("is_active", True):
                         await eng.enforce_vip_expired_stop("账号已被禁用或删除，所有策略已立即停止")
-                        await self.stop_user_engine(uid)
-                    elif not u.get("can_use_live", False):
+                        await self.stop_user_engine(uid, skip_persist=(u is None))
+                        continue
+                    if not u.get("can_use_live", False):
                         if (
                             eng.trading_active_by_mode.get("LIVE")
                             or eng.trading_active_by_mode.get("SHADOW")
@@ -184,5 +189,20 @@ class EngineManager:
                             await eng.enforce_vip_expired_stop(
                                 "VIP 会员有效期已结束，所有正在运行的策略与自动交易已全部自动停止；续费或积分兑换会员后可重新启用"
                             )
+                    # Evict completely idle user engines (0 WS tabs, not trading, 0 open positions, >15m inactive)
+                    has_open_pos = bool(
+                        eng.active_positions or eng.active_grid_positions or eng.exchange_live_positions
+                    )
+                    is_actively_trading = (
+                        bool(eng.trading_active_by_mode.get("LIVE") or eng.trading_active_by_mode.get("SHADOW"))
+                        and any(c.is_running for c in eng.strategies.values())
+                    )
+                    if (
+                        getattr(eng, "_active_ws_clients", 0) <= 0
+                        and not is_actively_trading
+                        and not has_open_pos
+                        and (now_m - getattr(eng, "_last_activity_mono", now_m) >= 900_000.0)
+                    ):
+                        await self.stop_user_engine(uid)
                 except Exception:
                     pass

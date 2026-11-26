@@ -737,15 +737,18 @@ class MarketSentimentService:
         self._task = None
 
     async def _refresh_loop(self):
-        # Small initial delay so FastAPI startup stays instant, then fetch live sentiment immediately
+        # Demand-gated background refresh: skips external HTTP polling when no client queried sentiment in >15m
         try:
             await asyncio.sleep(0.5)
+            await self.refresh(force=True)
             while self._running:
-                try:
-                    await self.refresh(force=True)
-                except Exception:
-                    pass
                 await asyncio.sleep(self.refresh_interval_sec)
+                last_req = getattr(self, "_last_client_req_mono", 0.0)
+                if last_req > 0.0 and (time.monotonic() - last_req <= 900.0):
+                    try:
+                        await self.refresh(force=True)
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             return
 
@@ -754,6 +757,7 @@ class MarketSentimentService:
 
     async def get_sentiment(self, force_refresh: bool = False) -> Dict[str, Any]:
         now_m = time.monotonic()
+        self._last_client_req_mono = now_m
         need_fetch = (not self._cache.get("ok")) or (
             force_refresh and (now_m - self._last_fetch_mono >= 15.0)
         ) or (now_m - self._last_fetch_mono >= self.refresh_interval_sec)

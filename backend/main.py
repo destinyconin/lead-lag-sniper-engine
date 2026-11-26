@@ -26,6 +26,7 @@ from backend.market_gateway import (
     SP500_SYMBOL_NAMES,
     _BINANCE_INSTRUMENT_CACHE,
     _OKX_INSTRUMENT_CACHE,
+    canonicalize_unified_symbol,
     get_binance_instrument_spec,
     get_default_base_price,
     get_okx_instrument_spec,
@@ -819,7 +820,7 @@ async def verify_symbol(
 @app.post("/api/symbol/update")
 async def update_symbol(cfg: SymbolStrategy, authorization: str = Header(default="")):
     _, eng = await _require_vip_engine(authorization)
-    cfg.symbol = cfg.symbol.strip().upper()
+    cfg.symbol = canonicalize_unified_symbol(cfg.symbol.strip().upper())
     if not SYMBOL_FORMAT_RE.match(cfg.symbol):
         raise HTTPException(status_code=400, detail="标的代号格式无效，加密合约应如 BTC/USDT:USDT，美股标的应如 NVDA/USD 或 BRK.B/USD")
     cfg.price_precision = min(12, max(0, int(cfg.price_precision)))
@@ -906,10 +907,27 @@ async def close_position(payload: Dict[str, Any], authorization: str = Header(de
     }
 
 
+@app.post("/api/symbol/pause-close")
+async def pause_and_close_symbol(payload: Dict[str, Any], authorization: str = Header(default="")):
+    # Allow authenticated users (including expired VIPs) and guest preview to pause a symbol and flatten exposure
+    _, eng = await _resolve_user_engine(authorization)
+    symbol = canonicalize_unified_symbol(str(payload.get("symbol") or "").strip())
+    if not symbol:
+        raise HTTPException(status_code=400, detail="缺少合约代号")
+    res = await eng.pause_and_close_symbol(symbol, reason="用户手动暂停运行并平仓撤单")
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("message", "暂停并平仓撤单存在异常"))
+    return {
+        **res,
+        "strategies": [s.model_dump() for s in eng.strategies.values()],
+        "snapshot": eng.build_dashboard_snapshot(),
+    }
+
+
 @app.post("/api/positions/adopt-grid")
 async def adopt_position_grid(payload: Dict[str, Any], authorization: str = Header(default="")):
     _, eng = await _require_vip_engine(authorization)
-    symbol = str(payload.get("symbol") or "").strip()
+    symbol = canonicalize_unified_symbol(str(payload.get("symbol") or "").strip())
     if not symbol:
         raise HTTPException(status_code=400, detail="缺少合约代号")
     res = await eng.adopt_exchange_position_into_grid(symbol)
@@ -925,11 +943,15 @@ async def adopt_position_grid(payload: Dict[str, Any], authorization: str = Head
 @app.delete("/api/symbol/{symbol:path}")
 async def delete_symbol(symbol: str, authorization: str = Header(default="")):
     _, eng = await _require_vip_engine(authorization)
+    symbol = canonicalize_unified_symbol(symbol)
     tracker = eng.grid_trackers.get(symbol)
     has_grid_pos = any(k.startswith(f"{symbol}:") for k in eng.active_grid_positions.keys()) or bool(
         tracker and tracker._has_active_slots()
     )
-    if has_grid_pos or eng.symbol_states.get(symbol) not in (None, "IDLE"):
+    has_live_pos = symbol in eng.active_positions or any(
+        k.startswith(f"{symbol}:") for k in eng.exchange_live_positions.keys()
+    )
+    if has_grid_pos or has_live_pos or eng.symbol_states.get(symbol) not in (None, "IDLE"):
         raise HTTPException(status_code=409, detail="该合约当前存在在途持仓或活跃状态，无法移除")
     eng.remove_symbol(symbol)
     return {"status": "ok", "strategies": [s.model_dump() for s in eng.strategies.values()]}
@@ -1363,8 +1385,10 @@ async def admin_update_user(req: AdminUpdateUserRequest, authorization: str = He
         raise HTTPException(status_code=400, detail=res["message"])
     if req.is_active is False:
         ban_reason = "账号已被管理员封禁，所有策略已立即停止"
+        updated_ban = await asyncio.to_thread(user_manager.get_user_by_id, req.user_id)
         eng_ban = engine_manager.user_engines.get(int(req.user_id))
         if eng_ban:
+            eng_ban.sync_owner_vip_status(updated_ban)
             await eng_ban.enforce_vip_expired_stop(ban_reason)
         else:
             await asyncio.to_thread(db_manager.stop_all_user_strategies_sync, int(req.user_id), ban_reason)
@@ -1385,6 +1409,12 @@ async def admin_update_user(req: AdminUpdateUserRequest, authorization: str = He
                 await eng.enforce_vip_expired_stop(demote_reason)
             else:
                 await asyncio.to_thread(db_manager.stop_all_user_strategies_sync, int(req.user_id), demote_reason)
+                await asyncio.to_thread(
+                    db_manager.save_runtime_setting_sync,
+                    "trading_active_by_mode",
+                    {"SHADOW": False, "LIVE": False},
+                    int(req.user_id),
+                )
         elif eng and updated_u:
             eng.sync_owner_vip_status(updated_u)
     return {**res, "dashboard": await _admin_summary_async()}
@@ -1419,10 +1449,21 @@ async def admin_grant_vip(req: AdminGrantVipRequest, authorization: str = Header
 @app.delete("/api/admin/users/{user_id}")
 async def admin_delete_user(user_id: int, authorization: str = Header(default="")):
     _require_admin(authorization)
+    target_u = await asyncio.to_thread(user_manager.get_user_by_id, user_id)
+    if target_u and target_u.get("username") == "admin":
+        raise HTTPException(status_code=400, detail="系统默认超级管理员账号不可删除")
+    # Stop the in-memory engine FIRST (without re-persisting state) so it can never resurrect deleted rows
+    eng_del = engine_manager.user_engines.get(int(user_id))
+    if eng_del:
+        eng_del.trading_active_by_mode["LIVE"] = False
+        eng_del.trading_active_by_mode["SHADOW"] = False
+        for c in eng_del.strategies.values():
+            c.is_running = False
+    await engine_manager.stop_user_engine(user_id, skip_persist=True)
+    await asyncio.sleep(0.1)
     res = await asyncio.to_thread(user_manager.admin_delete_user, user_id)
     if not res["ok"]:
         raise HTTPException(status_code=400, detail=res["message"])
-    await engine_manager.stop_user_engine(user_id)
     return {**res, "dashboard": await _admin_summary_async()}
 
 
@@ -1613,11 +1654,12 @@ async def dashboard_ws(
         if auth_hdr:
             raw_token = auth_hdr.strip().split()[-1]
 
-    user = user_manager.get_user_from_token(raw_token) if raw_token else None
+    user = await asyncio.to_thread(user_manager.get_user_from_token, raw_token) if raw_token else None
     bound_uid = int(user["id"]) if user else 0
-    ws_state = {"radar_symbol": (radar_symbol or "").strip()}
+    ws_state = {"radar_symbol": (radar_symbol or "").strip(), "hidden": False}
     tick_counter = 0
     reader_task: Optional[asyncio.Task] = None
+    counted_eng = None
 
     async def _recv_client_msgs():
         try:
@@ -1629,6 +1671,8 @@ async def dashboard_ws(
                         sym_val = str(msg.get("symbol") or "").strip()
                         if sym_val:
                             ws_state["radar_symbol"] = sym_val
+                    elif isinstance(msg, dict) and msg.get("type") == "visibility":
+                        ws_state["hidden"] = bool(msg.get("hidden"))
                 except Exception:
                     pass
         except Exception:
@@ -1637,6 +1681,10 @@ async def dashboard_ws(
     try:
         if bound_uid > 0:
             eng = await engine_manager.get_user_engine(bound_uid)
+            eng._active_ws_clients += 1
+            counted_eng = eng
+            eng.touch_activity(ws_state["radar_symbol"] or None)
+            eng._sync_gateway_subscription()
         else:
             eng = engine_manager.get_guest_engine()
 
@@ -1647,10 +1695,21 @@ async def dashboard_ws(
             if bound_uid > 0 and tick_counter % 20 == 0:
                 refreshed = await asyncio.to_thread(user_manager.get_user_from_token, raw_token)
                 if not refreshed or not refreshed.get("is_active"):
-                    bound_uid = 0
-                    eng = engine_manager.get_guest_engine()
+                    # Token revoked / user banned or deleted: notify client and close (no silent guest downgrade)
+                    try:
+                        await websocket.send_text(orjson.dumps({"type": "session_revoked"}).decode("utf-8"))
+                    except Exception:
+                        pass
+                    await websocket.close(code=4401)
+                    break
                 elif bound_uid in engine_manager.user_engines:
-                    eng = engine_manager.user_engines[bound_uid]
+                    new_eng = engine_manager.user_engines[bound_uid]
+                    if new_eng is not eng:
+                        if counted_eng is not None:
+                            counted_eng._active_ws_clients = max(0, counted_eng._active_ws_clients - 1)
+                        new_eng._active_ws_clients += 1
+                        counted_eng = new_eng
+                        eng = new_eng
                     eng.sync_owner_vip_status(refreshed)
                     if not refreshed.get("can_use_live") and (
                         eng.trading_active_by_mode.get("LIVE")
@@ -1661,6 +1720,7 @@ async def dashboard_ws(
 
             target_radar = ws_state["radar_symbol"] or None
             if bound_uid > 0:
+                eng.touch_activity(target_radar)
                 if not eng.is_owner_vip_valid_realtime() and (
                     eng.trading_active_by_mode.get("LIVE")
                     or eng.trading_active_by_mode.get("SHADOW")
@@ -1669,15 +1729,27 @@ async def dashboard_ws(
                     await eng.enforce_vip_expired_stop()
                 snapshot = eng.build_dashboard_snapshot(radar_symbol=target_radar)
             else:
+                if ws_state["hidden"]:
+                    await asyncio.sleep(2.0)
+                    continue
                 snapshot = eng.build_public_preview_snapshot(radar_symbol=target_radar)
 
             await asyncio.wait_for(websocket.send_text(orjson.dumps(snapshot).decode("utf-8")), timeout=5.0)
-            await asyncio.sleep(0.35)
+            # Throttle hidden/background tabs to 3s pushes (saves server snapshot builds, bandwidth & client CPU)
+            await asyncio.sleep(3.0 if ws_state["hidden"] else 0.35)
     except WebSocketDisconnect:
         pass
     except Exception:
         pass
     finally:
+        if counted_eng is not None:
+            counted_eng._active_ws_clients = max(0, counted_eng._active_ws_clients - 1)
+            try:
+                if counted_eng._active_ws_clients == 0:
+                    counted_eng._active_radar_symbols.clear()
+                    counted_eng._sync_gateway_subscription()
+            except Exception:
+                pass
         if reader_task is not None and not reader_task.done():
             reader_task.cancel()
             try:

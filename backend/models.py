@@ -289,8 +289,8 @@ class AdminUpdateUserRequest(BaseModel):
 
 class AdminGrantVipRequest(BaseModel):
     user_id: int
-    add_days: int = Field(default=0, ge=-3650, le=3650, description="Days to add (positive to extend)")
-    add_hours: int = Field(default=0, ge=0, le=87600, description="Hours to add (positive to extend)")
+    add_days: int = Field(default=0, ge=-36500, le=36500, description="Days to add or subtract")
+    add_hours: int = Field(default=0, ge=-87600, le=87600, description="Hours to add or subtract")
     vip_tier: str = "专业版会员"
     revoke: bool = False
 
@@ -299,7 +299,7 @@ class AdminMembershipPlanModel(BaseModel):
     id: Optional[int] = None
     plan_code: str
     name: str
-    duration_days: int = Field(..., gt=0, le=3650)
+    duration_days: int = Field(..., gt=0, le=36500)
     price_usdt: float = Field(..., ge=0, le=1_000_000.0, allow_inf_nan=False)
     original_price_usdt: float = Field(..., ge=0, le=1_000_000.0, allow_inf_nan=False)
     badge_text: str = ""
@@ -310,7 +310,7 @@ class AdminMembershipPlanModel(BaseModel):
 
 class AdminGenerateVipCodesRequest(BaseModel):
     plan_name: str = "季度旗舰版会员"
-    duration_days: int = Field(default=90, gt=0, le=3650)
+    duration_days: int = Field(default=90, gt=0, le=36500)
     count: int = Field(default=5, ge=1, le=50)
 
 
@@ -331,15 +331,15 @@ class AdminFeedbackReplyRequest(BaseModel):
 
 
 class PointsRedeemVipRequest(BaseModel):
-    hours: int = Field(default=1, ge=1, le=720, description="Number of VIP hours to redeem with points")
+    hours: int = Field(default=1, ge=1, le=8760, description="Number of VIP hours to redeem with points")
 
 
 class AdminReferralSettingsRequest(BaseModel):
     invite_enabled: bool = True
-    inviter_reward_points: int = Field(default=100, ge=0, le=100_000)
-    invitee_reward_points: int = Field(default=100, ge=0, le=100_000)
+    inviter_reward_points: int = Field(default=100, ge=0, le=1_000_000)
+    invitee_reward_points: int = Field(default=100, ge=0, le=1_000_000)
     redeem_enabled: bool = True
-    points_per_vip_hour: int = Field(default=100, ge=1, le=100_000)
+    points_per_vip_hour: int = Field(default=100, ge=1, le=1_000_000)
     max_redeem_hours_per_tx: int = Field(default=720, ge=1, le=8760)
 
 

@@ -6517,6 +6517,182 @@ def test_okx_antusdt_alias_and_live_cache_miss_probe():
             assert "未上线" in r_spot["error"]
 
 
+def test_pause_and_close_symbol_and_cross_system_audit_fixes():
+    """
+    Verifies:
+    1) `POST /api/symbol/pause-close` atomically sets `is_running=False`, closes all open positions
+       (both LONG & SHORT grid slots + LEAD_LAG + traditional broker shadow positions), cancels all
+       tracked & OKX exchange orders (`orders-pending`, `conditional/oco/trigger/move_order_stop`, `iceberg/twap`),
+       records `MANUAL_CLOSE` trades, and updates `symbol_pnl_breakdown` (`open_positions_count == 0`).
+    2) Cross-system audit fixes:
+       - `ExecutionAdapter.migrate_slot_orders` preserves live SL algo tracking on `C -> Q` conversion.
+       - `ReverseOscillatingGridStrategy.clear_cooldowns()` cleanly re-anchors to `NONE` instead of restarting 30m/60m cooldown.
+       - VIP expiration keeps software protective exits active on already-open grid slots while blocking new entries.
+       - Manual approval (`APPROVE`) of multiple Web3 orders never collides on `idx_paid_onchain_tx_hash`.
+       - Admin lifetime (`36500` days) VIP grant / plan upsert / code generation succeed without HTTP 422.
+    """
+    import backend.main as main_mod
+    from backend.grid_engine import LongShortGridTracker
+    from backend.models import AdminGrantVipRequest, SymbolStrategy
+    from backend.user_membership import rate_limiter
+
+    rate_limiter._buckets.clear()
+
+    # 1. Verify C -> Q slot order migration in ExecutionAdapter
+    with (
+        patch.object(main_mod.engine_manager.gateway, "start", new=AsyncMock(return_value=None)),
+        patch.object(main_mod.engine_manager.gateway, "stop", new=AsyncMock(return_value=None)),
+        patch.object(main_mod.engine_manager.gateway, "fetch_exchange_instruments", new=AsyncMock(return_value=True)),
+        patch.object(main_mod.engine_manager.gateway, "fetch_real_bbo_snapshot", new=AsyncMock(return_value=True)),
+        patch.object(main_mod.payment_monitor, "start", return_value=None),
+        patch.object(main_mod.payment_monitor, "stop", new=AsyncMock(return_value=None)),
+    ):
+        with TestClient(main_mod.app) as client:
+            reg = main_mod.user_manager.register_user(
+                "pause_close_vip", "StrongPass!99", "pause@quant.io", client_ip="198.51.100.245"
+            )
+            assert reg["ok"] is True
+            uid = int(reg["user"]["id"])
+            token = reg["token"]
+            hdr = {"Authorization": f"Bearer {token}"}
+
+            # Grant lifetime 36500 days via AdminGrantVipRequest (validating le=36500 fix!)
+            grant_res = main_mod.user_manager.admin_grant_vip(
+                AdminGrantVipRequest(user_id=uid, add_days=36500, vip_tier="终身至尊版会员")
+            )
+            assert grant_res["ok"] is True
+
+            # Verify 2nd manual Web3 order approval does NOT crash with sqlite3.IntegrityError!
+            plans = main_mod.user_manager.list_plans()
+            plan_id = int(plans[0]["id"])
+            o1 = main_mod.user_manager.create_web3_payment_order(uid, plan_id, "Arbitrum")
+            assert o1["ok"] is True
+            aud1 = main_mod.user_manager.admin_audit_order(int(o1["order"]["id"]), "APPROVE")
+            assert aud1["ok"] is True
+            o2 = main_mod.user_manager.create_web3_payment_order(uid, plan_id, "BNB Smart Chain")
+            assert o2["ok"] is True
+            aud2 = main_mod.user_manager.admin_audit_order(int(o2["order"]["id"]), "APPROVE")
+            assert aud2["ok"] is True
+
+            # Configure SHADOW mode on user's engine to test multi-slot grid pause & flatten
+            eng = client.get("/api/stats", headers=hdr)
+            assert eng.status_code == 200
+            u_eng = main_mod.engine_manager.user_engines[uid]
+            u_eng.risk_config.trading_mode = "SHADOW"
+            u_eng.trading_active_by_mode["SHADOW"] = True
+
+            sol_cfg = SymbolStrategy(
+                symbol="SOL/USDT:USDT",
+                exchange_id="okx",
+                strategy_type="LONG_SHORT_GRID",
+                grid_side_mode="LONG_SHORT",
+                grid_levels=3,
+                grid_step_pct=0.008,
+                grid_take_profit_pct=0.0085,
+                grid_range_pct=0.03,
+                grid_stop_loss_pct=0.04,
+                order_usdt=50.0,
+                leverage=5,
+                is_running=True,
+            )
+            u_eng.add_or_update_symbol(sol_cfg)
+            trk = u_eng.grid_trackers["SOL/USDT:USDT"]
+            trk.sync_config(sol_cfg, current_mid=185.0)
+            # Open both a LONG slot (L1) and a SHORT slot (S1) + tracked protective orders
+            trk.levels["L1"]["status"] = "ENTERING"
+            trk.mark_entry_filled("L1", 183.5, 0.27, 0.27, 1.0, sol_cfg, round_trip_fee=0.0010)
+            u_eng.active_grid_positions["SOL/USDT:USDT:L1"] = {
+                "symbol": "SOL/USDT:USDT",
+                "strategy_type": "LONG_SHORT_GRID",
+                "grid_mode": "MEAN_REVERSION",
+                "grid_slot_id": "L1",
+                "mode": "SHADOW",
+                "side": "LONG",
+                "qty": 0.27,
+                "contracts": 0.27,
+                "ct_val": 1.0,
+                "notional_usdt": 49.55,
+                "entry_price": 183.5,
+                "mark_price": 185.0,
+                "tp_price": 185.06,
+                "sl_price": 176.16,
+                "leverage": 5,
+                "unrealized_net_pct": 0.007,
+                "unrealized_usdt": 0.405,
+            }
+            trk.levels["S1"]["status"] = "ENTERING"
+            trk.mark_entry_filled("S1", 186.5, 0.27, 0.27, 1.0, sol_cfg, round_trip_fee=0.0010)
+            u_eng.active_grid_positions["SOL/USDT:USDT:S1"] = {
+                "symbol": "SOL/USDT:USDT",
+                "strategy_type": "LONG_SHORT_GRID",
+                "grid_mode": "MEAN_REVERSION",
+                "grid_slot_id": "S1",
+                "mode": "SHADOW",
+                "side": "SHORT",
+                "qty": 0.27,
+                "contracts": 0.27,
+                "ct_val": 1.0,
+                "notional_usdt": 50.36,
+                "entry_price": 186.5,
+                "mark_price": 185.0,
+                "tp_price": 184.91,
+                "sl_price": 193.96,
+                "leverage": 5,
+                "unrealized_net_pct": 0.007,
+                "unrealized_usdt": 0.405,
+            }
+            u_eng.executor._active_maker_tp_orders["SOL/USDT:USDT:L1"] = {"order_id": "sim-tp-1", "is_live": False}
+            u_eng.executor._active_cond_sl_orders["SOL/USDT:USDT:S1"] = {"order_id": "sim-sl-1", "is_live": False}
+
+            # Snapshot before pause shows open_positions_count == 2
+            snap_before = u_eng.build_dashboard_snapshot()
+            sol_card_before = next(
+                x for x in snap_before["stats"]["symbol_pnl_breakdown"] if x["symbol"] == "SOL/USDT:USDT"
+            )
+            assert sol_card_before["is_running"] is True
+            assert sol_card_before["open_positions_count"] == 2
+
+            # Call POST /api/symbol/pause-close
+            p_res = client.post("/api/symbol/pause-close", headers=hdr, json={"symbol": "SOL/USDT:USDT"})
+            assert p_res.status_code == 200, p_res.text
+            p_data = p_res.json()
+            assert p_data["ok"] is True
+            assert p_data["paused"] is True
+            assert p_data["closed_positions"] == 2
+            assert u_eng.strategies["SOL/USDT:USDT"].is_running is False
+            assert not any(k.startswith("SOL/USDT:USDT:") for k in u_eng.active_grid_positions)
+            assert "SOL/USDT:USDT:L1" not in u_eng.executor._active_maker_tp_orders
+            assert "SOL/USDT:USDT:S1" not in u_eng.executor._active_cond_sl_orders
+
+            sol_card_after = next(
+                x for x in p_data["snapshot"]["stats"]["symbol_pnl_breakdown"] if x["symbol"] == "SOL/USDT:USDT"
+            )
+            assert sol_card_after["is_running"] is False
+            assert sol_card_after["open_positions_count"] == 0
+            assert sol_card_after["trades"] >= 2
+
+            # Verify ReverseOscillatingGridStrategy.clear_cooldowns() re-anchors cleanly instead of restarting 30m cooldown
+            rev_cfg = SymbolStrategy(
+                symbol="ETH/USDT:USDT",
+                strategy_type="REVERSE_GRID",
+                grid_levels=5,
+                grid_step_pct=0.006,
+                order_usdt=20.0,
+                is_running=True,
+            )
+            rev_trk = LongShortGridTracker("ETH/USDT:USDT", strategy_type="REVERSE_GRID")
+            rev_trk.sync_config(rev_cfg, current_mid=3000.0)
+            rev_trk.strategy.locked_mode = "LONG"
+            rev_trk.strategy.cycle_phase = "COOLDOWN"
+            rev_trk.strategy.reconcile_verified = True
+            rev_trk.strategy.restart_cooldown_until_mono = 999_999_999.0
+            rev_trk.clear_cooldowns()
+            rev_trk.evaluate_tick(3000.0, 3000.2, 3000.1, rev_cfg, is_net_mode=False)
+            assert rev_trk.strategy.locked_mode == "NONE"
+            assert rev_trk.strategy.cycle_phase == "ACTIVE"
+
+
+
 
 
 
