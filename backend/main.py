@@ -1690,7 +1690,7 @@ async def dashboard_ws(
 
         reader_task = asyncio.create_task(_recv_client_msgs())
 
-        while True:
+        while engine_manager._running:
             tick_counter += 1
             if bound_uid > 0 and tick_counter % 20 == 0:
                 refreshed = await asyncio.to_thread(user_manager.get_user_from_token, raw_token)

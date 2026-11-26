@@ -1338,18 +1338,25 @@ class MarketDataGateway:
                 await asyncio.sleep(2.0)
 
     async def _okx_ws_loop(self):
-        """Native WebSocket client for OKX V5 Swap (`bbo-tbt` only, avoiding slow `tickers` overwrite)."""
+        """
+        Adaptive OKX V5 Swap WebSocket client:
+        - Subscribes 10ms `bbo-tbt` ONLY for active `LEAD_LAG` / Radar symbols requiring sub-50ms tick granularity.
+        - Subscribes 100ms event-driven `tickers` (`bidPx/askPx`) for pure `GRID` symbols (~12x lower WS frame & SSL CPU).
+        """
         while self._running:
             if not self.symbols:
                 await asyncio.sleep(0.5)
                 continue
 
             sym_ver = self._symbols_version
+            l_ver = self._leader_version
             self.proxy_url = get_system_proxy()
             inst_map = {to_okx_inst_id(s): s for s in self.symbols if not is_usd_equity_sym(s)}
             if not inst_map:
                 await asyncio.sleep(1.0)
                 continue
+            tbt_syms = set(self.leader_symbols) if self.leader_symbols is not None else set(self.symbols)
+            tbt_inst_set = {to_okx_inst_id(s) for s in tbt_syms if not is_usd_equity_sym(s)}
             url = "wss://ws.okx.com/ws/v5/public"
             try:
                 t_conn = mono_ms()
@@ -1358,7 +1365,10 @@ class MarketDataGateway:
                     conn_kwargs["proxy"] = self.proxy_url
                 async with websockets.connect(url, **conn_kwargs) as ws:
                     # Batch subscribe frames (<= 40 per frame) to avoid OKX frame limits
-                    all_args = [{"channel": "bbo-tbt", "instId": inst} for inst in inst_map.keys()]
+                    all_args = [
+                        {"channel": "bbo-tbt" if inst in tbt_inst_set else "tickers", "instId": inst}
+                        for inst in inst_map.keys()
+                    ]
                     for i in range(0, len(all_args), 40):
                         await ws.send(orjson.dumps({"op": "subscribe", "args": all_args[i : i + 40]}).decode("utf-8"))
                     self.okx_connected = True
@@ -1366,10 +1376,12 @@ class MarketDataGateway:
                     self.exchange_health["okx"]["ping_ms"] = round(min(45.0, (mono_ms() - t_conn) * 0.25), 1)
                     self.exchange_health["okx"]["status"] = "LIVE_WS"
 
-                    while self._running and sym_ver == self._symbols_version:
+                    while self._running and sym_ver == self._symbols_version and l_ver == self._leader_version:
                         try:
                             raw_msg = await asyncio.wait_for(ws.recv(), timeout=20.0)
                         except asyncio.TimeoutError:
+                            if sym_ver != self._symbols_version or l_ver != self._leader_version:
+                                break
                             # OKX V5 requires application-level text "ping" on idle sockets (< 30s)
                             await ws.send("ping")
                             continue
@@ -1387,25 +1399,43 @@ class MarketDataGateway:
                         rows = payload.get("data")
                         if not rows:
                             continue
-                        inst_id = payload.get("arg", {}).get("instId")
+                        arg_obj = payload.get("arg") or {}
+                        inst_id = arg_obj.get("instId")
+                        ch_name = arg_obj.get("channel")
                         unified_sym = inst_map.get(inst_id)
                         if not unified_sym:
                             continue
                         row = rows[0]
                         bid, ask, bid_q, ask_q = 0.0, 0.0, 0.0, 0.0
+                        spec = _OKX_INSTRUMENT_CACHE.get(inst_id)
+                        ct_val = float(spec["ctVal"]) if (spec and float(spec.get("ctVal") or 0) > 0) else 1.0
                         if "bids" in row and "asks" in row and row["bids"] and row["asks"]:
-                            spec = _OKX_INSTRUMENT_CACHE.get(inst_id)
-                            ct_val = float(spec["ctVal"]) if (spec and float(spec.get("ctVal") or 0) > 0) else 1.0
                             bid = float(row["bids"][0][0])
                             bid_q = float(row["bids"][0][1]) * ct_val
                             ask = float(row["asks"][0][0])
                             ask_q = float(row["asks"][0][1]) * ct_val
+                        elif row.get("bidPx") and row.get("askPx"):
+                            bid = float(row["bidPx"])
+                            ask = float(row["askPx"])
+                            bid_q = float(row.get("bidSz") or 100.0) * ct_val
+                            ask_q = float(row.get("askSz") or 100.0) * ct_val
 
                         if bid > 0 and ask > 0 and ask >= bid:
+                            prev_bbo = self.real_follower_bbo.get(unified_sym)
+                            prev_ts = self.real_follower_ts.get(unified_sym, 0.0)
                             self.real_follower_bbo[unified_sym] = (bid, ask, bid_q, ask_q)
                             self.real_follower_ts[unified_sym] = self._last_okx_ws_mono
                             if self._has_mode_subscriber("REAL_WS"):
                                 self._msg_counts["okx"] += 1
+                                # Skip unchanged price-only repeats on `tickers` channel within 500ms
+                                if (
+                                    ch_name == "tickers"
+                                    and prev_bbo is not None
+                                    and prev_bbo[0] == bid
+                                    and prev_bbo[1] == ask
+                                    and (self._last_okx_ws_mono - prev_ts < 500.0)
+                                ):
+                                    continue
                                 self._dispatch_follower_bbo("REAL_WS", unified_sym, bid, ask, bid_q, ask_q)
             except Exception as e:
                 self.okx_connected = False
