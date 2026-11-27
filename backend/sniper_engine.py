@@ -3241,6 +3241,21 @@ class BidirectionalSniperEngine:
 
         state = self.symbol_states.get(sym, SniperState.IDLE)
         is_locked = state != SniperState.IDLE
+        # Keep quiet OKX LEAD_LAG books fresh when the OKX WS socket itself is live & receiving frames
+        if (
+            cur_mode == "LIVE"
+            and cfg.strategy_type == "LEAD_LAG"
+            and m_state.latest_follower is not None
+            and self.gateway.okx_connected
+            and sym in self.gateway.symbols
+        ):
+            now_l_m = mono_ms()
+            if (
+                (now_l_m - self.gateway._last_okx_ws_mono) <= 3500.0
+                and (now_l_m - self.gateway.real_follower_ts.get(sym, 0.0)) <= 15_000.0
+                and (now_l_m - m_state.latest_follower.mono_ts) > cfg.max_book_staleness_ms * 0.5
+            ):
+                m_state.latest_follower.mono_ts = self.gateway._last_okx_ws_mono
         m_state.on_leader_tick(bid, ask, bid_qty, ask_qty, cfg, is_locked=is_locked)
 
         # Only LEAD_LAG symbols fire cross-exchange jump sniper entries here
@@ -5131,6 +5146,10 @@ class BidirectionalSniperEngine:
         symbols_telemetry = {}
         radar_data = {}
         target_radar_sym = (radar_symbol or "").strip() or None
+        okx_ws_age_ms = now_m - self.gateway._last_okx_ws_mono if self.gateway._last_okx_ws_mono > 0 else 9999.0
+        okx_ws_live = bool(self.gateway.okx_connected and okx_ws_age_ms <= 3500.0)
+        okx_ping_ms = float(self.gateway.exchange_health.get("okx", {}).get("ping_ms") or 18.0)
+        gw_syms_set = set(self.gateway.symbols)
 
         for sym, cfg in self.strategies.items():
             m = self.math_states.get(sym)
@@ -5140,7 +5159,32 @@ class BidirectionalSniperEngine:
             f_tick = m.latest_follower
             log_basis = m.log_basis_ema or 0.0
             basis_bps = log_basis * 10000.0
-            f_age_ms = round(now_m - f_tick.mono_ts, 1) if f_tick else 9999.0
+            sym_ex_id = str(getattr(cfg, "exchange_id", "okx") or "okx").lower()
+            is_equity_sym = is_usd_equity_symbol(sym, sym_ex_id)
+
+            raw_f_age_ms = (now_m - f_tick.mono_ts) if f_tick else 9999.0
+            gw_sym_ts = self.gateway.real_follower_ts.get(sym, 0.0)
+            if f_tick is not None and gw_sym_ts > 0.0 and cur_mode == "LIVE":
+                raw_f_age_ms = min(raw_f_age_ms, max(0.0, now_m - gw_sym_ts))
+            if (
+                f_tick is not None
+                and cur_mode == "LIVE"
+                and not is_equity_sym
+                and okx_ws_live
+                and sym in gw_syms_set
+                and gw_sym_ts > 0.0
+            ):
+                # Event-driven OKX WS (`tickers`/`bbo-tbt`) only pushes on BBO change.
+                # While the OKX WS socket itself is live (`okx_ws_age_ms <= 3.5s`), a quiet contract's
+                # BBO is confirmed unchanged as of `_last_okx_ws_mono` (real outages >3.5s still alarm!).
+                eff_ws_age = max(okx_ping_ms, min(okx_ws_age_ms, 250.0))
+                f_age_ms = round(min(max(0.0, raw_f_age_ms), eff_ws_age), 1)
+            elif self.is_guest_preview and f_tick is not None and raw_f_age_ms > 1500.0:
+                # Simulator just woke up from >45s auto-idle; avoid showing multi-hour idle gap on first frame
+                f_tick.mono_ts = now_m
+                f_age_ms = 18.0
+            else:
+                f_age_ms = round(max(0.0, raw_f_age_ms), 1)
 
             calibrated_l = (l_tick.mid * (2.718281828 ** (-log_basis))) if l_tick else 0.0
             live_spread_bps = (
@@ -5167,8 +5211,6 @@ class BidirectionalSniperEngine:
                     else "GRID_WATCH"
                 )
 
-            sym_ex_id = str(getattr(cfg, "exchange_id", "okx") or "okx").lower()
-            is_equity_sym = is_usd_equity_symbol(sym, sym_ex_id)
             sym_base = sym.split("/")[0].replace(".", "").upper()
             asset_type = (
                 "US_STOCK"

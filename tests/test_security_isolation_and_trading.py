@@ -6691,6 +6691,24 @@ def test_pause_and_close_symbol_and_cross_system_audit_fixes():
             assert rev_trk.strategy.locked_mode == "NONE"
             assert rev_trk.strategy.cycle_phase == "ACTIVE"
 
+            # Verify quiet-contract `follower_age_ms` reflects live OKX WS freshness (~ping_ms) when WS is healthy,
+            # and still alarms honestly (`> 3500ms`) when OKX WS actually disconnects/stalls!
+            from backend.math_engine import mono_ms as _mono_ms
+            u_eng.risk_config.trading_mode = "LIVE"
+            now_t = _mono_ms()
+            u_eng.math_states["SOL/USDT:USDT"].on_follower_tick_light(185.0, 185.1, now_mono=now_t - 4200.0)
+            u_eng.gateway.symbols = ["SOL/USDT:USDT"]
+            u_eng.gateway.okx_connected = True
+            u_eng.gateway._last_okx_ws_mono = now_t - 15.0
+            u_eng.gateway.real_follower_ts["SOL/USDT:USDT"] = now_t - 4200.0
+            u_eng.gateway.exchange_health["okx"]["ping_ms"] = 12.5
+            snap_live_ok = u_eng.build_dashboard_snapshot()
+            assert snap_live_ok["telemetry"]["SOL/USDT:USDT"]["follower_age_ms"] <= 50.0
+            # Simulate genuine OKX WS disconnect -> must report true stale age (> 3500ms)
+            u_eng.gateway.okx_connected = False
+            snap_live_stale = u_eng.build_dashboard_snapshot()
+            assert snap_live_stale["telemetry"]["SOL/USDT:USDT"]["follower_age_ms"] >= 3500.0
+
 
 
 
