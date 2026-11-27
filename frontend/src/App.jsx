@@ -7121,7 +7121,12 @@ export default function App() {
         {/* ==================== VIEW 4: ANALYTICS, REALITY GAP & PNL REVIEW ==================== */}
         {activeTab === 'analytics' && (
           <div className="space-y-4 sm:space-y-5">
-            <EquityChart equityCurve={stats.equity_curve || []} stats={stats} theme={theme} />
+            <EquityChart
+              equityCurve={stats.equity_curve || []}
+              stats={stats}
+              activePositions={snapshot.active_positions || []}
+              theme={theme}
+            />
 
             {/* All Open Positions Real-Time Profit & Loss Totals Panel */}
             <div className="surface-card p-4 sm:p-6 lg:p-7">
@@ -7271,27 +7276,37 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3.5 sm:gap-4">
-                {(stats.symbol_pnl_breakdown || [])
-                  .filter((item) => (showRunningOnly ? item.is_running : true))
-                  .map((item) => {
-                    const isFiltered = analyticsSymbolFilter === item.symbol;
-                    const netPositive = (item.net_pnl ?? 0) >= 0;
-                    const stateText = STATE_LABEL_MAP[item.state] || item.state || '空闲监控';
-                    const isHolding =
-                      item.state === 'HOLDING' || item.state === 'GRID_HOLDING' || item.state === 'EXIT_UNCERTAIN';
-                    return (
-                      <div
-                        key={item.symbol}
-                        onClick={() =>
-                          setAnalyticsSymbolFilter(isFiltered ? 'ALL' : item.symbol)
-                        }
-                        className={`surface-subtle p-4 sm:p-5 cursor-pointer transition flex flex-col justify-between ${
-                          isFiltered
-                            ? 'ring-2 ring-slate-900 dark:ring-sky-400'
-                            : 'hover:opacity-95'
-                        }`}
-                      >
+              {(() => {
+                const visibleCards = (stats.symbol_pnl_breakdown || []).filter((item) =>
+                  showRunningOnly ? item.is_running : true
+                );
+                return (
+                  <>
+                    {visibleCards.length > 1 && (
+                      <div className="sm:hidden flex items-center justify-between text-[11px] text-dim mb-2.5 px-0.5">
+                        <span>← 左右滑动切换各标的卡片 →</span>
+                        <span className="font-mono">共 {visibleCards.length} 个</span>
+                      </div>
+                    )}
+                    <div className="flex flex-nowrap overflow-x-auto snap-x snap-mandatory gap-3.5 pb-2.5 -mx-1 px-1 mobile-swipe-row sm:grid sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 sm:gap-4 sm:overflow-visible sm:pb-0 sm:mx-0 sm:px-0">
+                      {visibleCards.map((item) => {
+                        const isFiltered = analyticsSymbolFilter === item.symbol;
+                        const netPositive = (item.net_pnl ?? 0) >= 0;
+                        const stateText = STATE_LABEL_MAP[item.state] || item.state || '空闲监控';
+                        const isHolding =
+                          item.state === 'HOLDING' || item.state === 'GRID_HOLDING' || item.state === 'EXIT_UNCERTAIN';
+                        return (
+                          <div
+                            key={item.symbol}
+                            onClick={() =>
+                              setAnalyticsSymbolFilter(isFiltered ? 'ALL' : item.symbol)
+                            }
+                            className={`surface-subtle p-4 sm:p-5 cursor-pointer transition flex flex-col justify-between min-w-[82vw] max-w-[330px] snap-center shrink-0 sm:min-w-0 sm:max-w-none sm:snap-align-none ${
+                              isFiltered
+                                ? 'ring-2 ring-slate-900 dark:ring-sky-400'
+                                : 'hover:opacity-95'
+                            }`}
+                          >
                         <div>
                           {/* Card Top Row: Symbol & Running Status */}
                           <div className="flex flex-wrap items-center justify-between gap-1.5">
@@ -7468,10 +7483,13 @@ export default function App() {
                             )}
                           </div>
                         )}
-                      </div>
-                    );
-                  })}
-              </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                );
+              })()}
             </div>
 
             {/* Shadow-to-Live Reality Gap & Decay Diagnostic Panel (Shown only for unauthenticated preview) */}

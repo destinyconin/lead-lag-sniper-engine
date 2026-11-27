@@ -121,6 +121,11 @@
     text-rendering: optimizeLegibility;
   }
 
+  .mobile-swipe-row {
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+  }
+
   body {
     background-color: var(--bg-page);
     background-image: var(--bg-page-gradient);

@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { getChartPointIndex, useContainerChartSize } from '../utils/useContainerChartSize';
 
-export default function EquityChart({ equityCurve = [], stats = {}, theme = 'dark' }) {
+export default function EquityChart({ equityCurve = [], stats = {}, activePositions = [], theme = 'dark' }) {
   const [hoverIdx, setHoverIdx] = useState(null);
 
   const { containerRef, width, height, isCompact } = useContainerChartSize({
@@ -262,16 +262,65 @@ export default function EquityChart({ equityCurve = [], stats = {}, theme = 'dar
           </div>
         </div>
 
-        <div className="mt-3 pt-3 border-t border-line grid grid-cols-2 gap-2.5 text-xs font-mono">
-          <div className="surface-subtle p-2.5 rounded-lg">
-            <div className="text-dim text-[11px]">成交回报对账核验</div>
-            <div className="text-main font-semibold mt-0.5">{stats.reconciled_count ?? 0} 次</div>
-          </div>
-          <div className="surface-subtle p-2.5 rounded-lg">
-            <div className="text-dim text-[11px]">当前连续亏损计数</div>
-            <div className="text-main font-semibold mt-0.5">{stats.consecutive_losses ?? 0} 笔</div>
-          </div>
-        </div>
+        {(() => {
+          const pSum = stats.position_pnl_summary || {};
+          const fallbackLongSyms = new Set(
+            (activePositions || [])
+              .filter((p) => String(p?.side || '').toUpperCase() === 'LONG' && p?.symbol)
+              .map((p) => p.symbol)
+          );
+          const fallbackShortSyms = new Set(
+            (activePositions || [])
+              .filter((p) => String(p?.side || '').toUpperCase() === 'SHORT' && p?.symbol)
+              .map((p) => p.symbol)
+          );
+          const activeLongSymbols =
+            typeof stats.active_long_symbols_count === 'number'
+              ? stats.active_long_symbols_count
+              : typeof pSum.active_long_symbols_count === 'number'
+              ? pSum.active_long_symbols_count
+              : fallbackLongSyms.size;
+          const activeShortSymbols =
+            typeof stats.active_short_symbols_count === 'number'
+              ? stats.active_short_symbols_count
+              : typeof pSum.active_short_symbols_count === 'number'
+              ? pSum.active_short_symbols_count
+              : fallbackShortSyms.size;
+          const activeLongSlots =
+            typeof stats.active_long_slots === 'number'
+              ? stats.active_long_slots
+              : typeof pSum.active_long_slots === 'number'
+              ? pSum.active_long_slots
+              : (activePositions || []).filter((p) => String(p?.side || '').toUpperCase() === 'LONG').length;
+          const activeShortSlots =
+            typeof stats.active_short_slots === 'number'
+              ? stats.active_short_slots
+              : typeof pSum.active_short_slots === 'number'
+              ? pSum.active_short_slots
+              : (activePositions || []).filter((p) => String(p?.side || '').toUpperCase() === 'SHORT').length;
+          return (
+            <div className="mt-3 pt-3 border-t border-line grid grid-cols-2 gap-2.5 text-xs font-mono">
+              <div className="p-2.5 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.05]">
+                <div className="text-dim text-[11px] font-sans">当前做多标的</div>
+                <div className="text-emerald-600 dark:text-emerald-400 font-bold text-sm mt-0.5 flex items-baseline gap-1.5">
+                  <span>{activeLongSymbols} 个</span>
+                  {activeLongSlots > activeLongSymbols && (
+                    <span className="text-[10px] font-normal text-dim">({activeLongSlots} 槽位)</span>
+                  )}
+                </div>
+              </div>
+              <div className="p-2.5 rounded-lg border border-rose-500/20 bg-rose-500/[0.05]">
+                <div className="text-dim text-[11px] font-sans">当前做空标的</div>
+                <div className="text-rose-600 dark:text-rose-400 font-bold text-sm mt-0.5 flex items-baseline gap-1.5">
+                  <span>{activeShortSymbols} 个</span>
+                  {activeShortSlots > activeShortSymbols && (
+                    <span className="text-[10px] font-normal text-dim">({activeShortSlots} 槽位)</span>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
       </div>
     </div>
   );

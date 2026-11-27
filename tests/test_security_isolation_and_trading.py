@@ -6644,8 +6644,12 @@ def test_pause_and_close_symbol_and_cross_system_audit_fixes():
             u_eng.executor._active_maker_tp_orders["SOL/USDT:USDT:L1"] = {"order_id": "sim-tp-1", "is_live": False}
             u_eng.executor._active_cond_sl_orders["SOL/USDT:USDT:S1"] = {"order_id": "sim-sl-1", "is_live": False}
 
-            # Snapshot before pause shows open_positions_count == 2
+            # Snapshot before pause shows open_positions_count == 2 and active long/short symbol counts == 1 each
             snap_before = u_eng.build_dashboard_snapshot()
+            assert snap_before["stats"]["active_long_symbols_count"] == 1
+            assert snap_before["stats"]["active_short_symbols_count"] == 1
+            assert snap_before["position_pnl_summary"]["active_long_symbols_count"] == 1
+            assert snap_before["position_pnl_summary"]["active_short_symbols_count"] == 1
             sol_card_before = next(
                 x for x in snap_before["stats"]["symbol_pnl_breakdown"] if x["symbol"] == "SOL/USDT:USDT"
             )

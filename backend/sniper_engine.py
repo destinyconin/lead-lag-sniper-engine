@@ -5355,9 +5355,25 @@ class BidirectionalSniperEngine:
         total_loss_usdt = round(total_loss_usdt, 4)
         net_unrealized_usdt = round(total_profit_usdt + total_loss_usdt, 4)
         total_notional_usdt = round(total_notional_usdt, 2)
+        active_long_syms = {
+            str(p.get("symbol") or "")
+            for p in summary_entries
+            if str(p.get("side") or "").upper() == "LONG" and p.get("symbol")
+        }
+        active_short_syms = {
+            str(p.get("symbol") or "")
+            for p in summary_entries
+            if str(p.get("side") or "").upper() == "SHORT" and p.get("symbol")
+        }
+        active_long_slots = sum(1 for p in mode_positions if str(p.get("side") or "").upper() == "LONG")
+        active_short_slots = sum(1 for p in mode_positions if str(p.get("side") or "").upper() == "SHORT")
         position_pnl_summary = {
             "total_positions": len(summary_entries),
             "strategy_slots": len(mode_positions),
+            "active_long_symbols_count": len(active_long_syms),
+            "active_short_symbols_count": len(active_short_syms),
+            "active_long_slots": active_long_slots,
+            "active_short_slots": active_short_slots,
             "profit_count": profit_count,
             "loss_count": loss_count,
             "flat_count": flat_count,
@@ -5554,6 +5570,10 @@ class BidirectionalSniperEngine:
                 "win_rate_pct": win_rate,
                 "fill_rate_pct": fill_rate,
                 "profit_factor": profit_factor,
+                "active_long_symbols_count": len(active_long_syms),
+                "active_short_symbols_count": len(active_short_syms),
+                "active_long_slots": active_long_slots,
+                "active_short_slots": active_short_slots,
                 "symbol_pnl_breakdown": symbol_pnl_breakdown,
                 "position_pnl_summary": position_pnl_summary,
                 "stats_reset_at_ms": int(self.stats_reset_at_by_mode.get(cur_mode, 0) or 0),
