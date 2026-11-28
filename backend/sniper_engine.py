@@ -599,6 +599,7 @@ class BidirectionalSniperEngine:
             return
         _, follower_ex = self.get_leader_And_follower_cfg()
         escalate_item: Optional[dict] = None
+        cascade_trigger: Optional[tuple[SymbolStrategy, LongShortGridTracker, str, str, float]] = None
         async with self._get_symbol_exec_lock(sym):
             lv = tracker.levels.get(matched_sid)
             if not lv or lv.get("status") != "OPEN" or str(lv.get("cond_sl_algo_id") or "") != algo_id:
@@ -637,12 +638,14 @@ class BidirectionalSniperEngine:
                         self._save_open_strategy_state()
                         return
                     e_px = float(lv.get("entry_price") or 0.0)
+                    slot_side = str(lv.get("side") or "")
                     sl_reason = tracker.get_cond_sl_exit_reason(lv)
+                    fill_px = avg_px or float(lv.get("sl_price") or e_px)
                     self._finalize_grid_slot_trade(
                         cfg=cfg,
                         tracker=tracker,
                         lv=dict(lv),
-                        exit_avg=avg_px or float(lv.get("sl_price") or e_px),
+                        exit_avg=fill_px,
                         is_maker=False,
                         exit_reason=sl_reason,
                         order_id=str((ast.get("ord_id") if ast.get("ok") else "") or algo_id),
@@ -650,6 +653,8 @@ class BidirectionalSniperEngine:
                         exec_mode="LIVE",
                         actual_exit_fee_usdt=fee_u,
                     )
+                    if tracker.active_grid_mode == "REVERSE_OSCILLATING" and sl_reason in ("GRID_TRAIL_TP", "GRID_GLOBAL_SL"):
+                        cascade_trigger = (cfg, tracker, slot_side, sl_reason, fill_px)
                     self._save_open_strategy_state()
                 elif st_a == "effective" and child_st in ("canceled", "mmp_canceled"):
                     # Triggered SL child order was canceled with 0 fill -> immediately escalate to emergency market exit!
@@ -676,6 +681,11 @@ class BidirectionalSniperEngine:
                 self._save_open_strategy_state()
         if escalate_item is not None:
             self._spawn_task(self._run_grid_exits_batch(cfg, tracker, [escalate_item], "LIVE"))
+        if cascade_trigger is not None:
+            c_cfg, c_trk, c_side, c_reason, c_px = cascade_trigger
+            self._spawn_task(
+                self._cascade_reverse_grid_group_exit(c_cfg, c_trk, c_side, c_reason, c_px, "LIVE", delay_sec=0.35)
+            )
 
     def _get_pos_sync_lock(self) -> asyncio.Lock:
         if self._pos_sync_lock is None:
@@ -844,6 +854,7 @@ class BidirectionalSniperEngine:
         settled_count = 0
         state_changed = False
         failover_tasks: List[tuple[SymbolStrategy, LongShortGridTracker, dict]] = []
+        cascade_triggers: Dict[tuple[str, str], tuple[SymbolStrategy, LongShortGridTracker, str, str, float]] = {}
 
         for sym, sid, tp_oid, sl_aid in tracked:
             tp_missing = bool(tp_oid and tp_oid not in pending_ord_ids)
@@ -960,6 +971,8 @@ class BidirectionalSniperEngine:
                                 exec_mode="LIVE",
                                 actual_exit_fee_usdt=fee_u,
                             )
+                            if tracker.active_grid_mode == "REVERSE_OSCILLATING" and sl_reason in ("GRID_TRAIL_TP", "GRID_GLOBAL_SL"):
+                                cascade_triggers[(sym, side)] = (cfg, tracker, side, sl_reason, avg_px)
                             settled_count += 1
                             state_changed = True
                         elif st_a in ("order_failed", "partially_failed") or (st_a == "effective" and child_st in ("canceled", "mmp_canceled") and acc_ct <= 0):
@@ -981,10 +994,65 @@ class BidirectionalSniperEngine:
 
         for f_cfg, f_trk, f_item in failover_tasks:
             self._spawn_task(self._run_grid_exits_batch(f_cfg, f_trk, [f_item], "LIVE"))
+        for c_cfg, c_trk, c_side, c_reason, c_px in cascade_triggers.values():
+            self._spawn_task(
+                self._cascade_reverse_grid_group_exit(c_cfg, c_trk, c_side, c_reason, c_px, "LIVE", delay_sec=0.0)
+            )
 
         if state_changed:
             self._save_open_strategy_state()
         return settled_count
+
+    async def _cascade_reverse_grid_group_exit(
+        self,
+        cfg: SymbolStrategy,
+        tracker: LongShortGridTracker,
+        side: str,
+        trigger_reason: str,
+        ref_price: float,
+        exec_mode: str,
+        delay_sec: float = 0.0,
+    ):
+        """
+        When an exchange-side conditional SL triggers a group-ending exit (`GRID_TRAIL_TP` or
+        `GRID_GLOBAL_SL`) on one REVERSE_GRID slot (e.g., L3), closes any remaining OPEN same-side
+        slots (e.g., Q, L2, OSC) together so the group never splits across different exit times.
+        """
+        if tracker.active_grid_mode != "REVERSE_OSCILLATING":
+            return
+        if trigger_reason not in ("GRID_TRAIL_TP", "GRID_GLOBAL_SL"):
+            return
+        if delay_sec > 0:
+            await asyncio.sleep(delay_sec)
+        sym = cfg.symbol
+        cascade_items: List[dict] = []
+        async with self._get_symbol_exec_lock(sym):
+            if tracker.active_grid_mode != "REVERSE_OSCILLATING":
+                return
+            if getattr(tracker.strategy, "locked_mode", "NONE") != side:
+                return
+            for lv in tracker.levels.values():
+                if lv.get("status") == "OPEN" and lv.get("side") == side:
+                    lv["status"] = "EXITING"
+                    lv["exiting_is_sl"] = (trigger_reason == "GRID_GLOBAL_SL")
+                    cascade_items.append(
+                        {
+                            **lv,
+                            "exit_reason": trigger_reason,
+                            "target_price": float(ref_price or lv.get("sl_price") or lv.get("entry_price") or 0.0),
+                        }
+                    )
+        if not cascade_items:
+            return
+        sids_str = ",".join(sorted(str(it["slot_id"]) for it in cascade_items))
+        tag = "组移动止盈联动" if trigger_reason == "GRID_TRAIL_TP" else "全局止损联动"
+        self.append_log(
+            "WARN",
+            sym,
+            f"[{tag}] {sym} 交易所已触发 {trigger_reason}，联动平仓同组剩余槽位 [{sids_str}] 以保持整组同步收口",
+            mode=exec_mode,
+        )
+        await self._run_grid_exits_batch(cfg, tracker, cascade_items, exec_mode)
 
     async def _bbw_volatility_sync_loop(self):
         """Low-overhead periodic 15m/1H BBW + EMA20/60 trend refresh for all Grid symbols."""
@@ -3619,6 +3687,7 @@ class BidirectionalSniperEngine:
                         lv["maker_tp_touched_mono"] = 0.0
                         lv["cond_sl_algo_id"] = pstat["sl_order_id"]
                         lv["cond_sl_live"] = pstat["sl_is_live"]
+                        lv.pop("sl_needs_amend", None)
                         sl_breached_on_place = bool(pstat.get("sl_breached", False))
                         if not self.is_guest_preview:
                             close_dir = "SHORT" if side == "LONG" else "LONG"
@@ -3656,6 +3725,7 @@ class BidirectionalSniperEngine:
                                 )
 
                     # If Livermore or REVERSE_GRID group trailing raised earlier slots' SL, atomically amend live OKX SL algos!
+                    entry_cascade_trigger: Optional[tuple[str, float]] = None
                     if (tracker.uses_livermore_sl_amend() or tracker.active_grid_mode == "REVERSE_OSCILLATING") and prev_sl_map:
                         for prev_sid, old_sl in prev_sl_map.items():
                             prev_lv = tracker.levels.get(prev_sid)
@@ -3678,6 +3748,7 @@ class BidirectionalSniperEngine:
                                 if upd_st == "updated":
                                     prev_lv["cond_sl_algo_id"] = str(upd.get("algo_id") or "")
                                     prev_lv["cond_sl_live"] = bool(upd.get("sl_is_live", False))
+                                    prev_lv.pop("sl_needs_amend", None)
                                     if not self.is_guest_preview and prev_lv["cond_sl_live"] and prev_lv["cond_sl_algo_id"]:
                                         self.db.record_order_async(
                                             order_id=prev_lv["cond_sl_algo_id"],
@@ -3695,12 +3766,14 @@ class BidirectionalSniperEngine:
                                             user_id=self.user_id,
                                         )
                                 elif upd_st == "kept_old":
-                                    # Keep existing live SL algo tracked; never orphan it!
-                                    pass
+                                    # Keep existing live SL algo tracked & truthful to OKX price so next tick retries alignment!
+                                    prev_lv["sl_price"] = old_sl
+                                    prev_lv.pop("sl_needs_amend", None)
                                 elif upd_st == "old_triggered":
                                     fi = upd.get("fill_info") or {}
                                     prev_lv["cond_sl_algo_id"] = ""
                                     prev_lv["cond_sl_live"] = False
+                                    prev_lv.pop("sl_needs_amend", None)
                                     if prev_lv.get("maker_tp_live"):
                                         await self.executor.cancel_slot_protective_orders(
                                             sym, f"{sym}:{prev_sid}", exchange_cfg=follower_ex, cancel_tp=True, cancel_sl=False
@@ -3708,18 +3781,21 @@ class BidirectionalSniperEngine:
                                         prev_lv["maker_tp_order_id"] = ""
                                         prev_lv["maker_tp_live"] = False
                                     avg_px = float(fi.get("avg_px") or old_sl or prev_lv.get("entry_price") or 0.0)
+                                    prev_reason = tracker.get_cond_sl_exit_reason(prev_lv)
                                     self._finalize_grid_slot_trade(
                                         cfg=cfg,
                                         tracker=tracker,
                                         lv=dict(prev_lv),
                                         exit_avg=avg_px,
                                         is_maker=False,
-                                        exit_reason=tracker.get_cond_sl_exit_reason(prev_lv),
+                                        exit_reason=prev_reason,
                                         order_id=str(fi.get("ord_id") or "cond-sl"),
                                         latency_ms=0.0,
                                         exec_mode=exec_mode,
                                         actual_exit_fee_usdt=float(fi.get("fee_usdt") or 0.0),
                                     )
+                                    if tracker.active_grid_mode == "REVERSE_OSCILLATING" and prev_reason in ("GRID_TRAIL_TP", "GRID_GLOBAL_SL"):
+                                        entry_cascade_trigger = (prev_reason, avg_px)
                                 else:
                                     prev_lv["cond_sl_algo_id"] = ""
                                     prev_lv["cond_sl_live"] = False
@@ -3729,6 +3805,11 @@ class BidirectionalSniperEngine:
                                         f"[止损改单降级] {sym} [{prev_sid}] OKX 条件止损重建未挂起，已回退本地软件硬止损守护",
                                         mode=exec_mode,
                                     )
+                    if entry_cascade_trigger is not None:
+                        c_reason, c_px = entry_cascade_trigger
+                        self._spawn_task(
+                            self._cascade_reverse_grid_group_exit(cfg, tracker, side, c_reason, c_px, exec_mode, delay_sec=0.15)
+                        )
 
                 self.active_grid_positions[gk] = {
                     "symbol": sym,
@@ -3855,18 +3936,23 @@ class BidirectionalSniperEngine:
                         lv["maker_tp_order_id"] = ""
                         lv["maker_tp_live"] = False
                     avg_px = float(fi.get("avg_px") or new_sl or lv.get("entry_price") or 0.0)
+                    amend_reason = tracker.get_cond_sl_exit_reason(lv)
                     self._finalize_grid_slot_trade(
                         cfg=cfg,
                         tracker=tracker,
                         lv=dict(lv),
                         exit_avg=avg_px,
                         is_maker=False,
-                        exit_reason=tracker.get_cond_sl_exit_reason(lv),
+                        exit_reason=amend_reason,
                         order_id=str(fi.get("ord_id") or "cond-sl"),
                         latency_ms=0.0,
                         exec_mode=exec_mode,
                         actual_exit_fee_usdt=float(fi.get("fee_usdt") or 0.0),
                     )
+                    if tracker.active_grid_mode == "REVERSE_OSCILLATING" and amend_reason in ("GRID_TRAIL_TP", "GRID_GLOBAL_SL"):
+                        self._spawn_task(
+                            self._cascade_reverse_grid_group_exit(cfg, tracker, side, amend_reason, avg_px, exec_mode, delay_sec=0.25)
+                        )
                 elif upd_st != "kept_old":
                     lv["cond_sl_algo_id"] = ""
                     lv["cond_sl_live"] = False

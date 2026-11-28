@@ -88,6 +88,10 @@ class LongShortGridTracker:
         self._strategy.active_grid_mode = value
 
     @property
+    def locked_mode(self) -> str:
+        return str(getattr(self._strategy, "locked_mode", "NONE") or "NONE")
+
+    @property
     def completed_cycles(self) -> int:
         return self._strategy.completed_cycles
 

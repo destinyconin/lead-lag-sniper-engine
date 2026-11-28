@@ -752,14 +752,24 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             self.long_trail_stop_price = (
                 max(self.long_trail_stop_price, cand_trail) if self.long_trail_stop_price > 0 else cand_trail
             )
-            # Sync group slots' SL upward toward trail stop (throttled on >=0.20% improvement for live OKX amend)
+            # Sync ALL group slots' SL atomically to the exact same trail stop price so no slot ever
+            # hangs tighter/looser than its siblings on OKX (still throttled on >=0.20% step-up when aligned).
             target_sl = self.long_trail_stop_price
-            for lv in group_slots:
-                cur_sl = float(lv.get("sl_price") or 0.0)
-                if (self.group_floor_price > 0 and cur_sl < self.group_floor_price - 1e-9) or (
-                    cur_sl > 0 and target_sl >= cur_sl * 1.0020
-                ):
-                    if ref_price <= 0 or ref_price >= target_sl * 1.0008:
+            can_place = (target_sl > 0) and (ref_price <= 0 or ref_price >= target_sl * 1.0008)
+            existing_sls = [float(lv.get("sl_price") or 0.0) for lv in group_slots]
+            valid_sls = [sl for sl in existing_sls if sl > 0]
+            min_cur_sl = min(valid_sls) if valid_sls else 0.0
+            max_cur_sl = max(valid_sls) if valid_sls else 0.0
+            any_below_floor = any(
+                sl <= 0 or (self.group_floor_price > 0 and sl < self.group_floor_price - 1e-9)
+                for sl in existing_sls
+            )
+            any_drift = bool(len(valid_sls) >= 2 and (max_cur_sl - min_cur_sl) > 1e-9)
+            step_up = bool(min_cur_sl > 0 and target_sl >= min_cur_sl * 1.0020)
+            if can_place and (any_below_floor or any_drift or step_up):
+                for lv in group_slots:
+                    cur_sl = float(lv.get("sl_price") or 0.0)
+                    if abs(cur_sl - target_sl) > 1e-9:
                         lv["sl_price"] = target_sl
                         lv["sl_needs_amend"] = True
         elif self.locked_mode == "SHORT":
@@ -778,10 +788,21 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 min(self.short_trail_stop_price, cand_trail) if self.short_trail_stop_price > 0 else cand_trail
             )
             target_sl = self.short_trail_stop_price
-            for lv in group_slots:
-                cur_sl = float(lv.get("sl_price") or 0.0)
-                if cur_sl <= 0 or (self.group_floor_price > 0 and cur_sl > self.group_floor_price + 1e-9) or target_sl <= cur_sl * 0.9980:
-                    if ref_price <= 0 or ref_price <= target_sl * 0.9992:
+            can_place = (target_sl > 0) and (ref_price <= 0 or ref_price <= target_sl * 0.9992)
+            existing_sls = [float(lv.get("sl_price") or 0.0) for lv in group_slots]
+            valid_sls = [sl for sl in existing_sls if sl > 0]
+            min_cur_sl = min(valid_sls) if valid_sls else 0.0
+            max_cur_sl = max(valid_sls) if valid_sls else 0.0
+            any_above_floor = any(
+                sl <= 0 or (self.group_floor_price > 0 and sl > self.group_floor_price + 1e-9)
+                for sl in existing_sls
+            )
+            any_drift = bool(len(valid_sls) >= 2 and (max_cur_sl - min_cur_sl) > 1e-9)
+            step_down = bool(max_cur_sl > 0 and target_sl <= max_cur_sl * 0.9980)
+            if can_place and (any_above_floor or any_drift or step_down):
+                for lv in group_slots:
+                    cur_sl = float(lv.get("sl_price") or 0.0)
+                    if abs(cur_sl - target_sl) > 1e-9:
                         lv["sl_price"] = target_sl
                         lv["sl_needs_amend"] = True
 
@@ -1494,12 +1515,22 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                         min(self.short_trough_price, entry_price) if self.short_trough_price > 0 else entry_price
                     )
             self._recompute_group_trailing(cfg, round_trip_fee, ref_price=entry_price)
-            # Ensure newly filled pyramid slot receives trailing SL if active, otherwise global SL
-            lv["sl_price"] = (
-                (self.long_trail_stop_price if self.locked_mode == "LONG" else self.short_trail_stop_price)
-                if self.group_trail_active
-                else 0.0
-            ) or self.global_sl_price
+            # Keep newly filled pyramid slot aligned to the exact same trailing SL as its group siblings
+            # (never tighter than siblings if can_place prevented sibling amend).
+            if self.group_trail_active:
+                trail_px = self.long_trail_stop_price if self.locked_mode == "LONG" else self.short_trail_stop_price
+                peer_sls = [
+                    float(s.get("sl_price") or 0.0)
+                    for s in self._group_open_slots()
+                    if s["slot_id"] != slot_id and float(s.get("sl_price") or 0.0) > 0
+                ]
+                cur_lv_sl = float(lv.get("sl_price") or 0.0)
+                if peer_sls and abs(cur_lv_sl - trail_px) > 1e-9:
+                    lv["sl_price"] = min(peer_sls) if self.locked_mode == "LONG" else max(peer_sls)
+                else:
+                    lv["sl_price"] = trail_px or self.global_sl_price
+            else:
+                lv["sl_price"] = self.global_sl_price
         elif role == "BASE":
             lv["tp_price"] = 0.0
             lv["sl_price"] = self.global_sl_price
@@ -1513,9 +1544,17 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     )
             if self.group_trail_active:
                 self._recompute_group_trailing(cfg, round_trip_fee, ref_price=entry_price)
-                lv["sl_price"] = (
-                    self.long_trail_stop_price if self.locked_mode == "LONG" else self.short_trail_stop_price
-                ) or self.global_sl_price
+                trail_px = self.long_trail_stop_price if self.locked_mode == "LONG" else self.short_trail_stop_price
+                peer_sls = [
+                    float(s.get("sl_price") or 0.0)
+                    for s in self._group_open_slots()
+                    if s["slot_id"] != slot_id and float(s.get("sl_price") or 0.0) > 0
+                ]
+                cur_lv_sl = float(lv.get("sl_price") or 0.0)
+                if peer_sls and abs(cur_lv_sl - trail_px) > 1e-9:
+                    lv["sl_price"] = min(peer_sls) if self.locked_mode == "LONG" else max(peer_sls)
+                else:
+                    lv["sl_price"] = trail_px or self.global_sl_price
         elif role == "OSC":
             # Oscillation scalp slot keeps its exact adjacent grid-line TP and global SL
             lv["sl_price"] = self.global_sl_price

@@ -6860,6 +6860,194 @@ def test_utc_canonical_backend_and_multi_timezone_client_contract():
     assert abs((okx_dt - datetime.now(timezone.utc)).total_seconds()) < 5.0
 
 
+def test_reverse_grid_group_sl_alignment_and_single_leg_cascade_exit():
+    """
+    Regression test reproducing the PUMP/USDT:USDT real-world incident:
+    1. When Q & L2 already share a trailing SL (e.g. 0.0026149) and L3 fills at 0.002637 causing
+       trail stop to nudge by <0.20% (to 0.0026159), ALL group slots (Q, L2, L3) MUST align to
+       the exact same SL price (0.0026159) — never leaving L3 tighter than Q/L2 by 1 tick.
+    2. Mirror check for SHORT mode (QS, S2, S3).
+    3. Even if OKX triggers ONLY L3's conditional SL order (e.g. due to mark-price micro-flicker),
+       poll_grid_protective_orders() MUST cascade-close remaining open group slots (Q, L2) together
+       instead of leaving them stranded on the book.
+    """
+    from unittest.mock import AsyncMock, patch
+    from backend.executor import OrderResult
+    from backend.grid_engine import LongShortGridTracker
+    from backend.sniper_engine import BidirectionalSniperEngine
+
+    cfg = SymbolStrategy(
+        symbol="PUMP/USDT:USDT",
+        strategy_type="REVERSE_GRID",
+        direction="BOTH",
+        order_usdt=10.0,
+        leverage=5,
+        min_qty=1000.0,
+        qty_precision=2,
+        price_precision=6,
+        grid_levels=5,
+        grid_step_pct=0.008,
+        grid_take_profit_pct=0.0085,
+        grid_stop_loss_pct=0.079,
+        rev_l_pcts="100,70,40,100,5",
+        rev_s_pcts="40,40,40,40,40",
+        rev_c_pct=100.0,
+        rev_trail_start_level=2,
+        rev_trail_retracement_pct=0.008,
+        rev_max_level_mode="CAP_TP",
+        sl_trigger_px_type="mark",
+    )
+
+    # Part 1: LONG group SL alignment (exact PUMP/USDT:USDT prices)
+    trk = LongShortGridTracker("PUMP/USDT:USDT", "REVERSE_GRID")
+    trk.recenter(0.002575, cfg)
+    # First trigger Q (at L1 price) -> locks LONG mode and opens base slot Q
+    entries_1, _ = trk.evaluate_tick(0.002596, 0.002597, 0.0025965, cfg, is_net_mode=False, round_trip_fee=0.001)
+    assert any(e["slot_id"] == "Q" for e in entries_1)
+    trk.mark_entry_filled("Q", entry_price=0.002595, filled_qty=3000.0, contracts=3.0, ct_val=1000.0, cfg=cfg, round_trip_fee=0.001)
+    assert trk.locked_mode == "LONG" and trk.levels["Q"]["status"] == "OPEN"
+    # Price hits L2 -> activates group trailing TP (rev_trail_start_level=2)
+    entries_2, _ = trk.evaluate_tick(0.002618, 0.002619, 0.0026185, cfg, is_net_mode=False, round_trip_fee=0.001)
+    assert any(e["slot_id"] == "L2" for e in entries_2)
+    trk.mark_entry_filled("L2", entry_price=0.002618, filled_qty=2000.0, contracts=2.0, ct_val=1000.0, cfg=cfg, round_trip_fee=0.001)
+    # Peak reaches 0.002636 -> Q & L2 trailing SL moves to ~0.002615
+    trk.evaluate_tick(0.002636, 0.002637, 0.0026365, cfg, is_net_mode=False, round_trip_fee=0.001)
+    q_sl_before = float(trk.levels["Q"]["sl_price"])
+    l2_sl_before = float(trk.levels["L2"]["sl_price"])
+    assert q_sl_before == l2_sl_before and q_sl_before > 0.002610
+    trk.levels["Q"].pop("sl_needs_amend", None)
+    trk.levels["L2"].pop("sl_needs_amend", None)
+
+    # L3 fills at 0.002637 -> trail stop nudges up by <0.20% (1 tick!)
+    # ALL THREE slots (Q, L2, L3) must align to the exact same SL price and flag Q/L2 for amend!
+    trk.levels["L3"]["status"] = "ENTERING"
+    trk.mark_entry_filled("L3", entry_price=0.002637, filled_qty=1000.0, contracts=1.0, ct_val=1000.0, cfg=cfg, round_trip_fee=0.001)
+    q_sl_after = float(trk.levels["Q"]["sl_price"])
+    l2_sl_after = float(trk.levels["L2"]["sl_price"])
+    l3_sl_after = float(trk.levels["L3"]["sl_price"])
+    assert q_sl_after == l2_sl_after == l3_sl_after, (
+        f"Group SL drift detected: Q={q_sl_after}, L2={l2_sl_after}, L3={l3_sl_after}"
+    )
+    if q_sl_after > q_sl_before:
+        assert trk.levels["Q"].get("sl_needs_amend") is True
+        assert trk.levels["L2"].get("sl_needs_amend") is True
+
+    # Part 2: SHORT mirror group SL alignment
+    trk_s = LongShortGridTracker("PUMP/USDT:USDT", "REVERSE_GRID")
+    trk_s.recenter(0.002600, cfg)
+    entries_s1, _ = trk_s.evaluate_tick(0.002578, 0.002579, 0.0025785, cfg, is_net_mode=False, round_trip_fee=0.001)
+    assert any(e["slot_id"] == "QS" for e in entries_s1)
+    trk_s.mark_entry_filled("QS", entry_price=0.002579, filled_qty=3000.0, contracts=3.0, ct_val=1000.0, cfg=cfg, round_trip_fee=0.001)
+    entries_s2, _ = trk_s.evaluate_tick(0.002557, 0.002558, 0.0025575, cfg, is_net_mode=False, round_trip_fee=0.001)
+    assert any(e["slot_id"] == "S2" for e in entries_s2)
+    trk_s.mark_entry_filled("S2", entry_price=0.002558, filled_qty=2000.0, contracts=2.0, ct_val=1000.0, cfg=cfg, round_trip_fee=0.001)
+    trk_s.evaluate_tick(0.002537, 0.002538, 0.0025375, cfg, is_net_mode=False, round_trip_fee=0.001)
+    assert trk_s.levels["QS"]["sl_price"] == trk_s.levels["S2"]["sl_price"]
+    trk_s.levels["QS"].pop("sl_needs_amend", None)
+    trk_s.levels["S2"].pop("sl_needs_amend", None)
+    trk_s.levels["S3"]["status"] = "ENTERING"
+    trk_s.mark_entry_filled("S3", entry_price=0.002536, filled_qty=1000.0, contracts=1.0, ct_val=1000.0, cfg=cfg, round_trip_fee=0.001)
+    assert trk_s.levels["QS"]["sl_price"] == trk_s.levels["S2"]["sl_price"] == trk_s.levels["S3"]["sl_price"]
+
+    # Part 3: Single-leg OKX GRID_TRAIL_TP trigger on L3 MUST cascade-close Q & L2 immediately!
+    with tempfile.TemporaryDirectory() as tmp:
+        db_file = os.path.join(tmp, "pump_cascade.db")
+        adb = AsyncDatabaseManager(db_file)
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(4)
+        adb.upsert_symbol_sync(cfg, user_id=4)
+
+        async def run_cascade_check():
+            await adb.start_worker()
+            try:
+                eng = BidirectionalSniperEngine(adb, user_id=4)
+                eng.risk_config = GlobalRiskConfig(trading_mode="LIVE")
+                for ex in adb.load_exchanges_sync(user_id=4):
+                    eng.exchanges[ex["exchange_id"]] = ex
+                eng._register_symbol_internal(cfg)
+                eng.grid_trackers["PUMP/USDT:USDT"] = trk
+
+                # Mark all 3 slots with live OKX conditional SL algos
+                trk.levels["Q"]["cond_sl_live"] = True
+                trk.levels["Q"]["cond_sl_algo_id"] = "algo-Q"
+                trk.levels["L2"]["cond_sl_live"] = True
+                trk.levels["L2"]["cond_sl_algo_id"] = "algo-L2"
+                trk.levels["L3"]["cond_sl_live"] = True
+                trk.levels["L3"]["cond_sl_algo_id"] = "algo-L3"
+
+                # Simulate OKX where ONLY algo-L3 triggered while algo-Q & algo-L2 are still pending!
+                async def fake_fetch_pending(_ex):
+                    return {"ok": True, "pending_ord_ids": set(), "pending_algo_ids": {"algo-Q", "algo-L2"}}
+
+                async def fake_query_algo(sym, aid, _ex):
+                    assert aid == "algo-L3"
+                    return {
+                        "ok": True,
+                        "state": "effective",
+                        "child_state": "filled",
+                        "acc_fill_ct": 1.0,
+                        "avg_px": 0.002616,
+                        "fee_usdt": 0.0013,
+                        "ord_id": "okx-ord-L3",
+                    }
+
+                async def fake_cancel_prot(symbol, slot_key, exchange_cfg=None, cancel_tp=True, cancel_sl=True, expected_contracts=0.0):
+                    return {
+                        "tp_fully_filled": False,
+                        "tp_filled_ct": 0.0,
+                        "tp_avg_px": 0.0,
+                        "tp_fee_usdt": 0.0,
+                        "tp_order_id": "",
+                        "sl_already_filled": False,
+                        "sl_avg_px": 0.0,
+                        "sl_fee_usdt": 0.0,
+                        "sl_order_id": "",
+                        "reconcile_uncertain": False,
+                    }
+
+                batch_close_calls = []
+
+                async def fake_exit_retry(**kwargs):
+                    batch_close_calls.append(kwargs)
+                    return OrderResult(
+                        order_id="okx-cascade-batch",
+                        status="FILLED",
+                        filled_qty=float(kwargs["qty"]),
+                        avg_price=0.002616,
+                        latency_ms=35.0,
+                        is_maker=False,
+                        fee_usdt=0.0065,
+                        contracts=float(kwargs.get("contracts") or 5.0),
+                        ct_val=1000.0,
+                    )
+
+                with patch.object(eng.executor, "fetch_live_pending_protective_ids", side_effect=fake_fetch_pending), \
+                     patch.object(eng.executor, "query_algo_final_status", side_effect=fake_query_algo), \
+                     patch.object(eng.executor, "cancel_slot_protective_orders", side_effect=fake_cancel_prot), \
+                     patch.object(eng.executor, "execute_exit_with_retry", side_effect=fake_exit_retry), \
+                     patch.object(eng.executor, "reconcile_and_cleanup_symbol_flat", new=AsyncMock(return_value={"is_flat": True, "cleaned": False, "message": "ok"})):
+                    settled = await eng.poll_grid_protective_orders()
+                    assert settled == 1
+                    # Wait for spawned cascade batch task to complete
+                    if eng._bg_tasks:
+                        await asyncio.gather(*list(eng._bg_tasks), return_exceptions=True)
+
+                # Verify Q & L2 were cascaded & closed together in ONE 5000-PUMP batch!
+                assert len(batch_close_calls) == 1
+                assert abs(float(batch_close_calls[0]["qty"]) - 5000.0) < 1e-6
+                assert trk.levels["Q"]["status"] == "IDLE"
+                assert trk.levels["L2"]["status"] == "IDLE"
+                assert trk.levels["L3"]["status"] == "IDLE"
+                recent = eng.stats_by_mode["LIVE"]["recent_trades"]
+                reasons = {t["reason"] for t in recent}
+                assert {"GRID_TRAIL_TP_L3", "GRID_TRAIL_TP_L2", "GRID_TRAIL_TP_Q"} <= reasons
+            finally:
+                await adb.stop_worker()
+
+        asyncio.run(run_cascade_check())
+
+
+
 
 
 
