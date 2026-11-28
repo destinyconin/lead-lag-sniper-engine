@@ -39,6 +39,7 @@ import {
 import MarketSentimentChart from './components/MarketSentimentChart';
 import EquityChart from './components/EquityChart';
 import { AuthModal, MembershipCenterView, AdminSystemView } from './components/UserMembershipViews';
+import { formatUtc8MonthDayTime } from './utils/timeUtc8';
 
 const STRATEGY_STATE_PIPELINES = {
   LEAD_LAG: [
@@ -2305,14 +2306,7 @@ export default function App() {
     return `${prefix}${abs.toFixed(digits)}`;
   }, []);
 
-  const formatResetTime = useCallback((ms) => {
-    const n = Number(ms || 0);
-    if (!Number.isFinite(n) || n <= 0) return '';
-    const d = new Date(n);
-    if (Number.isNaN(d.getTime())) return '';
-    const pad = (v) => String(v).padStart(2, '0');
-    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-  }, []);
+  const formatResetTime = useCallback((ms) => formatUtc8MonthDayTime(ms), []);
 
   const positionPnlSummary = useMemo(() => {
     const srv = snapshot.position_pnl_summary || stats.position_pnl_summary;
@@ -3355,7 +3349,7 @@ export default function App() {
                 </span>
                 {Number(stats.stats_reset_at_ms || 0) > 0 && (
                   <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-sky-500/10 text-sky-600 dark:text-sky-400 border border-sky-500/20">
-                    统计起点 {formatResetTime(stats.stats_reset_at_ms)}
+                    统计起点 {formatResetTime(stats.stats_reset_at_ms)} UTC+8
                   </span>
                 )}
               </div>
@@ -4354,6 +4348,9 @@ export default function App() {
                     <h3 className="text-sm sm:text-base font-bold text-main">
                       {isLiveMode ? '实盘执行与风控日志' : '毫秒级狙击日志'}
                     </h3>
+                    <span className="px-1.5 py-0.5 rounded-md text-[10px] font-mono surface-subtle text-dim border border-line">
+                      UTC+8
+                    </span>
                   </div>
                   <div className="flex items-center gap-1 rounded-full surface-subtle p-1 text-[11px] sm:text-xs">
                     {[
@@ -7742,7 +7739,7 @@ export default function App() {
                 <table className="w-full min-w-[1160px] text-left border-collapse text-xs">
                   <thead>
                     <tr className="border-b border-line text-[11px] text-dim surface-subtle">
-                      <th className="py-3 px-3 font-medium whitespace-nowrap rounded-l-xl">触发时间</th>
+                      <th className="py-3 px-3 font-medium whitespace-nowrap rounded-l-xl">触发时间 (UTC+8)</th>
                       <th className="py-3 px-3 font-medium whitespace-nowrap">合约代号</th>
                       <th className="py-3 px-3 font-medium whitespace-nowrap">执行策略</th>
                       <th className="py-3 px-3 font-medium whitespace-nowrap">方向</th>

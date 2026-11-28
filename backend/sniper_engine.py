@@ -35,13 +35,25 @@ from backend.models import (
     is_traditional_broker,
     is_usd_equity_symbol,
 )
+from backend.time_utils import (
+    TZ_LABEL,
+    format_ms_utc8,
+    now_utc8_time_ms_str,
+    parse_db_timestamp_ms,
+    today_utc8_str,
+)
 
 
-def _utc_today_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def _today_utc8_str() -> str:
+    return today_utc8_str()
+
+
+# Backwards-compatible alias (calendar boundary is now UTC+8)
+_utc_today_str = _today_utc8_str
 
 
 def _create_empty_stats_bucket() -> Dict[str, Any]:
+    today_s = _today_utc8_str()
     return {
         "total_signals": 0,
         "ioc_filled_count": 0,
@@ -59,7 +71,9 @@ def _create_empty_stats_bucket() -> Dict[str, Any]:
         "total_fees": 0.0,
         "total_net_pnl": 0.0,
         "daily_net_pnl": 0.0,
-        "daily_pnl_date_utc": _utc_today_str(),
+        "daily_pnl_date": today_s,
+        "daily_pnl_date_utc": today_s,
+        "timezone": TZ_LABEL,
         "consecutive_losses": 0,
         "gross_profit_sum": 0.0,
         "gross_loss_sum": 0.0,
@@ -207,8 +221,7 @@ class BidirectionalSniperEngine:
         return task
 
     def append_log(self, level: str, symbol: str, message: str, mode: Optional[str] = None):
-        now = datetime.now()
-        ts_str = now.strftime("%H:%M:%S.") + f"{int(now.microsecond / 1000):03d}"
+        ts_str = now_utc8_time_ms_str()
         target_mode = mode or self.risk_config.trading_mode
         self._log_seq += 1
         entry = {
@@ -279,8 +292,9 @@ class BidirectionalSniperEngine:
         return lock
 
     def _ensure_daily_pnl_date(self, bucket: Dict[str, Any]) -> str:
-        today = _utc_today_str()
-        if bucket.get("daily_pnl_date_utc") != today:
+        today = _today_utc8_str()
+        if bucket.get("daily_pnl_date") != today or bucket.get("daily_pnl_date_utc") != today:
+            bucket["daily_pnl_date"] = today
             bucket["daily_pnl_date_utc"] = today
             bucket["daily_net_pnl"] = 0.0
         return today
@@ -386,14 +400,7 @@ class BidirectionalSniperEngine:
             if reset_ms > 0:
                 tr_ts_ms = int(tr.get("ack_ts_ms") or tr.get("submit_ts_ms") or tr.get("signal_ts_ms") or 0)
                 if tr_ts_ms <= 0 and tr.get("created_at"):
-                    try:
-                        from datetime import timezone
-                        dt = datetime.strptime(str(tr["created_at"])[:19], "%Y-%m-%d %H:%M:%S").replace(
-                            tzinfo=timezone.utc
-                        )
-                        tr_ts_ms = int(dt.timestamp() * 1000)
-                    except Exception:
-                        tr_ts_ms = 0
+                    tr_ts_ms = parse_db_timestamp_ms(tr.get("created_at"), assume_utc8=True)
                 if tr_ts_ms <= reset_ms:
                     continue
             self._accumulate_trade_into_stats(tr, is_historical=True, mode_override=tr_mode)
@@ -1076,9 +1083,8 @@ class BidirectionalSniperEngine:
             exit_fee = exit_res.fee_usdt if exit_res.fee_usdt > 0 else exit_avg * filled_qty * (maker_fee if exit_res.is_maker else taker_fee)
             total_fee = entry_avg * filled_qty * taker_fee + exit_fee
             net_pnl = gross_pnl - total_fee
-            now_dt = datetime.now()
             trade_record = {
-                "time": now_dt.strftime("%H:%M:%S.") + f"{int(now_dt.microsecond / 1000):03d}",
+                "time": now_utc8_time_ms_str(),
                 "symbol": sym,
                 "strategy_type": "LEAD_LAG",
                 "leader_ex": follower_ex["exchange_id"],
@@ -1830,8 +1836,7 @@ class BidirectionalSniperEngine:
                     gross_pnl = (exit_px - entry_px) * qty_closed if side == "LONG" else (entry_px - exit_px) * qty_closed
                     total_fee = (entry_px + exit_px) * qty_closed * taker_fee
                     net_pnl = gross_pnl - total_fee
-                    now_dt = datetime.now()
-                    now_time_str = now_dt.strftime("%H:%M:%S.") + f"{int(now_dt.microsecond / 1000):03d}"
+                    now_time_str = now_utc8_time_ms_str()
                     now_wall = wall_ms()
                     tr_rec = {
                         "time": now_time_str,
@@ -3970,8 +3975,7 @@ class BidirectionalSniperEngine:
         net_pnl = gross_pnl - total_fee
         hold_ms = int(max(1.0, mono_ms() - float(lv.get("opened_mono_ms") or mono_ms())))
 
-        now_dt = datetime.now()
-        now_time_str = now_dt.strftime("%H:%M:%S.") + f"{int(now_dt.microsecond / 1000):03d}"
+        now_time_str = now_utc8_time_ms_str()
         now_wall = wall_ms()
 
         trade_record = {
@@ -4742,7 +4746,7 @@ class BidirectionalSniperEngine:
             self.exchange_live_positions.pop(f"{sym}:{sig.side}", None)
 
             trade_record = {
-                "time": datetime.now().strftime("%H:%M:%S.") + f"{int(datetime.now().microsecond / 1000):03d}",
+                "time": now_utc8_time_ms_str(),
                 "symbol": sym,
                 "strategy_type": "LEAD_LAG",
                 "leader_ex": leader_ex["exchange_id"],
@@ -4815,13 +4819,17 @@ class BidirectionalSniperEngine:
         if target_mode not in self.stats_by_mode:
             target_mode = "SHADOW"
         bucket = self.stats_by_mode[target_mode]
-        today_utc = self._ensure_daily_pnl_date(bucket)
+        today_utc8 = self._ensure_daily_pnl_date(bucket)
 
         gross = float(tr.get("gross_pnl_usdt", 0.0))
         fee = float(tr.get("fee_usdt", 0.0))
         net = float(tr.get("net_pnl_usdt", 0.0))
         side = tr.get("side", "LONG")
         exit_type = tr.get("exit_order_type", "MAKER_POST_ONLY")
+        tr_ts_ms = int(tr.get("ack_ts_ms") or tr.get("submit_ts_ms") or tr.get("signal_ts_ms") or 0)
+        trade_time_str = tr.get("time") or (
+            format_ms_utc8(tr_ts_ms) if tr_ts_ms > 0 else str(tr.get("created_at", ""))[-8:]
+        )
 
         if is_historical:
             bucket["total_signals"] += 1
@@ -4833,12 +4841,11 @@ class BidirectionalSniperEngine:
 
         include_in_daily = True
         if is_historical:
-            tr_ts_ms = int(tr.get("ack_ts_ms") or tr.get("submit_ts_ms") or tr.get("signal_ts_ms") or 0)
             if tr_ts_ms > 0:
-                tr_day = datetime.fromtimestamp(tr_ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
-                include_in_daily = (tr_day == today_utc)
+                tr_day = format_ms_utc8(tr_ts_ms, "%Y-%m-%d")
+                include_in_daily = (tr_day == today_utc8)
             elif tr.get("created_at"):
-                include_in_daily = str(tr["created_at"])[:10] == today_utc
+                include_in_daily = str(tr["created_at"])[:10] == today_utc8
             else:
                 include_in_daily = False
         if include_in_daily:
@@ -4895,7 +4902,7 @@ class BidirectionalSniperEngine:
         hold_ms_val = int(tr.get("hold_duration_ms", 0))
         sym_stat["_hold_ms_sum"] += hold_ms_val
         sym_stat["avg_hold_ms"] = int(sym_stat["_hold_ms_sum"] / max(1, sym_stat["trades"]))
-        sym_stat["last_trade_time"] = tr.get("time") or str(tr.get("created_at", ""))[-8:]
+        sym_stat["last_trade_time"] = trade_time_str
 
         sym_cfg = self.strategies.get(tr["symbol"])
         cur_st = str(getattr(sym_cfg, "strategy_type", "LEAD_LAG") or "LEAD_LAG") if sym_cfg else "LEAD_LAG"
@@ -4929,7 +4936,7 @@ class BidirectionalSniperEngine:
 
         ui_trade = {
             "id": tr.get("id") or tr.get("order_id"),
-            "time": tr.get("time") or str(tr.get("created_at", ""))[-8:],
+            "time": trade_time_str,
             "symbol": tr["symbol"],
             "strategy_type": resolved_st,
             "follower_ex": tr.get("follower_ex", "okx"),
@@ -5519,6 +5526,7 @@ class BidirectionalSniperEngine:
         )
         return {
             "ts": wall_ms(),
+            "timezone": TZ_LABEL,
             "owner_user_id": self.user_id,
             "owner_vip_status": {
                 "can_use_live": bool(vip_valid_now),

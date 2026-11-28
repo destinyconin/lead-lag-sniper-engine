@@ -6714,6 +6714,145 @@ def test_pause_and_close_symbol_and_cross_system_audit_fixes():
             assert snap_live_stale["telemetry"]["SOL/USDT:USDT"]["follower_age_ms"] >= 3500.0
 
 
+def test_utc8_time_standardization_and_exchange_utc_signing():
+    """
+    Verifies platform-wide UTC+8 time standardization:
+    1. backend.time_utils formats epoch seconds/ms deterministically in UTC+8.
+    2. database.py schema defaults & explicit writers store UTC+8 timestamps, and cleanup keeps fresh rows.
+    3. sniper_engine.py logs, historical trade time formatting, and daily PnL rollover align to UTC+8.
+    4. user_membership.py _now_str / _fmt_ts / order formatting emit UTC+8.
+    5. executor.py OKX API signing header `OK-ACCESS-TIMESTAMP` MUST remain strict UTC ISO-8601 (`Z`).
+    """
+    from datetime import datetime, timedelta, timezone
+    from backend.time_utils import (
+        TZ_UTC8,
+        format_ms_utc8,
+        format_ts_utc8,
+        now_utc8_str,
+        parse_db_timestamp_ms,
+        today_utc8_str,
+    )
+    from backend.executor import ExecutionAdapter
+    from backend.sniper_engine import BidirectionalSniperEngine
+    from backend.user_membership import UserMembershipManager, _fmt_ts, _now_str
+
+    # 1. Deterministic UTC+8 conversions (2023-11-14 22:13:20 UTC == 2023-11-15 06:13:20 UTC+8)
+    assert format_ts_utc8(1700000000) == "2023-11-15 06:13:20"
+    assert format_ts_utc8(1700000000, "%Y-%m-%d") == "2023-11-15"
+    assert format_ms_utc8(1700000000456) == "06:13:20.456"
+    assert parse_db_timestamp_ms("2023-11-15 06:13:20", assume_utc8=True) == 1700000000 * 1000
+
+    # Current time matches UTC + 8h within 5 seconds
+    expected_utc8_now = datetime.now(timezone.utc) + timedelta(hours=8)
+    parsed_now = datetime.strptime(now_utc8_str(), "%Y-%m-%d %H:%M:%S")
+    assert abs((parsed_now - expected_utc8_now.replace(tzinfo=None)).total_seconds()) < 5.0
+    assert today_utc8_str() == expected_utc8_now.strftime("%Y-%m-%d")
+
+    # 2. user_membership UTC+8 formatting
+    assert abs((datetime.strptime(_now_str(), "%Y-%m-%d %H:%M:%S") - expected_utc8_now.replace(tzinfo=None)).total_seconds()) < 5.0
+    assert _fmt_ts(1700000000) == "2023-11-15 06:13"
+
+    # 3. DB schema defaults, explicit UTC+8 writes, and cleanup compatibility
+    with tempfile.TemporaryDirectory() as tmp:
+        db_file = os.path.join(tmp, "utc8_test.db")
+        adb = AsyncDatabaseManager(db_file)
+        adb.init_sync()
+        adb.ensure_user_workspace_sync(1)
+        adb.save_runtime_setting_sync("tz_check", {"ok": True}, user_id=1)
+        adb.update_exchange_auth_status_sync("okx", "VERIFIED", "ok", 100.0, user_id=1)
+
+        conn = sqlite3.connect(db_file)
+        rt_updated = conn.execute(
+            "SELECT updated_at FROM runtime_settings WHERE user_id = 1 AND key = 'tz_check'"
+        ).fetchone()[0]
+        ex_verified = conn.execute(
+            "SELECT last_verified_at FROM exchanges WHERE user_id = 1 AND exchange_id = 'okx'"
+        ).fetchone()[0]
+        # Default column expression should also yield UTC+8
+        conn.execute(
+            """INSERT INTO orders (order_id, user_id, symbol, exchange_id, purpose, side, order_type, price, requested_qty, filled_qty, avg_price, status, latency_ms)
+               VALUES ('fresh-miss-utc8', 1, 'BTC/USDT:USDT', 'okx', 'GRID_L1', 'LONG', 'IOC_LIMIT', 90000, 0.01, 0, 0, 'MISSED', 10.0)"""
+        )
+        conn.execute(
+            """INSERT INTO orders (order_id, user_id, symbol, exchange_id, purpose, side, order_type, price, requested_qty, filled_qty, avg_price, status, latency_ms, created_at)
+               VALUES ('old-miss-utc8', 1, 'BTC/USDT:USDT', 'okx', 'GRID_L1', 'LONG', 'IOC_LIMIT', 90000, 0.01, 0, 0, 'MISSED', 10.0, datetime('now', '+8 hours', '-72 hours'))"""
+        )
+        conn.commit()
+        fresh_created = conn.execute(
+            "SELECT created_at FROM orders WHERE order_id = 'fresh-miss-utc8'"
+        ).fetchone()[0]
+        conn.close()
+
+        assert abs((datetime.strptime(rt_updated, "%Y-%m-%d %H:%M:%S") - expected_utc8_now.replace(tzinfo=None)).total_seconds()) < 5.0
+        assert abs((datetime.strptime(fresh_created, "%Y-%m-%d %H:%M:%S") - expected_utc8_now.replace(tzinfo=None)).total_seconds()) < 5.0
+        assert len(ex_verified) == 8 and ex_verified[:2] == expected_utc8_now.strftime("%H")
+
+        clean_res = adb.cleanup_old_records_sync(missed_keep_hours=48, risk_keep_days=14)
+        assert clean_res["missed_deleted"] == 1
+        conn = sqlite3.connect(db_file)
+        rem = {r[0] for r in conn.execute("SELECT order_id FROM orders").fetchall()}
+        conn.close()
+        assert "fresh-miss-utc8" in rem
+        assert "old-miss-utc8" not in rem
+
+        # 4. BidirectionalSniperEngine logs, historical trade time rendering (UTC+8), and UTC+8 daily PnL bucket
+        eng = BidirectionalSniperEngine(adb, user_id=1)
+        eng.append_log("INFO", "BTC/USDT:USDT", "utc8 log test", mode="SHADOW")
+        log_time = eng.logs_by_mode["SHADOW"][0]["time"]
+        assert log_time[:2] == expected_utc8_now.strftime("%H")
+
+        # Historical trade from 2023-11-14 22:13:20.456 UTC must render as 06:13:20.456 (UTC+8)
+        eng._accumulate_trade_into_stats(
+            {
+                "id": 999,
+                "symbol": "BTC/USDT:USDT",
+                "side": "LONG",
+                "trading_mode": "SHADOW",
+                "exit_order_type": "MAKER_POST_ONLY",
+                "entry_price": 90000.0,
+                "exit_price": 90500.0,
+                "filled_qty": 0.01,
+                "gross_pnl_usdt": 5.0,
+                "fee_usdt": 0.2,
+                "net_pnl_usdt": 4.8,
+                "ack_ts_ms": 1700000000456,
+                "created_at": "2023-11-14 22:13:20",
+            },
+            is_historical=True,
+            mode_override="SHADOW",
+        )
+        assert eng.stats_by_mode["SHADOW"]["recent_trades"][0]["time"] == "06:13:20.456"
+        assert eng.stats_by_mode["SHADOW"]["symbol_stats"]["BTC/USDT:USDT"]["last_trade_time"] == "06:13:20.456"
+        assert eng.stats_by_mode["SHADOW"]["daily_pnl_date"] == today_utc8_str()
+        assert eng.build_dashboard_snapshot()["timezone"] == "UTC+8"
+
+        # Order row formatting uses UTC+8
+        um = UserMembershipManager(db_file)
+        um.init_sync()
+        formatted_ord = um._format_order_row(
+            {
+                "order_no": "VIPTEST",
+                "amount_usdt": 10.0,
+                "base_amount_usdt": 10.0,
+                "pay_amount_usdt": 10.001,
+                "created_at": "2023-11-14 22:13:20",
+                "created_at_ts": 1700000000,
+                "expires_at_ts": 1700001800,
+                "status": "PENDING",
+            }
+        )
+        assert formatted_ord["created_at"] == "2023-11-15 06:13:20"
+        assert formatted_ord["expires_at_str"] == "2023-11-15 06:43:20"
+
+    # 5. External OKX API authentication header MUST remain strict UTC ISO-8601 (`Z`)
+    hdrs = ExecutionAdapter._build_okx_headers("k", "s", "p", "GET", "/api/v5/account/balance", "")
+    okx_ts = hdrs["OK-ACCESS-TIMESTAMP"]
+    assert okx_ts.endswith("Z")
+    okx_dt = datetime.strptime(okx_ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+    assert abs((okx_dt - datetime.now(timezone.utc)).total_seconds()) < 5.0
+
+
+
 
 
 
