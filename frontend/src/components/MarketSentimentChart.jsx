@@ -1,7 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { getChartPointIndex, useContainerChartSize } from '../utils/useContainerChartSize';
-import { formatUtc8HourLabel } from '../utils/timeUtc8';
+import {
+  formatLocalHourLabel,
+  getClientTimezoneOffsetLabel,
+  getClientTimezoneTooltip,
+} from '../utils/clientTime';
 
 const getSentimentMeta = (score) => {
   const s = Number(score);
@@ -38,7 +42,7 @@ const getSentimentMeta = (score) => {
   };
 };
 
-const formatHourLabel = (tsMs, includeDate = true) => formatUtc8HourLabel(tsMs, includeDate);
+const formatHourLabel = (tsMs, includeDate = true) => formatLocalHourLabel(tsMs, includeDate);
 
 const formatSigned = (val, digits = 1, suffix = '') => {
   const n = Number(val);
@@ -54,6 +58,8 @@ export default function MarketSentimentChart({
 }) {
   const [rangeMode, setRangeMode] = useState('AUTO');
   const [hoverIdx, setHoverIdx] = useState(null);
+  const clientTzLabel = useMemo(() => getClientTimezoneOffsetLabel(), []);
+  const clientTzTooltip = useMemo(() => getClientTimezoneTooltip(), []);
 
   const { containerRef, width, height, isCompact } = useContainerChartSize({
     defaultWidth: 880,
@@ -326,8 +332,8 @@ export default function MarketSentimentChart({
         <div className="rounded-xl surface-subtle px-3 py-2">
           <div className="flex items-center justify-between gap-1.5">
             <span className="text-[11px] font-semibold text-sub">情绪差 (加密 − 传统)</span>
-            <span className="text-[10px] font-mono text-dim">
-              {activeRaw ? `${formatHourLabel(activeRaw.ts_ms, true)} UTC+8` : '--'}
+            <span title={clientTzTooltip} className="text-[10px] font-mono text-dim">
+              {activeRaw ? `${formatHourLabel(activeRaw.ts_ms, true)} ${clientTzLabel}` : '--'}
             </span>
           </div>
           <div className="flex items-baseline gap-2 mt-1 font-mono">
@@ -603,7 +609,7 @@ export default function MarketSentimentChart({
                 className="relative flex-1 h-full cursor-pointer"
                 onMouseEnter={() => setHoverIdx(i)}
                 onMouseLeave={() => setHoverIdx(null)}
-                title={`${formatHourLabel(pt.ts_ms, true)} UTC+8 | 加密 ${pt.crypto_score} vs 传统 ${pt.trad_score} | 差值 ${formatSigned(sp, 1)}`}
+                title={`${formatHourLabel(pt.ts_ms, true)} ${clientTzLabel} | 加密 ${pt.crypto_score} vs 传统 ${pt.trad_score} | 差值 ${formatSigned(sp, 1)}`}
               >
                 <div
                   className={`absolute inset-x-0 rounded-[1px] transition-all duration-75 ${barCls}`}

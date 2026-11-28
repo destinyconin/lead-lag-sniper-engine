@@ -39,7 +39,14 @@ import {
 import MarketSentimentChart from './components/MarketSentimentChart';
 import EquityChart from './components/EquityChart';
 import { AuthModal, MembershipCenterView, AdminSystemView } from './components/UserMembershipViews';
-import { formatUtc8MonthDayTime } from './utils/timeUtc8';
+import {
+  formatLocalDateTime,
+  formatLocalMonthDayTime,
+  formatLocalTime,
+  formatLocalTimeMs,
+  getClientTimezoneOffsetLabel,
+  getClientTimezoneTooltip,
+} from './utils/clientTime';
 
 const STRATEGY_STATE_PIPELINES = {
   LEAD_LAG: [
@@ -2306,7 +2313,9 @@ export default function App() {
     return `${prefix}${abs.toFixed(digits)}`;
   }, []);
 
-  const formatResetTime = useCallback((ms) => formatUtc8MonthDayTime(ms), []);
+  const clientTzLabel = useMemo(() => getClientTimezoneOffsetLabel(), []);
+  const clientTzTooltip = useMemo(() => getClientTimezoneTooltip(), []);
+  const formatResetTime = useCallback((ms) => formatLocalMonthDayTime(ms), []);
 
   const positionPnlSummary = useMemo(() => {
     const srv = snapshot.position_pnl_summary || stats.position_pnl_summary;
@@ -3348,8 +3357,11 @@ export default function App() {
                   净收益 · 抢单成交 · 闭环胜率 · 触发信号
                 </span>
                 {Number(stats.stats_reset_at_ms || 0) > 0 && (
-                  <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-sky-500/10 text-sky-600 dark:text-sky-400 border border-sky-500/20">
-                    统计起点 {formatResetTime(stats.stats_reset_at_ms)} UTC+8
+                  <span
+                    title={clientTzTooltip}
+                    className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-sky-500/10 text-sky-600 dark:text-sky-400 border border-sky-500/20"
+                  >
+                    统计起点 {formatResetTime(stats.stats_reset_at_ms)} {clientTzLabel}
                   </span>
                 )}
               </div>
@@ -4348,8 +4360,11 @@ export default function App() {
                     <h3 className="text-sm sm:text-base font-bold text-main">
                       {isLiveMode ? '实盘执行与风控日志' : '毫秒级狙击日志'}
                     </h3>
-                    <span className="px-1.5 py-0.5 rounded-md text-[10px] font-mono surface-subtle text-dim border border-line">
-                      UTC+8
+                    <span
+                      title={clientTzTooltip}
+                      className="px-1.5 py-0.5 rounded-md text-[10px] font-mono surface-subtle text-dim border border-line"
+                    >
+                      {clientTzLabel}
                     </span>
                   </div>
                   <div className="flex items-center gap-1 rounded-full surface-subtle p-1 text-[11px] sm:text-xs">
@@ -4400,7 +4415,12 @@ export default function App() {
 
                       return (
                         <div key={log.id} className={`px-3.5 py-2.5 rounded-2xl leading-relaxed ${badgeCls}`}>
-                          <span className="text-dim mr-1.5">[{log.time}]</span>
+                          <span
+                            title={log.ts_ms ? `${formatLocalDateTime(log.ts_ms)} (${clientTzLabel})` : clientTzTooltip}
+                            className="text-dim mr-1.5"
+                          >
+                            [{formatLocalTimeMs(log.ts_ms, log.time)}]
+                          </span>
                           <span>{log.message}</span>
                         </div>
                       );
@@ -6863,8 +6883,8 @@ export default function App() {
                           <div className="leading-relaxed min-w-0">
                             <div className="font-semibold text-main break-words">{ex.auth_message || '未配置 API 密钥'}</div>
                             {ex.last_verified_at && (
-                              <div className="text-[11px] text-dim font-mono mt-0.5">
-                                最近校验: {ex.last_verified_at}
+                              <div className="text-[11px] text-dim font-mono mt-0.5" title={clientTzTooltip}>
+                                最近校验: {formatLocalTime(ex.last_verified_at, ex.last_verified_at)}
                               </div>
                             )}
                           </div>
@@ -7724,7 +7744,12 @@ export default function App() {
                         <div className="text-right text-dim">手续费: {Number(tr.fee).toFixed(4)}</div>
                       </div>
                       <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-line">
-                        <span className="text-[11px] font-mono text-dim">{tr.time}</span>
+                        <span
+                          title={tr.ts_ms ? `${formatLocalDateTime(tr.ts_ms)} (${clientTzLabel})` : clientTzTooltip}
+                          className="text-[11px] font-mono text-dim"
+                        >
+                          {formatLocalTimeMs(tr.ts_ms, tr.time)}
+                        </span>
                         <span className={`inline-flex items-center whitespace-nowrap px-2 py-0.5 rounded-full border text-[10px] font-medium ${tr._badge.cls}`}>
                           {tr._badge.text}
                         </span>
@@ -7739,7 +7764,9 @@ export default function App() {
                 <table className="w-full min-w-[1160px] text-left border-collapse text-xs">
                   <thead>
                     <tr className="border-b border-line text-[11px] text-dim surface-subtle">
-                      <th className="py-3 px-3 font-medium whitespace-nowrap rounded-l-xl">触发时间 (UTC+8)</th>
+                      <th title={clientTzTooltip} className="py-3 px-3 font-medium whitespace-nowrap rounded-l-xl">
+                        触发时间 ({clientTzLabel})
+                      </th>
                       <th className="py-3 px-3 font-medium whitespace-nowrap">合约代号</th>
                       <th className="py-3 px-3 font-medium whitespace-nowrap">执行策略</th>
                       <th className="py-3 px-3 font-medium whitespace-nowrap">方向</th>
@@ -7767,7 +7794,12 @@ export default function App() {
                     ) : (
                       filteredRecentTrades.map((tr, i) => (
                           <tr key={tr.id || i} className="hover:opacity-90 transition">
-                            <td className="py-3 px-3 text-dim whitespace-nowrap">{tr.time}</td>
+                            <td
+                              title={tr.ts_ms ? `${formatLocalDateTime(tr.ts_ms)} (${clientTzLabel})` : clientTzTooltip}
+                              className="py-3 px-3 text-dim whitespace-nowrap"
+                            >
+                              {formatLocalTimeMs(tr.ts_ms, tr.time)}
+                            </td>
                             <td className="py-3 px-3 font-bold text-main whitespace-nowrap">{tr.symbol}</td>
                             <td className="py-3 px-3 font-sans whitespace-nowrap">
                               <span

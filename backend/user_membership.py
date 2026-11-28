@@ -32,7 +32,7 @@ from backend.payment_monitor import (
     SUPPORTED_CHAIN_NAMES,
     generate_wallet_qr_data_uri,
 )
-from backend.time_utils import format_ts_utc8, now_utc8_compact_str, now_utc8_str
+from backend.time_utils import format_ts_utc, now_utc_compact_str, now_utc_str
 
 
 TOKEN_SECRET = os.environ.get("SNIPER_AUTH_SECRET", "sniper-lead-lag-hmac-secret-key-2026-v2").encode("utf-8")
@@ -252,7 +252,7 @@ DEFAULT_PLANS = [
 
 
 def _now_str() -> str:
-    return now_utc8_str()
+    return now_utc_str()
 
 
 def _fmt_ts(ts: int) -> str:
@@ -262,8 +262,8 @@ def _fmt_ts(ts: int) -> str:
     if ts > now_s + 3650 * 86400:
         return "永久有效"
     if 0 < (ts - now_s) < 86400:
-        return format_ts_utc8(ts, "%Y-%m-%d %H:%M:%S")
-    return format_ts_utc8(ts, "%Y-%m-%d %H:%M")
+        return format_ts_utc(ts, "%Y-%m-%d %H:%M:%S")
+    return format_ts_utc(ts, "%Y-%m-%d %H:%M")
 
 
 def _format_vip_remaining_label(remaining_sec: int, role: str = "user", exp: int = 0) -> str:
@@ -605,8 +605,8 @@ class UserMembershipManager:
         d["remaining_seconds"] = remaining_s
         d["timeout_seconds"] = ORDER_TIMEOUT_SECONDS
         if created_ts > 0:
-            d["created_at"] = format_ts_utc8(created_ts, "%Y-%m-%d %H:%M:%S")
-        d["expires_at_str"] = format_ts_utc8(exp_ts, "%Y-%m-%d %H:%M:%S") if exp_ts > 0 else ""
+            d["created_at"] = format_ts_utc(created_ts, "%Y-%m-%d %H:%M:%S")
+        d["expires_at_str"] = format_ts_utc(exp_ts, "%Y-%m-%d %H:%M:%S") if exp_ts > 0 else ""
         d["wallet_address"] = d.get("wallet_address") or PAYMENT_WALLET_ADDRESS
         d["chain_network"] = d.get("chain_network") or "MULTI_EVM"
         d["created_at_ts"] = created_ts
@@ -1121,7 +1121,7 @@ class UserMembershipManager:
                 return {"ok": False, "message": str(pool_err)}
             now_str = _now_str()
             expires_ts = now_s + ORDER_TIMEOUT_SECONDS
-            order_no = f"VIP{now_utc8_compact_str()}{secrets.randbelow(9000)+1000}"
+            order_no = f"VIP{now_utc_compact_str()}{secrets.randbelow(9000)+1000}"
             duration_days = int(p_row["duration_days"])
             plan_name = p_row["name"]
 
@@ -1328,7 +1328,7 @@ class UserMembershipManager:
                 return {"ok": False, "message": "激活码不存在，请检查输入是否正确"}
             if c_row["status"] == "USED":
                 conn.rollback()
-                return {"ok": False, "message": f"该激活码已被使用（使用时间: {c_row['used_at']}）"}
+                return {"ok": False, "message": f"该激活码已被使用（使用时间: {c_row['used_at']} UTC）"}
             if c_row["status"] != "UNUSED":
                 conn.rollback()
                 return {"ok": False, "message": "该激活码已失效或被禁用"}
@@ -1347,7 +1347,7 @@ class UserMembershipManager:
                 return {"ok": False, "message": "该激活码已被使用"}
             self._extend_user_vip_in_tx(cur, user_id, duration_days, plan_name)
 
-            order_no = f"CODE{now_utc8_compact_str()}{secrets.randbelow(900)+100}"
+            order_no = f"CODE{now_utc_compact_str()}{secrets.randbelow(900)+100}"
             cur.execute(
                 """INSERT INTO membership_orders
                    (order_no, user_id, username, plan_id, plan_name, duration_days,
@@ -1433,7 +1433,7 @@ class UserMembershipManager:
             )
             uid = cur.lastrowid
             if req.vip_days > 0:
-                order_no = f"ADM{now_utc8_compact_str()}{secrets.randbelow(900)+100}"
+                order_no = f"ADM{now_utc_compact_str()}{secrets.randbelow(900)+100}"
                 cur.execute(
                     """INSERT INTO membership_orders
                        (order_no, user_id, username, plan_id, plan_name, duration_days,
@@ -1547,7 +1547,7 @@ class UserMembershipManager:
                 return {"ok": True, "message": f"已调整用户 {row['username']} 的会员有效期"}
 
             self._extend_user_vip_seconds_in_tx(cur, req.user_id, total_add_sec, req.vip_tier or "专业版会员")
-            order_no = f"ADM{now_utc8_compact_str()}{secrets.randbelow(900)+100}"
+            order_no = f"ADM{now_utc_compact_str()}{secrets.randbelow(900)+100}"
             dur_desc = (
                 f"+{add_days}天{add_hours}小时"
                 if (add_days > 0 and add_hours > 0)
@@ -1907,9 +1907,9 @@ class UserMembershipManager:
             "status": d.get("status") or ("REPLIED" if (d.get("admin_reply") or "").strip() else "OPEN"),
             "admin_reply": d.get("admin_reply") or "",
             "replied_by": d.get("replied_by") or "",
-            "replied_at": format_ts_utc8(replied_ts) if replied_ts > 0 else (d.get("replied_at") or ""),
+            "replied_at": format_ts_utc(replied_ts) if replied_ts > 0 else (d.get("replied_at") or ""),
             "replied_at_ts": replied_ts,
-            "created_at": format_ts_utc8(created_ts) if created_ts > 0 else (d.get("created_at") or ""),
+            "created_at": format_ts_utc(created_ts) if created_ts > 0 else (d.get("created_at") or ""),
             "created_at_ts": created_ts,
             "age_seconds": age_sec,
             "can_user_delete": unlock_rem == 0,
@@ -1977,7 +1977,7 @@ class UserMembershipManager:
             return {"ok": False, "message": "留言内容请控制在 2000 字以内"}
 
         now_s = int(now_ts if now_ts is not None else time.time())
-        now_str = format_ts_utc8(now_s)
+        now_str = format_ts_utc(now_s)
 
         conn = self._connect(isolation_level=None)
         conn.row_factory = sqlite3.Row
@@ -2144,7 +2144,7 @@ class UserMembershipManager:
             return {"ok": False, "message": "回复内容请控制在 2000 字以内"}
 
         now_s = int(now_ts if now_ts is not None else time.time())
-        now_str = format_ts_utc8(now_s)
+        now_str = format_ts_utc(now_s)
 
         conn = self._connect()
         conn.row_factory = sqlite3.Row
@@ -2252,7 +2252,7 @@ class UserMembershipManager:
                 item = dict(r)
                 cts = int(item.get("created_at_ts") or 0)
                 if cts > 0:
-                    item["created_at"] = format_ts_utc8(cts)
+                    item["created_at"] = format_ts_utc(cts)
                 ledger.append(item)
             return {
                 "ok": True,
@@ -2332,7 +2332,7 @@ class UserMembershipManager:
                 (user_id, u_row["username"], -cost_points, new_bal, note_str, now_str, now_s),
             )
 
-            order_no = f"PTS{now_utc8_compact_str()}{secrets.randbelow(900)+100}"
+            order_no = f"PTS{now_utc_compact_str()}{secrets.randbelow(900)+100}"
             cur.execute(
                 """INSERT INTO membership_orders
                    (order_no, user_id, username, plan_id, plan_name, duration_days,
@@ -2513,7 +2513,7 @@ class UserMembershipManager:
                 item = dict(r)
                 cts = int(item.get("created_at_ts") or 0)
                 if cts > 0:
-                    item["created_at"] = format_ts_utc8(cts)
+                    item["created_at"] = format_ts_utc(cts)
                 ledger.append(item)
 
             pts_agg = cur.execute(

@@ -30,6 +30,7 @@ import {
   Wallet,
   X,
 } from 'lucide-react';
+import { formatLocalDateTime, formatLocalVipExpiry } from '../utils/clientTime';
 
 const DEFAULT_WALLET_ADDRESS = '0x8D550B8c462310126BA26d85A4a1f779Cd56A9e0';
 const DEFAULT_SUPPORTED_CHAINS = [
@@ -967,7 +968,7 @@ export function MembershipCenterView({
           <div className="surface-subtle p-4 sm:p-5">
             <div className="text-xs text-dim font-medium">会员到期时间</div>
             <div className="text-sm sm:text-base font-bold text-main mt-1.5 font-mono">
-              {currentUser ? currentUser.vip_expires_str : '未开通'}
+              {currentUser ? formatLocalVipExpiry(currentUser) : '未开通'}
             </div>
             {currentUser && currentUser.is_vip && currentUser.vip_remaining_label && (
               <div className="text-[11px] font-mono text-emerald-600 dark:text-emerald-400 mt-1">
@@ -1575,7 +1576,9 @@ export function MembershipCenterView({
                             {iu.is_vip ? iu.vip_label : '未开VIP'}
                           </span>
                         </div>
-                        <span className="text-[11px] font-mono text-dim shrink-0">{iu.created_at}</span>
+                        <span className="text-[11px] font-mono text-dim shrink-0">
+                          {formatLocalDateTime(iu.created_at)}
+                        </span>
                       </div>
                     ))}
                   </div>
@@ -1695,7 +1698,9 @@ export function MembershipCenterView({
                               <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold surface-subtle text-main">
                                 {formatPointsActionLabel(row.action_type)}
                               </span>
-                              <span className="text-[11px] font-mono text-dim">{row.created_at}</span>
+                              <span className="text-[11px] font-mono text-dim">
+                                {formatLocalDateTime(row.created_at_ts || row.created_at)}
+                              </span>
                             </div>
                             <div className="text-sub mt-1 break-words">{row.note}</div>
                           </div>
@@ -1900,7 +1905,9 @@ export function MembershipCenterView({
                             >
                               {m.status === 'REPLIED' ? '管理员已回复' : '待管理员回复'}
                             </span>
-                            <span className="text-[11px] font-mono text-dim">{m.created_at}</span>
+                            <span className="text-[11px] font-mono text-dim">
+                              {formatLocalDateTime(m.created_at_ts || m.created_at)}
+                            </span>
                           </div>
                         </div>
 
@@ -1915,7 +1922,9 @@ export function MembershipCenterView({
                                 <CheckCircle2 className="w-3.5 h-3.5" strokeWidth={2} />
                                 <span>管理员回复{m.replied_by ? ` (${m.replied_by})` : ''}</span>
                               </span>
-                              <span className="font-mono text-dim">{m.replied_at}</span>
+                              <span className="font-mono text-dim">
+                                {formatLocalDateTime(m.replied_at_ts || m.replied_at)}
+                              </span>
                             </div>
                             <div className="text-sub leading-relaxed whitespace-pre-wrap break-words">
                               {m.admin_reply}
@@ -2079,7 +2088,9 @@ export function MembershipCenterView({
                   · {o.tx_hash}
                 </div>
                 <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-line">
-                  <span className="text-[11px] font-mono text-dim">{o.created_at}</span>
+                  <span className="text-[11px] font-mono text-dim">
+                    {formatLocalDateTime(o.created_at_ts || o.created_at)}
+                  </span>
                   {o.status === 'PENDING' && (
                     <div className="flex items-center gap-1.5">
                       <button
@@ -2178,7 +2189,7 @@ export function MembershipCenterView({
                                 : '已拒绝'}
                       </span>
                     </td>
-                    <td className="py-3 px-3 text-dim">{o.created_at}</td>
+                    <td className="py-3 px-3 text-dim">{formatLocalDateTime(o.created_at_ts || o.created_at)}</td>
                     <td className="py-3 px-3 text-right font-sans">
                       {o.status === 'PENDING' ? (
                         <div className="flex items-center justify-end gap-2">
@@ -3193,7 +3204,7 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                         </td>
                         <td className="py-3.5 px-3 font-semibold text-main">{u.vip_label}</td>
                         <td className="py-3.5 px-3 font-mono text-sub">
-                          <div>{u.vip_expires_str}</div>
+                          <div>{formatLocalVipExpiry(u)}</div>
                           {u.is_vip && u.vip_remaining_label && (
                             <div className="text-[10px] text-emerald-600 dark:text-emerald-400">
                               剩 {u.vip_remaining_label}
@@ -3446,7 +3457,7 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                                   : '已拒绝'}
                         </span>
                       </td>
-                      <td className="py-3.5 px-3 text-dim">{o.created_at}</td>
+                      <td className="py-3.5 px-3 text-dim">{formatLocalDateTime(o.created_at_ts || o.created_at)}</td>
                       <td className="py-3.5 px-3 text-right font-sans space-x-2 whitespace-nowrap">
                         {confirmDeleteOrderId === o.id ? (
                           <div className="inline-flex items-center justify-end gap-1.5">
@@ -3813,8 +3824,8 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                           </span>
                         </td>
                         <td className="py-3.5 px-3 text-main">{c.used_by_username || '--'}</td>
-                        <td className="py-3.5 px-3 text-dim">{c.used_at || '--'}</td>
-                        <td className="py-3.5 px-3 text-dim">{c.created_at}</td>
+                        <td className="py-3.5 px-3 text-dim">{c.used_at ? formatLocalDateTime(c.used_at) : '--'}</td>
+                        <td className="py-3.5 px-3 text-dim">{formatLocalDateTime(c.created_at)}</td>
                         <td className="py-3.5 px-3 text-right font-sans space-x-2">
                           <button
                             onClick={() => {
@@ -3927,7 +3938,9 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                           </span>
                         )}
                       </div>
-                      <span className="text-[11px] font-mono text-dim">{m.created_at}</span>
+                      <span className="text-[11px] font-mono text-dim">
+                        {formatLocalDateTime(m.created_at_ts || m.created_at)}
+                      </span>
                     </div>
 
                     {/* Title & Content */}
@@ -3949,7 +3962,9 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                             <span>已回复 · {m.replied_by || 'admin'}</span>
                           </span>
                           <div className="flex items-center gap-2.5">
-                            <span className="font-mono text-dim">{m.replied_at}</span>
+                            <span className="font-mono text-dim">
+                              {formatLocalDateTime(m.replied_at_ts || m.replied_at)}
+                            </span>
                             <button
                               type="button"
                               onClick={() => {
@@ -4345,7 +4360,7 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                             {rec.invitee_is_vip ? '有效 VIP' : '未开 VIP'}
                           </span>
                         </td>
-                        <td className="py-3 px-3 text-dim">{rec.created_at}</td>
+                        <td className="py-3 px-3 text-dim">{formatLocalDateTime(rec.created_at)}</td>
                       </tr>
                     ))
                   )}
@@ -4443,7 +4458,9 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
                           <td className="py-3 px-3 font-sans text-sub max-w-xs truncate" title={row.note}>
                             {row.note}
                           </td>
-                          <td className="py-3 px-3 text-dim">{row.created_at}</td>
+                          <td className="py-3 px-3 text-dim">
+                            {formatLocalDateTime(row.created_at_ts || row.created_at)}
+                          </td>
                         </tr>
                       );
                     })

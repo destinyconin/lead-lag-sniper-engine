@@ -19,7 +19,7 @@ logger = logging.getLogger("sniper.db")
 from typing import Any, Dict, List
 from backend.crypto_utils import vault
 from backend.models import ExchangeConfigModel, SymbolStrategy
-from backend.time_utils import now_utc8_str, now_utc8_time_str
+from backend.time_utils import now_utc_iso_str, now_utc_str
 
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sniper_engine.db")
@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS trade_logs (
     signal_to_fill_ms DECIMAL(8, 2),
     hold_duration_ms INTEGER,
     exit_reason VARCHAR(32),
-    created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours'))
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- 4. 订单生命周期与对账表 (按 user_id 隔离)
@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS orders (
     avg_price DECIMAL(18, 8),
     status VARCHAR(24) NOT NULL,
     latency_ms DECIMAL(8, 2),
-    created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours'))
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- 5. 持仓状态与孤儿仓位对账表 (按 user_id + symbol 隔离)
@@ -171,7 +171,7 @@ CREATE TABLE IF NOT EXISTS positions (
     sl_order_id VARCHAR(64),
     state VARCHAR(24) NOT NULL,
     opened_at_ms INTEGER,
-    updated_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, symbol)
 );
 
@@ -183,7 +183,7 @@ CREATE TABLE IF NOT EXISTS risk_events (
     category VARCHAR(32) NOT NULL,
     symbol VARCHAR(32) DEFAULT '',
     message TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours'))
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- 7. 运行时全局配置持久化表 (按 user_id 隔离)
@@ -625,7 +625,7 @@ class AsyncDatabaseManager:
     ):
         conn = self._connect()
         try:
-            ts_str = now_utc8_time_str()
+            ts_str = now_utc_iso_str()
             conn.execute(
                 """UPDATE exchanges
                    SET auth_status=?, auth_message=?, account_equity_usdt=?, last_verified_at=?
@@ -983,7 +983,7 @@ class AsyncDatabaseManager:
 
     def record_trade_async(self, trade: Dict[str, Any], user_id: int = 0):
         ord_id = str(trade.get("order_id") or "")
-        created_at_str = now_utc8_str()
+        created_at_str = now_utc_str()
         sql = """INSERT INTO trade_logs (
             user_id, symbol, leader_ex, follower_ex, side, trading_mode, order_id, exit_order_type,
             leader_jump_pct, follower_lag_pct, expected_net_pct, actual_slippage_pct,
@@ -1045,7 +1045,7 @@ class AsyncDatabaseManager:
         latency_ms: float,
         user_id: int = 0,
     ):
-        created_at_str = now_utc8_str()
+        created_at_str = now_utc_str()
         sql = """INSERT OR REPLACE INTO orders (
             order_id, user_id, symbol, exchange_id, purpose, side, order_type,
             price, requested_qty, filled_qty, avg_price, status, latency_ms, created_at
@@ -1083,7 +1083,7 @@ class AsyncDatabaseManager:
         opened_at_ms: int,
         user_id: int = 0,
     ):
-        updated_at_str = now_utc8_str()
+        updated_at_str = now_utc_str()
         sql = """INSERT INTO positions (
             user_id, symbol, exchange_id, side, qty, entry_price, tp_order_id, sl_order_id, state, opened_at_ms, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1114,14 +1114,14 @@ class AsyncDatabaseManager:
         )
 
     def record_risk_event_async(self, level: str, category: str, symbol: str, message: str, user_id: int = 0):
-        created_at_str = now_utc8_str()
+        created_at_str = now_utc_str()
         sql = "INSERT INTO risk_events (user_id, level, category, symbol, message, created_at) VALUES (?, ?, ?, ?, ?, ?)"
         self.enqueue_write(sql, (user_id, level, category, symbol, message, created_at_str))
 
     def save_runtime_setting_sync(self, key: str, value: Any, user_id: int = 0):
         conn = self._connect()
         try:
-            ts_str = now_utc8_str()
+            ts_str = now_utc_str()
             conn.execute(
                 """INSERT INTO runtime_settings (user_id, key, value_json, updated_at)
                    VALUES (?, ?, ?, ?)
@@ -1134,7 +1134,7 @@ class AsyncDatabaseManager:
 
     def save_runtime_setting_async(self, key: str, value: Any, user_id: int = 0):
         """Hot-path safe: persists runtime state via the background SQLite batch writer thread."""
-        ts_str = now_utc8_str()
+        ts_str = now_utc_str()
         sql = """INSERT INTO runtime_settings (user_id, key, value_json, updated_at)
                  VALUES (?, ?, ?, ?)
                  ON CONFLICT(user_id, key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at"""
@@ -1149,12 +1149,12 @@ class AsyncDatabaseManager:
         try:
             cur = conn.cursor()
             cur.execute(
-                "DELETE FROM orders WHERE status = 'MISSED' AND created_at < datetime('now', '+8 hours', ?)",
+                "DELETE FROM orders WHERE status = 'MISSED' AND created_at < datetime('now', ?)",
                 (f"-{max(1, int(missed_keep_hours))} hours",),
             )
             missed_deleted = cur.rowcount or 0
             cur.execute(
-                "DELETE FROM risk_events WHERE created_at < datetime('now', '+8 hours', ?)",
+                "DELETE FROM risk_events WHERE created_at < datetime('now', ?)",
                 (f"-{max(1, int(risk_keep_days))} days",),
             )
             risk_deleted = cur.rowcount or 0
