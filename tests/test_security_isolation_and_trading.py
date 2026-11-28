@@ -7047,6 +7047,198 @@ def test_reverse_grid_group_sl_alignment_and_single_leg_cascade_exit():
         asyncio.run(run_cascade_check())
 
 
+def test_reverse_grid_deep_dip_s2_l2_global_breakeven_full_lifecycle():
+    """
+    Comprehensive verification of REVERSE_GRID deep-dip global breakeven logic:
+    - LONG mode (C=100, step=0.6%, N=5):
+      L1(100.60) locks LONG -> dips to C(100.00) & S1(99.40) do NOT trigger breakeven ->
+      dip to S2(98.80) buys S2 AND activates global breakeven target = L1(Q)+0.1% (100.7006) ->
+      deeper S3(98.20) still buys/sells normally -> rebounds sell S3->S2->S1->C normally ->
+      reaching 100.7006 closes remaining LONG slots via GRID_BREAKEVEN_TP (NOT L5=103.00),
+      enters TP_COOLDOWN (rev_tp_cooldown_min), reconciles flat, and re-anchors cleanly.
+    - Also tests: Q upward slippage ref, TRAIL_ONLY + trail_start_level=1 guard,
+      export/restore persistence (including legacy state auto-inference), exact SHORT mirror (L2 -> S1(QS)-0.1%),
+      and Global Hard SL still overriding on crash.
+    """
+    from backend.grid_engine import LongShortGridTracker
+
+    cfg = SymbolStrategy(
+        symbol="TEST/USDT:USDT",
+        strategy_type="REVERSE_GRID",
+        direction="BOTH",
+        order_usdt=100.0,
+        leverage=5,
+        min_qty=0.01,
+        qty_precision=3,
+        price_precision=4,
+        grid_levels=5,
+        grid_step_pct=0.006,
+        grid_take_profit_pct=0.006,
+        grid_stop_loss_pct=0.05,
+        use_post_only_tp=False,
+        rev_l_pcts="100,50,30,10,5",
+        rev_s_pcts="100,100,50,30,20",
+        rev_c_pct=100.0,
+        rev_tp_cooldown_min=30.0,
+        rev_sl_cooldown_min=60.0,
+        rev_trail_start_level=2,
+        rev_trail_retracement_pct=0.008,
+        rev_max_level_mode="CAP_TP",
+    )
+
+    # 1. Exact LONG lifecycle: L1 -> C -> S1 -> S2 -> S3 -> rebound S2 -> S1 -> C -> L1 -> L1+0.1%
+    trk = LongShortGridTracker("TEST/USDT:USDT", "REVERSE_GRID")
+    trk.recenter(100.0, cfg)
+    e_q, _ = trk.evaluate_tick(100.60, 100.60, 100.60, cfg, is_net_mode=False)
+    assert [e["slot_id"] for e in e_q] == ["Q"]
+    trk.mark_entry_filled("Q", 100.60, 1.0, 1.0, 1.0, cfg, 0.001)
+    assert trk.locked_mode == "LONG"
+    assert trk.deep_dip_breakeven_active is False
+    assert abs(trk.strategy.full_tp_price - 103.0) < 1e-6
+
+    # Dip to C (100.00) and S1 (99.40) -> breakeven MUST remain inactive
+    e_c, _ = trk.evaluate_tick(100.00, 100.00, 100.00, cfg, is_net_mode=False)
+    assert [e["slot_id"] for e in e_c] == ["C"]
+    trk.mark_entry_filled("C", 100.00, 1.0, 1.0, 1.0, cfg, 0.001)
+    assert trk.deep_dip_breakeven_active is False
+
+    e_s1, _ = trk.evaluate_tick(99.40, 99.40, 99.40, cfg, is_net_mode=False)
+    assert [e["slot_id"] for e in e_s1] == ["S1"]
+    trk.mark_entry_filled("S1", 99.40, 1.0, 1.0, 1.0, cfg, 0.001)
+    assert trk.deep_dip_breakeven_active is False
+    assert abs(trk.strategy.full_tp_price - 103.0) < 1e-6
+
+    # Dip to S2 (98.80) -> buys S2 normally AND activates global breakeven at 100.60 * 1.001 = 100.7006!
+    e_s2, _ = trk.evaluate_tick(98.80, 98.80, 98.80, cfg, is_net_mode=False)
+    assert [e["slot_id"] for e in e_s2] == ["S2"]
+    trk.mark_entry_filled("S2", 98.80, 1.0, 1.0, 1.0, cfg, 0.001)
+    assert trk.deep_dip_breakeven_active is True
+    assert abs(trk.strategy.full_tp_price - 100.7006) < 1e-6
+    assert "全局保本" in (trk.consume_regime_log() or "")
+
+    # Dip deeper to S3 (98.20) -> S3 STILL buys normally!
+    e_s3, _ = trk.evaluate_tick(98.20, 98.20, 98.20, cfg, is_net_mode=False)
+    assert [e["slot_id"] for e in e_s3] == ["S3"]
+    trk.mark_entry_filled("S3", 98.20, 0.5, 0.5, 1.0, cfg, 0.001)
+
+    # Persistence check across restart while deep_dip_breakeven_active == True
+    exported = trk.export_state()
+    assert exported["deep_dip_breakeven_active"] is True
+    trk_restored = LongShortGridTracker("TEST/USDT:USDT", "REVERSE_GRID")
+    trk_restored.restore_state(exported, cfg)
+    assert trk_restored.deep_dip_breakeven_active is True
+    assert abs(trk_restored.strategy.full_tp_price - 100.7006) < 1e-6
+
+    # Legacy state without the new flag, but with S2 OPEN -> auto-infers deep_dip_breakeven_active!
+    legacy_state = dict(exported)
+    legacy_state.pop("deep_dip_breakeven_active", None)
+    trk_legacy = LongShortGridTracker("TEST/USDT:USDT", "REVERSE_GRID")
+    trk_legacy.restore_state(legacy_state, cfg)
+    assert trk_legacy.deep_dip_breakeven_active is True
+    assert abs(trk_legacy.strategy.full_tp_price - 100.7006) < 1e-6
+
+    # Rebound step-by-step: S2(98.80) sells S3 -> S1(99.40) sells S2 -> C(100.00) sells S1 -> L1(100.60) sells C
+    for px, exp_sid in [(98.80, "S3"), (99.40, "S2"), (100.00, "S1"), (100.60, "C")]:
+        _, exs = trk.evaluate_tick(px, px, px, cfg, is_net_mode=False)
+        assert [x["slot_id"] for x in exs] == [exp_sid]
+        assert exs[0]["exit_reason"] == "GRID_TP"
+        trk.mark_exited(exp_sid, net_pnl=0.5, is_sl=False)
+        # Q must remain open until 100.7006
+        assert trk.levels["Q"]["status"] == "OPEN"
+
+    # Rebound hits L1(Q)+0.1% (100.7006) -> closes Q with GRID_BREAKEVEN_TP (NOT waiting for L5=103.00!)
+    ens_be, exs_be = trk.evaluate_tick(100.7006, 100.7006, 100.7006, cfg, is_net_mode=False)
+    assert ens_be == []
+    assert [x["slot_id"] for x in exs_be] == ["Q"]
+    assert exs_be[0]["exit_reason"] == "GRID_BREAKEVEN_TP"
+    assert trk.strategy.group_trail_active is False
+    trk.mark_exited("Q", net_pnl=0.05, is_sl=False)
+
+    # Enters TP_COOLDOWN (30 min), NOT GLOBAL_SL_COOLDOWN!
+    assert trk.strategy.cycle_phase == "PENDING_RECONCILE"
+    assert trk.strategy.restart_reason == "TP_COOLDOWN"
+    assert trk.deep_dip_breakeven_active is False
+
+    # After flat reconcile + cooldown expiry -> re-anchors cleanly to latest price and resets to NONE
+    trk.mark_reconcile_verified_clean()
+    assert trk.strategy.cycle_phase == "COOLDOWN"
+    trk.strategy.restart_cooldown_until_mono = 0.0
+    trk.evaluate_tick(105.0, 105.0, 105.0, cfg, is_net_mode=False)
+    assert trk.locked_mode == "NONE"
+    assert abs(trk.center_price - 105.0) < 1e-6
+    assert trk.deep_dip_breakeven_active is False
+
+    # 2. Upward Q slippage (Q filled at 100.65 > L1=100.60) + TRAIL_ONLY + rev_trail_start_level=1 guard
+    cfg_trail_only = cfg.model_copy(update={"rev_max_level_mode": "TRAIL_ONLY", "rev_trail_start_level": 1})
+    trk2 = LongShortGridTracker("TEST/USDT:USDT", "REVERSE_GRID")
+    trk2.recenter(100.0, cfg_trail_only)
+    trk2.evaluate_tick(100.60, 100.60, 100.60, cfg_trail_only, is_net_mode=False)
+    # Use normal trail_start_level=2 initially, then edit to 1 after S2 to test live guard
+    trk2.mark_entry_filled("Q", 100.65, 1.0, 1.0, 1.0, cfg, 0.001)
+    trk2.evaluate_tick(98.80, 98.80, 98.80, cfg_trail_only, is_net_mode=False)
+    assert trk2.deep_dip_breakeven_active is True
+    # Must use max(100.60, 100.65) * 1.001 = 100.75065 (rounded 4 dec -> 100.7506), NOT 0.0 under TRAIL_ONLY!
+    exp_be2 = round(100.65 * 1.001, 4)
+    assert abs(trk2.strategy.full_tp_price - exp_be2) < 1e-6
+    # Even at 100.70 (above L1), must NOT activate group trailing and must wait for exp_be2
+    _, ex_mid = trk2.evaluate_tick(100.70, 100.70, 100.70, cfg_trail_only, is_net_mode=False)
+    assert trk2.strategy.group_trail_active is False
+    assert ex_mid == []
+    _, ex_hit = trk2.evaluate_tick(exp_be2, exp_be2, exp_be2, cfg_trail_only, is_net_mode=False)
+    assert [x["slot_id"] for x in ex_hit] == ["Q"] and ex_hit[0]["exit_reason"] == "GRID_BREAKEVEN_TP"
+
+    # 3. Exact SHORT mirror: S1(99.40) -> CS(100.00) -> L1(100.60) -> L2(101.20) activates S1(QS)-0.1% (99.3006)
+    trk_s = LongShortGridTracker("TEST/USDT:USDT", "REVERSE_GRID")
+    trk_s.recenter(100.0, cfg)
+    e_qs, _ = trk_s.evaluate_tick(99.40, 99.40, 99.40, cfg, is_net_mode=False)
+    assert [e["slot_id"] for e in e_qs] == ["QS"]
+    trk_s.mark_entry_filled("QS", 99.40, 1.0, 1.0, 1.0, cfg, 0.001)
+    assert trk_s.locked_mode == "SHORT" and trk_s.deep_dip_breakeven_active is False
+
+    e_cs, _ = trk_s.evaluate_tick(100.00, 100.00, 100.00, cfg, is_net_mode=False)
+    trk_s.mark_entry_filled("CS", 100.00, 1.0, 1.0, 1.0, cfg, 0.001)
+    e_l1, _ = trk_s.evaluate_tick(100.60, 100.60, 100.60, cfg, is_net_mode=False)
+    trk_s.mark_entry_filled("L1", 100.60, 1.0, 1.0, 1.0, cfg, 0.001)
+    assert trk_s.deep_dip_breakeven_active is False
+
+    e_l2, _ = trk_s.evaluate_tick(101.20, 101.20, 101.20, cfg, is_net_mode=False)
+    assert [e["slot_id"] for e in e_l2] == ["L2"]
+    trk_s.mark_entry_filled("L2", 101.20, 1.0, 1.0, 1.0, cfg, 0.001)
+    assert trk_s.deep_dip_breakeven_active is True
+    assert abs(trk_s.strategy.full_tp_price - 99.3006) < 1e-6
+
+    # Fall back covers L2 -> L1 -> CS, then closes QS at 99.3006 via GRID_BREAKEVEN_TP
+    for px, exp_sid in [(100.60, "L2"), (100.00, "L1"), (99.40, "CS")]:
+        _, exs = trk_s.evaluate_tick(px, px, px, cfg, is_net_mode=False)
+        assert [x["slot_id"] for x in exs] == [exp_sid]
+        trk_s.mark_exited(exp_sid, net_pnl=0.5, is_sl=False)
+
+    _, exs_s_be = trk_s.evaluate_tick(99.3006, 99.3006, 99.3006, cfg, is_net_mode=False)
+    assert [x["slot_id"] for x in exs_s_be] == ["QS"]
+    assert exs_s_be[0]["exit_reason"] == "GRID_BREAKEVEN_TP"
+    trk_s.mark_exited("QS", net_pnl=0.05, is_sl=False)
+    assert trk_s.strategy.restart_reason == "TP_COOLDOWN"
+
+    # 4. Crash to Global Hard SL after S2 STILL triggers GRID_GLOBAL_SL on ALL open slots and 60m SL cooldown
+    trk_sl = LongShortGridTracker("TEST/USDT:USDT", "REVERSE_GRID")
+    trk_sl.recenter(100.0, cfg)
+    trk_sl.evaluate_tick(100.60, 100.60, 100.60, cfg, is_net_mode=False)
+    trk_sl.mark_entry_filled("Q", 100.60, 1.0, 1.0, 1.0, cfg, 0.001)
+    e_s2_sl, _ = trk_sl.evaluate_tick(98.80, 98.80, 98.80, cfg, is_net_mode=False)
+    assert [e["slot_id"] for e in e_s2_sl] == ["S2"]
+    trk_sl.mark_entry_filled("S2", 98.80, 1.0, 1.0, 1.0, cfg, 0.001)
+    assert trk_sl.deep_dip_breakeven_active is True
+    gsl = trk_sl.strategy.global_sl_price
+    _, exs_sl = trk_sl.evaluate_tick(gsl - 0.1, gsl - 0.1, gsl - 0.1, cfg, is_net_mode=False)
+    assert {x["slot_id"] for x in exs_sl} == {"Q", "S2"}
+    assert all(x["exit_reason"] == "GRID_GLOBAL_SL" for x in exs_sl)
+    trk_sl.mark_exited("S2", net_pnl=-6.0, is_sl=True)
+    trk_sl.mark_exited("Q", net_pnl=-8.0, is_sl=True)
+    assert trk_sl.strategy.restart_reason == "GLOBAL_SL_COOLDOWN"
+    assert trk_sl.deep_dip_breakeven_active is False
+
+
+
 
 
 

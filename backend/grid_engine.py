@@ -92,6 +92,10 @@ class LongShortGridTracker:
         return str(getattr(self._strategy, "locked_mode", "NONE") or "NONE")
 
     @property
+    def deep_dip_breakeven_active(self) -> bool:
+        return bool(getattr(self._strategy, "deep_dip_breakeven_active", False))
+
+    @property
     def completed_cycles(self) -> int:
         return self._strategy.completed_cycles
 

@@ -3203,6 +3203,7 @@ class BidirectionalSniperEngine:
         regime_msg = tracker.consume_regime_log()
         if regime_msg:
             self.append_log("INFO", sym, regime_msg, mode=cur_mode)
+            self._save_open_strategy_state()
 
         # Sync any zero-order in-place slot conversions (e.g. REVERSE_GRID C -> Q or CS -> QS)
         conversions = tracker.consume_slot_conversions()

@@ -62,6 +62,8 @@ SLOT_CLOSE_COOLDOWN_MS = 1500.0        # 1~2s per-slot post-close cooldown
 TP_CYCLE_COOLDOWN_MS = 1_800_000.0     # Default 30 min post-TP restart cooldown
 GLOBAL_SL_COOLDOWN_MS = 3_600_000.0    # Default 1 hour post-global-SL cooldown
 REARM_OUTER_BUF_PCT = 0.0003           # 0.03% outer-side re-arm hysteresis
+DEEP_DIP_BREAKEVEN_LEVEL = 2           # Trigger global breakeven once S2 (LONG) / L2 (SHORT) is reached
+DEEP_DIP_BREAKEVEN_BUFFER_PCT = 0.001  # +0.1% above L1(Q) in LONG / -0.1% below S1(QS) in SHORT
 
 DEFAULT_TREND_PCT_LIST = [100.0, 50.0, 30.0, 10.0, 5.0]
 DEFAULT_OSC_PCT_LIST = [100.0, 100.0, 50.0, 30.0, 20.0]
@@ -123,6 +125,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         super().__init__(symbol)
         self.locked_mode: str = "NONE"  # "NONE" | "LONG" | "SHORT"
         self.group_trail_active: bool = False
+        self.deep_dip_breakeven_active: bool = False
+        self.breakeven_tp_price: float = 0.0
         self.group_vwap: float = 0.0
         self.group_floor_price: float = 0.0
         self.full_tp_price: float = 0.0
@@ -239,6 +243,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         super().reset_runtime_state()
         self.locked_mode = "NONE"
         self.group_trail_active = False
+        self.deep_dip_breakeven_active = False
+        self.breakeven_tp_price = 0.0
         self.group_vwap = 0.0
         self.group_floor_price = 0.0
         self.full_tp_price = 0.0
@@ -335,6 +341,10 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 self.last_regime_reason = (
                     f"多头模式(锁定) · L组移动止盈已激活 (回撤 {self.trail_retracement_pct*100:.2f}% · 均价 {self.group_vwap:g} / 保底 {self.group_floor_price:g})"
                 )
+            elif self.deep_dip_breakeven_active:
+                self.last_regime_reason = (
+                    f"多头模式(锁定) · 已触及S2激活全局保本 · 回升至 {self.full_tp_price:g} (L1(Q)+0.1%) 全平止盈，下方震荡照常高抛低吸"
+                )
             else:
                 self.last_regime_reason = (
                     f"多头模式(锁定) · 底仓Q持仓 · C/S档震荡套利 · 上破L{self.trail_trigger_level}激活移动止盈({self.trail_retracement_pct*100:.2f}%)"
@@ -343,6 +353,10 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             if self.group_trail_active:
                 self.last_regime_reason = (
                     f"空头模式(锁定) · S组移动止盈已激活 (回撤 {self.trail_retracement_pct*100:.2f}% · 均价 {self.group_vwap:g} / 保底 {self.group_floor_price:g})"
+                )
+            elif self.deep_dip_breakeven_active:
+                self.last_regime_reason = (
+                    f"空头模式(锁定) · 已触及L2激活全局保本 · 回落至 {self.full_tp_price:g} (S1(Q')-0.1%) 全平止盈，上方震荡照常高空低平"
                 )
             else:
                 self.last_regime_reason = (
@@ -447,6 +461,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             self.global_sl_price = 0.0
             self.trail_trigger_price = 0.0
             self.group_trail_active = False
+            self.deep_dip_breakeven_active = False
+            self.breakeven_tp_price = 0.0
             self.group_vwap = 0.0
             self.group_floor_price = 0.0
             self.long_peak_price = 0.0
@@ -490,7 +506,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 )
 
         elif self.locked_mode == "LONG":
-            self.full_tp_price = l_px[n] if cap_at_max else 0.0
+            self.full_tp_price = self._calc_effective_full_tp_price(cfg)
             self.global_sl_price = long_global_sl
             self.trail_trigger_price = l_px[trig_lvl]
             # Base slot Q (at L1, l_ratios[0], no fixed TP)
@@ -576,7 +592,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 )
 
         elif self.locked_mode == "SHORT":
-            self.full_tp_price = s_px[n] if cap_at_max else 0.0
+            self.full_tp_price = self._calc_effective_full_tp_price(cfg)
             self.global_sl_price = short_global_sl
             self.trail_trigger_price = s_px[trig_lvl]
             # Base slot QS (Q' at S1, l_ratios[0], no fixed TP)
@@ -688,6 +704,86 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                     lv[k] = base_snapshot[k]
             lv["sl_price"] = self.global_sl_price
             lv["tp_price"] = 0.0
+        self._update_regime_reason()
+
+    def _calc_breakeven_tp_price(self, cfg: SymbolStrategy) -> float:
+        """
+        Computes the global breakeven exit target once deep-dip breakeven (S2 in LONG / L2 in SHORT)
+        has been activated:
+        - LONG:  max(L1, Q.entry_price) * (1 + 0.1%)
+        - SHORT: min(S1, QS.entry_price) * (1 - 0.1%)
+        """
+        if self.center_price <= 0 or self.locked_mode not in ("LONG", "SHORT"):
+            return 0.0
+        prec = self._calc_prec(cfg)
+        step = max(0.0001, float(cfg.grid_step_pct))
+        if self.locked_mode == "LONG":
+            l1_px = round(self.center_price * (1.0 + step), prec)
+            q_lv = self.levels.get("Q")
+            q_entry = (
+                float(q_lv.get("entry_price") or 0.0)
+                if (q_lv and q_lv.get("status") in ("OPEN", "EXITING"))
+                else 0.0
+            )
+            base_ref = max(l1_px, q_entry) if q_entry > 0 else l1_px
+            be_px = round(base_ref * (1.0 + DEEP_DIP_BREAKEVEN_BUFFER_PCT), prec)
+            if be_px <= base_ref:
+                be_px = round(base_ref + (10.0 ** (-prec)), prec)
+            return be_px
+        s1_px = round(self.center_price * max(0.05, 1.0 - step), prec)
+        qs_lv = self.levels.get("QS")
+        qs_entry = (
+            float(qs_lv.get("entry_price") or 0.0)
+            if (qs_lv and qs_lv.get("status") in ("OPEN", "EXITING"))
+            else 0.0
+        )
+        base_ref = min(s1_px, qs_entry) if qs_entry > 0 else s1_px
+        be_px = round(base_ref * max(0.05, 1.0 - DEEP_DIP_BREAKEVEN_BUFFER_PCT), prec)
+        if be_px >= base_ref:
+            be_px = round(max(10.0 ** (-prec), base_ref - (10.0 ** (-prec))), prec)
+        return be_px
+
+    def _calc_effective_full_tp_price(self, cfg: SymbolStrategy) -> float:
+        """
+        Returns the active global full-close TP target:
+        - If `deep_dip_breakeven_active` is True (after reaching S2 in LONG or L2 in SHORT),
+          replaces the top-level L_N / S_N target with L1(Q)+0.1% / S1(QS)-0.1%.
+        - Otherwise returns L_N / S_N when `CAP_TP` is enabled, or 0.0 under `TRAIL_ONLY`.
+        """
+        if self.center_price <= 0 or self.locked_mode not in ("LONG", "SHORT"):
+            self.breakeven_tp_price = 0.0
+            return 0.0
+        if self.deep_dip_breakeven_active:
+            be_px = self._calc_breakeven_tp_price(cfg)
+            self.breakeven_tp_price = be_px
+            return be_px
+        self.breakeven_tp_price = 0.0
+        if not self._effective_cap_at_max(cfg):
+            return 0.0
+        prec = self._calc_prec(cfg)
+        step = max(0.0001, float(cfg.grid_step_pct))
+        n = max(1, int(cfg.grid_levels))
+        if self.locked_mode == "LONG":
+            return round(self.center_price * (1.0 + n * step), prec)
+        return round(self.center_price * max(0.05, 1.0 - n * step), prec)
+
+    def _activate_deep_dip_breakeven(self, cfg: SymbolStrategy):
+        """Latches deep-dip global breakeven mode when price reaches S2 (LONG) or L2 (SHORT)."""
+        if self.deep_dip_breakeven_active or self.group_trail_active or self.locked_mode not in ("LONG", "SHORT"):
+            return
+        self.deep_dip_breakeven_active = True
+        self.full_tp_price = self._calc_effective_full_tp_price(cfg)
+        prec = self._calc_prec(cfg)
+        if self.locked_mode == "LONG":
+            self._pending_regime_log = (
+                f"[多空震荡全局保本激活] {self.symbol} 多头模式触及S2，已激活全局保本止盈目标 → "
+                f"{self.full_tp_price:.{prec}f} (L1(Q)+0.1%)，下方震荡槽仍正常低吸高抛"
+            )
+        else:
+            self._pending_regime_log = (
+                f"[多空震荡全局保本激活] {self.symbol} 空头模式触及L2，已激活全局保本止盈目标 → "
+                f"{self.full_tp_price:.{prec}f} (S1(Q')-0.1%)，上方震荡槽仍正常高空低平"
+            )
         self._update_regime_reason()
 
     def _group_open_slots(self) -> List[dict]:
@@ -823,6 +919,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         self.needs_flat_reconcile = True
         self.reconcile_verified = False
         self.group_trail_active = False
+        self.deep_dip_breakeven_active = False
+        self.breakeven_tp_price = 0.0
         self.group_vwap = 0.0
         self.group_floor_price = 0.0
         self.long_peak_price = 0.0
@@ -877,15 +975,13 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             trig_lvl = self.trail_trigger_level
             if self.locked_mode == "LONG":
                 sn = round(self.center_price * max(0.05, 1.0 - n * step), prec)
-                ln = round(self.center_price * (1.0 + n * step), prec)
                 self.global_sl_price = round(sn * max(0.05, 1.0 - sl_pct), prec)
-                self.full_tp_price = ln if cap_at_max else 0.0
+                self.full_tp_price = self._calc_effective_full_tp_price(cfg)
                 self.trail_trigger_price = round(self.center_price * (1.0 + trig_lvl * step), prec)
             else:
                 ln = round(self.center_price * (1.0 + n * step), prec)
-                sn = round(self.center_price * max(0.05, 1.0 - n * step), prec)
                 self.global_sl_price = round(ln * (1.0 + sl_pct), prec)
-                self.full_tp_price = sn if cap_at_max else 0.0
+                self.full_tp_price = self._calc_effective_full_tp_price(cfg)
                 self.trail_trigger_price = round(self.center_price * max(0.05, 1.0 - trig_lvl * step), prec)
             self._last_user_sig_params = sig_params
             self._last_sig_params = sig_params
@@ -897,6 +993,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         self.active_grid_mode = "REVERSE_OSCILLATING"
         self.center_price = new_center
         self.locked_mode = "NONE"
+        self.deep_dip_breakeven_active = False
+        self.breakeven_tp_price = 0.0
         self.cycle_phase = "ACTIVE"
         self.needs_flat_reconcile = False
         self.reconcile_verified = True
@@ -954,8 +1052,17 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         # Keep global_sl_price, trail_trigger_price & full_tp_price responsive to live user parameter edits
         if self.locked_mode == "LONG":
             s_n = round(self.center_price * max(0.05, 1.0 - n * step), prec)
-            l_n = round(self.center_price * (1.0 + n * step), prec)
-            self.full_tp_price = l_n if cap_at_max else 0.0
+            if (
+                not self.deep_dip_breakeven_active
+                and not self.group_trail_active
+                and self.cycle_phase == "ACTIVE"
+                and self._has_active_slots()
+                and n >= DEEP_DIP_BREAKEVEN_LEVEL
+            ):
+                s2_px = round(self.center_price * max(0.05, 1.0 - DEEP_DIP_BREAKEVEN_LEVEL * step), prec)
+                if s2_px > 0 and ask <= s2_px:
+                    self._activate_deep_dip_breakeven(cfg)
+            self.full_tp_price = self._calc_effective_full_tp_price(cfg)
             self.trail_trigger_price = round(self.center_price * (1.0 + trig_lvl * step), prec)
             new_gsl = round(s_n * max(0.05, 1.0 - sl_pct), prec)
             if abs(new_gsl - self.global_sl_price) > 1e-9:
@@ -967,8 +1074,17 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                             lv["sl_needs_amend"] = True
         elif self.locked_mode == "SHORT":
             l_n = round(self.center_price * (1.0 + n * step), prec)
-            s_n = round(self.center_price * max(0.05, 1.0 - n * step), prec)
-            self.full_tp_price = s_n if cap_at_max else 0.0
+            if (
+                not self.deep_dip_breakeven_active
+                and not self.group_trail_active
+                and self.cycle_phase == "ACTIVE"
+                and self._has_active_slots()
+                and n >= DEEP_DIP_BREAKEVEN_LEVEL
+            ):
+                l2_px = round(self.center_price * (1.0 + DEEP_DIP_BREAKEVEN_LEVEL * step), prec)
+                if l2_px > 0 and bid >= l2_px:
+                    self._activate_deep_dip_breakeven(cfg)
+            self.full_tp_price = self._calc_effective_full_tp_price(cfg)
             self.trail_trigger_price = round(self.center_price * max(0.05, 1.0 - trig_lvl * step), prec)
             new_gsl = round(l_n * (1.0 + sl_pct), prec)
             if abs(new_gsl - self.global_sl_price) > 1e-9:
@@ -1035,6 +1151,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             )
             if (
                 not self.group_trail_active
+                and not self.deep_dip_breakeven_active
                 and q_open_now
                 and not osc_busy_now
                 and not has_pending_pyr_at_or_below_trig
@@ -1046,8 +1163,9 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             if self.group_trail_active:
                 self._recompute_group_trailing(cfg, round_trip_fee, ref_price=bid)
 
-            # 1c. L_N Full Take-Profit (active ONLY when max_level_mode == CAP_TP)
+            # 1c. Global Full Take-Profit: L1(Q)+0.1% when deep-dip breakeven is active, else L_N under CAP_TP
             if self.full_tp_price > 0 and bid >= self.full_tp_price:
+                tp_reason = "GRID_BREAKEVEN_TP" if self.deep_dip_breakeven_active else "GRID_GROUP_TP"
                 for lv in self.levels.values():
                     if lv["status"] != "OPEN" or lv["side"] != "LONG":
                         continue
@@ -1055,7 +1173,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                         continue
                     lv["status"] = "EXITING"
                     lv["exiting_is_sl"] = False
-                    exits.append({**lv, "exit_reason": "GRID_GROUP_TP", "target_price": bid})
+                    exits.append({**lv, "exit_reason": tp_reason, "target_price": bid})
                 if exits:
                     return [], exits
 
@@ -1137,6 +1255,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             )
             if (
                 not self.group_trail_active
+                and not self.deep_dip_breakeven_active
                 and qs_open_now
                 and not osc_busy_now
                 and not has_pending_pyr_at_or_below_trig
@@ -1150,8 +1269,9 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             if self.group_trail_active:
                 self._recompute_group_trailing(cfg, round_trip_fee, ref_price=ask)
 
-            # 1c. S_N Full Take-Profit (active ONLY when max_level_mode == CAP_TP)
+            # 1c. Global Full Take-Profit: S1(QS)-0.1% when deep-dip breakeven is active, else S_N under CAP_TP
             if self.full_tp_price > 0 and ask <= self.full_tp_price:
+                tp_reason = "GRID_BREAKEVEN_TP" if self.deep_dip_breakeven_active else "GRID_GROUP_TP"
                 for lv in self.levels.values():
                     if lv["status"] != "OPEN" or lv["side"] != "SHORT":
                         continue
@@ -1159,7 +1279,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                         continue
                     lv["status"] = "EXITING"
                     lv["exiting_is_sl"] = False
-                    exits.append({**lv, "exit_reason": "GRID_GROUP_TP", "target_price": ask})
+                    exits.append({**lv, "exit_reason": tp_reason, "target_price": ask})
                 if exits:
                     return [], exits
 
@@ -1327,7 +1447,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 lv.get("role") == "OSC" and lv["status"] in ("OPEN", "ENTERING", "EXITING")
                 for lv in self.levels.values()
             )
-            if q_open and not osc_open and (self.full_tp_price <= 0 or bid < self.full_tp_price):
+            if q_open and not osc_open and not self.deep_dip_breakeven_active and (self.full_tp_price <= 0 or bid < self.full_tp_price):
                 pyr_cands = [
                     lv
                     for lv in self.levels.values()
@@ -1371,7 +1491,7 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 lv.get("role") == "OSC" and lv["status"] in ("OPEN", "ENTERING", "EXITING")
                 for lv in self.levels.values()
             )
-            if qs_open and not osc_open and (self.full_tp_price <= 0 or ask > self.full_tp_price):
+            if qs_open and not osc_open and not self.deep_dip_breakeven_active and (self.full_tp_price <= 0 or ask > self.full_tp_price):
                 pyr_cands = [
                     lv
                     for lv in self.levels.values()
@@ -1558,6 +1678,9 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         elif role == "OSC":
             # Oscillation scalp slot keeps its exact adjacent grid-line TP and global SL
             lv["sl_price"] = self.global_sl_price
+            # Reaching/filling S2+ (LONG) or L2+ (SHORT) activates deep-dip global breakeven exit at L1(Q)+0.1% / S1(QS)-0.1%!
+            if int(lv.get("level_idx") or 0) >= DEEP_DIP_BREAKEVEN_LEVEL and not self.group_trail_active:
+                self._activate_deep_dip_breakeven(cfg)
             # If Q (or QS) is NOT held when C (or CS) opens, keep tp_price for software C->Q conversion
             # (sniper_engine checks should_place_maker_tp_for_slot so OKX doesn't auto-sell C instead of converting!)
 
@@ -1759,6 +1882,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             "active_grid_mode": "REVERSE_OSCILLATING",
             "locked_mode": self.locked_mode,
             "group_trail_active": bool(self.group_trail_active),
+            "deep_dip_breakeven_active": bool(self.deep_dip_breakeven_active),
+            "breakeven_tp_price": float(self.breakeven_tp_price or 0.0),
             "group_vwap": float(self.group_vwap or 0.0),
             "group_floor_price": float(self.group_floor_price or 0.0),
             "full_tp_price": float(self.full_tp_price or 0.0),
@@ -1811,6 +1936,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
         self.completed_cycles = int(data.get("completed_cycles") or self.completed_cycles)
         self.total_net_pnl = float(data.get("total_net_pnl") or self.total_net_pnl)
         self.group_trail_active = bool(data.get("group_trail_active", False))
+        self.deep_dip_breakeven_active = bool(data.get("deep_dip_breakeven_active", False))
+        self.breakeven_tp_price = float(data.get("breakeven_tp_price") or 0.0)
         self.group_vwap = float(data.get("group_vwap") or 0.0)
         self.group_floor_price = float(data.get("group_floor_price") or 0.0)
         self.long_peak_price = float(data.get("long_peak_price") or 0.0)
@@ -1840,6 +1967,16 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
                 lv["role"] = "LEGACY"
             elif not lv.get("role"):
                 lv["role"] = str(slot.get("role") or ("BASE" if sid in ("Q", "QS") else ("OSC" if sid in ("C", "CS") else "PYRAMID")))
+        # Auto-infer deep-dip breakeven if an S2+ (LONG) / L2+ (SHORT) oscillation slot is already OPEN on restart
+        if not self.group_trail_active and self.locked_mode in ("LONG", "SHORT"):
+            if any(
+                lv.get("status") == "OPEN"
+                and lv.get("role") == "OSC"
+                and int(lv.get("level_idx") or 0) >= DEEP_DIP_BREAKEVEN_LEVEL
+                for lv in self.levels.values()
+            ):
+                self.deep_dip_breakeven_active = True
+            self.full_tp_price = self._calc_effective_full_tp_price(cfg)
         self._update_regime_reason()
 
     def get_snapshot(self) -> dict:
@@ -1856,6 +1993,8 @@ class ReverseOscillatingGridStrategy(BaseGridStrategy):
             "active_grid_mode": "REVERSE_OSCILLATING",
             "locked_mode": self.locked_mode,
             "group_trail_active": bool(self.group_trail_active),
+            "deep_dip_breakeven_active": bool(self.deep_dip_breakeven_active),
+            "breakeven_tp_price": float(self.breakeven_tp_price or 0.0),
             "group_vwap": float(self.group_vwap or 0.0),
             "group_floor_price": float(self.group_floor_price or 0.0),
             "full_tp_price": float(self.full_tp_price or 0.0),

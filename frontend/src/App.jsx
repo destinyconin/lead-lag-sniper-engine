@@ -176,6 +176,7 @@ function resolveStrategyStateMachine(cfg, tel) {
   } else if (st === 'REVERSE_GRID') {
     const lockedMode = String(grid?.locked_mode || 'NONE');
     const groupTrailActive = Boolean(grid?.group_trail_active);
+    const deepDipBeActive = Boolean(grid?.deep_dip_breakeven_active);
     const groupVwap = Number(grid?.group_vwap || 0);
     const groupFloor = Number(grid?.group_floor_price || 0);
     const fullTpPx = Number(grid?.full_tp_price || 0);
@@ -218,15 +219,25 @@ function resolveStrategyStateMachine(cfg, tel) {
       { label: '网格中枢 / 锁定', value: `${fmtPx(centerPx)} · ${lockedMode === 'LONG' ? '多' : lockedMode === 'SHORT' ? '空' : 'NONE'}`, tone: lockedMode !== 'NONE' ? 'emerald' : 'main' },
       { label: '在途槽位 (多/空)', value: `${openLong} 多 / ${openShort} 空`, tone: openLong + openShort > 0 ? 'emerald' : 'main' },
       {
-        label: groupTrailActive ? 'L/S组追踪线 / 均价' : cdRemSec > 0 ? '重启冷却倒计时' : fullTpPx > 0 ? '顶格全平 / 全局止损' : '追踪触发 / 全局止损',
+        label: groupTrailActive
+          ? 'L/S组追踪线 / 均价'
+          : deepDipBeActive
+          ? '全局保本止盈 / 全局止损'
+          : cdRemSec > 0
+          ? '重启冷却倒计时'
+          : fullTpPx > 0
+          ? '顶格全平 / 全局止损'
+          : '追踪触发 / 全局止损',
         value: groupTrailActive
           ? `${fmtPx(liveTrailPx)} (均 ${fmtPx(groupVwap || groupFloor)})`
+          : deepDipBeActive && fullTpPx > 0
+          ? `${fmtPx(fullTpPx)} (${lockedMode === 'LONG' ? 'Q+0.1%' : "Q'-0.1%"}) / ${fmtPx(globalSlPx)}`
           : cdRemSec > 0
           ? `${Math.ceil(cdRemSec)}s (${grid?.restart_reason === 'GLOBAL_SL_COOLDOWN' ? '止损冷却' : '止盈冷却'})`
           : lockedMode !== 'NONE'
           ? `${fullTpPx > 0 ? fmtPx(fullTpPx) : `${ fmtPx(grid?.trail_trigger_price) }(不封顶)`} / ${fmtPx(globalSlPx)}`
           : `L1/S1 待触发`,
-        tone: groupTrailActive ? 'emerald' : cdRemSec > 0 ? 'amber' : 'sky',
+        tone: groupTrailActive ? 'emerald' : deepDipBeActive ? 'teal' : cdRemSec > 0 ? 'amber' : 'sky',
       },
       { label: `套利闭环 (${cycles}轮)`, value: fmtSigned(gridNetPnl), tone: gridNetPnl >= 0 ? 'emerald' : 'rose' },
     ];
@@ -743,6 +754,10 @@ const EXIT_BADGE_MAP = {
   GRID_GROUP_TP: {
     text: '顶格全平止盈',
     cls: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 border-emerald-500/40',
+  },
+  GRID_BREAKEVEN_TP: {
+    text: '全局保本止盈',
+    cls: 'bg-teal-500/15 text-teal-600 dark:text-teal-300 border-teal-500/35',
   },
   GRID_GLOBAL_SL: {
     text: '全局止损清仓',
@@ -3874,6 +3889,7 @@ export default function App() {
                                 ? (() => {
                                     const lk = String(grid?.locked_mode || 'NONE');
                                     const trActive = Boolean(grid?.group_trail_active);
+                                    const beActive = Boolean(grid?.deep_dip_breakeven_active);
                                     const trPx =
                                       lk === 'LONG'
                                         ? Number(grid?.long_trail_stop_price || 0)
@@ -3883,6 +3899,8 @@ export default function App() {
                                     const cdSec = Number(grid?.restart_cooldown_rem_sec || 0);
                                     if (cdSec > 0) return `重启冷却 ${Math.ceil(cdSec)}s`;
                                     if (trActive && trPx > 0) return `组追踪 ${fmtPx(trPx)}`;
+                                    if (beActive && Number(grid?.full_tp_price || 0) > 0)
+                                      return `全局保本 ${fmtPx(grid?.full_tp_price)}`;
                                     if (lk === 'LONG') return `多头锁定 · 全局损 ${fmtPx(grid?.global_sl_price)}`;
                                     if (lk === 'SHORT') return `空头锁定 · 全局损 ${fmtPx(grid?.global_sl_price)}`;
                                     return `待锁方向 · 步长 ${stepPctVal.toFixed(2)}%`;
