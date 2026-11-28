@@ -289,6 +289,8 @@
   border: 1px solid var(--border-primary);
   box-shadow: var(--shadow-card);
   border-radius: 1.25rem;
+  min-width: 0;
+  max-width: 100%;
   transition:
     background 0.22s cubic-bezier(0.22, 1, 0.36, 1),
     border-color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
@@ -331,6 +333,8 @@
   border: 1px solid var(--border-primary);
   box-shadow: var(--neu-inset-sm);
   border-radius: 0.95rem;
+  min-width: 0;
+  max-width: 100%;
   transition:
     background 0.18s cubic-bezier(0.22, 1, 0.36, 1),
     border-color 0.18s cubic-bezier(0.22, 1, 0.36, 1),

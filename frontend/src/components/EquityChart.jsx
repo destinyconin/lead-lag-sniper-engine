@@ -235,7 +235,7 @@ export default function EquityChart({ equityCurve = [], stats = {}, activePositi
               <div className="bg-emerald-500 h-full transition-all duration-300" style={{ width: `${longPct}%` }} />
               <div className="bg-rose-500 h-full transition-all duration-300" style={{ width: `${shortPct}%` }} />
             </div>
-            <div className="flex justify-between text-[11px] font-mono text-dim mt-1">
+            <div className="flex flex-wrap justify-between gap-x-2 gap-y-0.5 text-[11px] font-mono text-dim mt-1">
               <span>多头占比 {longPct}%</span>
               <span>空头占比 {shortPct}%</span>
             </div>

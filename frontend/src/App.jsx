@@ -3418,122 +3418,128 @@ export default function App() {
               )}
             </div>
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-4 lg:gap-5">
-            <div className="surface-card p-3 sm:p-5 lg:p-6 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 min-w-0">
-              <div className="flex items-center gap-2 sm:contents min-w-0">
-                <div className="icon-box w-8 h-8 sm:w-12 sm:h-12 shrink-0">
-                  <DollarSign className="w-4 h-4 sm:w-5 sm:h-5" strokeWidth={1.75} />
+              {/* Card 1: Net PnL */}
+              <div className="surface-card p-3 sm:p-5 lg:p-6 flex flex-col sm:flex-row sm:items-center gap-1.5 sm:gap-4 min-w-0">
+                <div className="flex items-center gap-2 sm:contents min-w-0">
+                  <div className="icon-box w-7 h-7 sm:w-12 sm:h-12 shrink-0">
+                    <DollarSign className="w-3.5 h-3.5 sm:w-5 sm:h-5" strokeWidth={1.75} />
+                  </div>
+                  <div className="sm:hidden text-[11px] font-semibold text-sub leading-tight min-w-0 break-words">
+                    {isLiveMode ? '实盘净收益' : '模拟净收益'}
+                  </div>
                 </div>
-                <div
-                  className={`sm:hidden text-base font-bold font-mono leading-tight break-all ${
-                    (stats.total_net_pnl ?? 0) >= 0 ? 'text-emerald-500' : 'text-rose-500'
-                  }`}
-                >
-                  {(stats.total_net_pnl ?? 0) >= 0
-                    ? `+$${Number(stats.total_net_pnl ?? 0).toFixed(2)}`
-                    : `-$${Math.abs(Number(stats.total_net_pnl ?? 0)).toFixed(2)}`}
-                </div>
-              </div>
-              <div className="min-w-0 flex-1">
-                <div
-                  className={`hidden sm:block text-2xl font-bold font-mono leading-tight break-all ${
-                    (stats.total_net_pnl ?? 0) >= 0 ? 'text-emerald-500' : 'text-rose-500'
-                  }`}
-                >
-                  {(stats.total_net_pnl ?? 0) >= 0
-                    ? `+$${Number(stats.total_net_pnl ?? 0).toFixed(2)}`
-                    : `-$${Math.abs(Number(stats.total_net_pnl ?? 0)).toFixed(2)}`}
-                </div>
-                <div className="text-[11px] sm:text-xs text-dim sm:mt-1 leading-snug break-words">
-                  <span>{isLiveMode ? '实盘净收益' : '模拟净收益'}</span>{' '}
-                  <span className="font-mono whitespace-nowrap">
-                    (毛{' '}
-                    {(stats.total_gross_pnl ?? 0) >= 0
-                      ? `$${Number(stats.total_gross_pnl ?? 0).toFixed(2)}`
-                      : `-$${Math.abs(Number(stats.total_gross_pnl ?? 0)).toFixed(2)}`}
-                    )
-                  </span>
-                </div>
-                {positionPnlSummary.total_positions > 0 && (
-                  <div className="text-[11px] font-mono mt-1 leading-snug flex flex-wrap items-baseline gap-x-1 gap-y-0.5">
-                    <span className="text-dim font-sans">持仓浮盈亏:</span>
-                    <span
-                      className={`font-semibold whitespace-nowrap ${
-                        positionPnlSummary.net_unrealized_usdt >= 0 ? 'text-emerald-500' : 'text-rose-500'
-                      }`}
-                    >
-                      {formatUsdtSigned(positionPnlSummary.net_unrealized_usdt)}
+                <div className="min-w-0 flex-1">
+                  <div
+                    className={`text-[17px] sm:text-2xl font-bold font-mono tabular-nums tracking-tight leading-tight break-words ${
+                      (stats.total_net_pnl ?? 0) >= 0 ? 'text-emerald-500' : 'text-rose-500'
+                    }`}
+                  >
+                    {(stats.total_net_pnl ?? 0) >= 0
+                      ? `+$${Number(stats.total_net_pnl ?? 0).toFixed(2)}`
+                      : `-$${Math.abs(Number(stats.total_net_pnl ?? 0)).toFixed(2)}`}
+                  </div>
+                  <div className="text-[11px] sm:text-xs text-dim mt-1 leading-snug flex flex-wrap items-baseline gap-x-1 gap-y-0.5">
+                    <span className="hidden sm:inline">{isLiveMode ? '实盘净收益' : '模拟净收益'}</span>
+                    <span className="sm:hidden text-dim">毛利</span>
+                    <span className="font-mono whitespace-nowrap">
+                      <span className="hidden sm:inline">(毛 </span>
+                      {(stats.total_gross_pnl ?? 0) >= 0
+                        ? `$${Number(stats.total_gross_pnl ?? 0).toFixed(2)}`
+                        : `-$${Math.abs(Number(stats.total_gross_pnl ?? 0)).toFixed(2)}`}
+                      <span className="hidden sm:inline">)</span>
                     </span>
                   </div>
-                )}
+                  {positionPnlSummary.total_positions > 0 && (
+                    <div className="text-[11px] font-mono mt-0.5 sm:mt-1 leading-snug flex flex-wrap items-baseline gap-x-1 gap-y-0.5">
+                      <span className="text-dim font-sans">
+                        <span className="sm:hidden">浮盈亏</span>
+                        <span className="hidden sm:inline">持仓浮盈亏:</span>
+                      </span>
+                      <span
+                        className={`font-semibold whitespace-nowrap ${
+                          positionPnlSummary.net_unrealized_usdt >= 0 ? 'text-emerald-500' : 'text-rose-500'
+                        }`}
+                      >
+                        {formatUsdtSigned(positionPnlSummary.net_unrealized_usdt)}
+                      </span>
+                    </div>
+                  )}
+                </div>
               </div>
-            </div>
 
-            <div className="surface-card p-3 sm:p-5 lg:p-6 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 min-w-0">
-              <div className="flex items-center gap-2 sm:contents min-w-0">
-                <div className="icon-box w-8 h-8 sm:w-12 sm:h-12 shrink-0">
-                  <Activity className="w-4 h-4 sm:w-5 sm:h-5" strokeWidth={1.75} />
+              {/* Card 2: Fill Rate */}
+              <div className="surface-card p-3 sm:p-5 lg:p-6 flex flex-col sm:flex-row sm:items-center gap-1.5 sm:gap-4 min-w-0">
+                <div className="flex items-center gap-2 sm:contents min-w-0">
+                  <div className="icon-box w-7 h-7 sm:w-12 sm:h-12 shrink-0">
+                    <Activity className="w-3.5 h-3.5 sm:w-5 sm:h-5" strokeWidth={1.75} />
+                  </div>
+                  <div className="sm:hidden text-[11px] font-semibold text-sub leading-tight min-w-0 break-words">
+                    抢单成交率
+                  </div>
                 </div>
-                <div className="sm:hidden text-base font-bold font-mono text-main leading-tight break-all">
-                  {stats.fill_rate_pct ?? 0}%
+                <div className="min-w-0 flex-1">
+                  <div className="text-[17px] sm:text-2xl font-bold font-mono tabular-nums tracking-tight text-main leading-tight break-words">
+                    {stats.fill_rate_pct ?? 0}%
+                  </div>
+                  <div className="text-[11px] sm:text-xs text-dim mt-1 leading-snug flex flex-wrap items-baseline gap-x-1 gap-y-0.5">
+                    <span className="hidden sm:inline">抢单成交</span>
+                    <span className="font-mono whitespace-nowrap">
+                      <span className="hidden sm:inline">(</span>
+                      {stats.ioc_filled_count ?? 0}成 / {stats.ioc_missed_count ?? 0}撤
+                      <span className="hidden sm:inline">)</span>
+                    </span>
+                  </div>
                 </div>
               </div>
-              <div className="min-w-0 flex-1">
-                <div className="hidden sm:block text-2xl font-bold font-mono text-main leading-tight">
-                  {stats.fill_rate_pct ?? 0}%
-                </div>
-                <div className="text-[11px] sm:text-xs text-dim sm:mt-1 leading-snug break-words">
-                  <span>抢单成交</span>{' '}
-                  <span className="font-mono whitespace-nowrap">
-                    ({stats.ioc_filled_count ?? 0}成/{stats.ioc_missed_count ?? 0}撤)
-                  </span>
-                </div>
-              </div>
-            </div>
 
-            <div className="surface-card p-3 sm:p-5 lg:p-6 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 min-w-0">
-              <div className="flex items-center gap-2 sm:contents min-w-0">
-                <div className="icon-box w-8 h-8 sm:w-12 sm:h-12 shrink-0">
-                  <Percent className="w-4 h-4 sm:w-5 sm:h-5" strokeWidth={1.75} />
+              {/* Card 3: Win Rate */}
+              <div className="surface-card p-3 sm:p-5 lg:p-6 flex flex-col sm:flex-row sm:items-center gap-1.5 sm:gap-4 min-w-0">
+                <div className="flex items-center gap-2 sm:contents min-w-0">
+                  <div className="icon-box w-7 h-7 sm:w-12 sm:h-12 shrink-0">
+                    <Percent className="w-3.5 h-3.5 sm:w-5 sm:h-5" strokeWidth={1.75} />
+                  </div>
+                  <div className="sm:hidden text-[11px] font-semibold text-sub leading-tight min-w-0 break-words">
+                    闭环胜率
+                  </div>
                 </div>
-                <div className="sm:hidden text-base font-bold font-mono text-main leading-tight break-all">
-                  {stats.win_rate_pct ?? 0}%
+                <div className="min-w-0 flex-1">
+                  <div className="text-[17px] sm:text-2xl font-bold font-mono tabular-nums tracking-tight text-main leading-tight break-words">
+                    {stats.win_rate_pct ?? 0}%
+                  </div>
+                  <div className="text-[11px] sm:text-xs text-dim mt-1 leading-snug flex flex-wrap items-baseline gap-x-1 gap-y-0.5">
+                    <span className="hidden sm:inline">闭环胜率</span>
+                    <span className="font-mono whitespace-nowrap">
+                      <span className="hidden sm:inline">(</span>
+                      {stats.win_count ?? 0}盈 / {stats.loss_count ?? 0}亏
+                      <span className="hidden sm:inline">)</span>
+                    </span>
+                  </div>
                 </div>
               </div>
-              <div className="min-w-0 flex-1">
-                <div className="hidden sm:block text-2xl font-bold font-mono text-main leading-tight">
-                  {stats.win_rate_pct ?? 0}%
-                </div>
-                <div className="text-[11px] sm:text-xs text-dim sm:mt-1 leading-snug break-words">
-                  <span>闭环胜率</span>{' '}
-                  <span className="font-mono whitespace-nowrap">
-                    ({stats.win_count ?? 0}盈/{stats.loss_count ?? 0}亏)
-                  </span>
-                </div>
-              </div>
-            </div>
 
-            <div className="surface-card p-3 sm:p-5 lg:p-6 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 min-w-0">
-              <div className="flex items-center gap-2 sm:contents min-w-0">
-                <div className="icon-box w-8 h-8 sm:w-12 sm:h-12 shrink-0">
-                  <Wallet className="w-4 h-4 sm:w-5 sm:h-5" strokeWidth={1.75} />
+              {/* Card 4: Trigger Signals */}
+              <div className="surface-card p-3 sm:p-5 lg:p-6 flex flex-col sm:flex-row sm:items-center gap-1.5 sm:gap-4 min-w-0">
+                <div className="flex items-center gap-2 sm:contents min-w-0">
+                  <div className="icon-box w-7 h-7 sm:w-12 sm:h-12 shrink-0">
+                    <Wallet className="w-3.5 h-3.5 sm:w-5 sm:h-5" strokeWidth={1.75} />
+                  </div>
+                  <div className="sm:hidden text-[11px] font-semibold text-sub leading-tight min-w-0 break-words">
+                    触发信号
+                  </div>
                 </div>
-                <div className="sm:hidden text-base font-bold font-mono text-main leading-tight break-all">
-                  {stats.total_signals ?? 0}
+                <div className="min-w-0 flex-1">
+                  <div className="text-[17px] sm:text-2xl font-bold font-mono tabular-nums tracking-tight text-main leading-tight break-words">
+                    {stats.total_signals ?? 0}
+                  </div>
+                  <div className="text-[11px] sm:text-xs text-dim mt-1 leading-snug flex flex-wrap items-baseline gap-x-1 gap-y-0.5">
+                    <span className="hidden sm:inline">触发信号 ·</span>
+                    <span className="font-mono whitespace-nowrap">
+                      在途 {(snapshot.active_positions || []).length}/
+                      {snapshot.risk?.max_concurrent_positions ?? 2} 仓
+                    </span>
+                  </div>
                 </div>
               </div>
-              <div className="min-w-0 flex-1">
-                <div className="hidden sm:block text-2xl font-bold font-mono text-main leading-tight">
-                  {stats.total_signals ?? 0}
-                </div>
-                <div className="text-[11px] sm:text-xs text-dim sm:mt-1 leading-snug break-words">
-                  <span>触发信号</span>{' '}
-                  <span className="font-mono whitespace-nowrap">
-                    · 在途 {(snapshot.active_positions || []).length}/
-                    {snapshot.risk?.max_concurrent_positions ?? 2} 仓
-                  </span>
-                </div>
-              </div>
-            </div>
             </div>
           </div>
         )}
@@ -3655,13 +3661,13 @@ export default function App() {
                           <div className="grid grid-cols-2 gap-2 sm:gap-2.5 text-xs font-mono">
                             <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
                               <div className="text-[11px] text-dim font-sans">主所 (Binance)</div>
-                              <div className="text-main font-bold text-xs sm:text-sm mt-1 break-all leading-tight">
+                              <div className="text-main font-bold text-xs sm:text-sm mt-1 tabular-nums break-words leading-tight">
                                 {t.leader_mid ? Number(t.leader_mid).toFixed(prec) : '--'}
                               </div>
                             </div>
                             <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
                               <div className="text-[11px] text-dim font-sans">从所 (OKX)</div>
-                              <div className="text-main font-bold text-xs sm:text-sm mt-1 break-all leading-tight">
+                              <div className="text-main font-bold text-xs sm:text-sm mt-1 tabular-nums break-words leading-tight">
                                 {t.follower_mid ? Number(t.follower_mid).toFixed(prec) : '--'}
                               </div>
                             </div>
@@ -3728,8 +3734,8 @@ export default function App() {
                                   </span>
                                 )}
                               </div>
-                              <div className="text-main font-bold text-xs sm:text-sm mt-1 break-all leading-tight">{fmtPx(midPx)}</div>
-                              <div className="text-[10px] text-dim leading-snug break-all mt-0.5">中枢 {fmtPx(centerPx)}</div>
+                              <div className="text-main font-bold text-xs sm:text-sm mt-1 tabular-nums break-words leading-tight">{fmtPx(midPx)}</div>
+                              <div className="text-[10px] text-dim leading-snug tabular-nums break-words mt-0.5">中枢 {fmtPx(centerPx)}</div>
                             </div>
 
                             {openTotal > 0 ? (
@@ -3744,7 +3750,7 @@ export default function App() {
                                     {formatUsdtSigned(symUpl.upl)}
                                   </span>
                                 </div>
-                                <div className="text-main font-bold text-xs sm:text-sm mt-1 break-all leading-tight">
+                                <div className="text-main font-bold text-xs sm:text-sm mt-1 tabular-nums break-words leading-tight">
                                   {trailPx > 0 ? fmtPx(trailPx) : fmtPx(activeSlPx)}
                                 </div>
                                 <div className="text-[10px] text-dim leading-snug break-words mt-0.5">
@@ -3754,10 +3760,10 @@ export default function App() {
                             ) : (
                               <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
                                 <div className="text-[10px] sm:text-[11px] text-dim font-sans">突破触发位</div>
-                                <div className="text-emerald-600 dark:text-emerald-400 font-bold text-[11px] sm:text-xs mt-1 break-all leading-tight">
+                                <div className="text-emerald-600 dark:text-emerald-400 font-bold text-[11px] sm:text-xs mt-1 tabular-nums break-words leading-tight">
                                   ↑ {fmtPx(l1?.trigger_price)}
                                 </div>
-                                <div className="text-rose-500 font-bold text-[11px] sm:text-xs mt-0.5 break-all leading-tight">
+                                <div className="text-rose-500 font-bold text-[11px] sm:text-xs mt-0.5 tabular-nums break-words leading-tight">
                                   ↓ {fmtPx(s1?.trigger_price)}
                                 </div>
                               </div>
@@ -3816,8 +3822,8 @@ export default function App() {
                                   {isAdpTrend ? '顺势' : '震荡'}
                                 </span>
                               </div>
-                              <div className="text-main font-bold text-xs sm:text-sm mt-1 break-all leading-tight">{fmtPx(midPx)}</div>
-                              <div className="text-[10px] text-dim leading-snug break-all mt-0.5">中枢 {fmtPx(centerPx)}</div>
+                              <div className="text-main font-bold text-xs sm:text-sm mt-1 tabular-nums break-words leading-tight">{fmtPx(midPx)}</div>
+                              <div className="text-[10px] text-dim leading-snug tabular-nums break-words mt-0.5">中枢 {fmtPx(centerPx)}</div>
                             </div>
 
                             <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
@@ -3833,7 +3839,7 @@ export default function App() {
                                   </span>
                                 )}
                               </div>
-                              <div className="text-main font-bold text-xs sm:text-sm mt-1 break-all leading-tight">
+                              <div className="text-main font-bold text-xs sm:text-sm mt-1 tabular-nums break-words leading-tight">
                                 {bbwPct != null ? `${bbwPct.toFixed(2)}%` : '--'}
                                 {bbwRank != null ? ` · P${bbwRank}` : ''}
                               </div>
@@ -3892,8 +3898,8 @@ export default function App() {
                                 </span>
                               )}
                             </div>
-                            <div className="text-main font-bold text-xs sm:text-sm mt-1 break-all leading-tight">{fmtPx(midPx)}</div>
-                            <div className="text-[10px] text-dim leading-snug break-all mt-0.5">中枢 {fmtPx(centerPx)}</div>
+                            <div className="text-main font-bold text-xs sm:text-sm mt-1 tabular-nums break-words leading-tight">{fmtPx(midPx)}</div>
+                            <div className="text-[10px] text-dim leading-snug tabular-nums break-words mt-0.5">中枢 {fmtPx(centerPx)}</div>
                           </div>
 
                           <div className="surface-subtle p-2.5 sm:p-3 min-w-0">
@@ -3999,15 +4005,15 @@ export default function App() {
                     <div
                       key={s.symbol}
                       onClick={() => setSelectedSymbol(s.symbol)}
-                      className={`w-[84vw] max-w-[315px] shrink-0 snap-start sm:w-auto sm:max-w-none surface-card interactive-card p-4 sm:p-5 lg:p-5 ${
+                      className={`w-[86vw] max-w-[335px] shrink-0 snap-start sm:w-auto sm:max-w-none surface-card interactive-card p-3.5 sm:p-5 lg:p-5 ${
                         isSelected
                           ? 'ring-2 ring-[#0f1419] dark:ring-sky-400 shadow-[0_10px_28px_-8px_rgba(15,23,42,0.16)] dark:shadow-[0_12px_32px_-8px_rgba(56,189,248,0.22)]'
                           : ''
                       }`}
                     >
-                      <div className="flex items-center justify-between gap-2 mb-3">
-                        <div className="flex items-center gap-1.5 min-w-0">
-                          <span className="font-mono font-bold text-sm sm:text-base text-main truncate">
+                      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5 mb-3">
+                        <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                          <span className="font-mono font-bold text-sm sm:text-base text-main leading-snug break-words">
                             {s.symbol.replace(':USDT', '')}
                           </span>
                           <span
@@ -4072,14 +4078,14 @@ export default function App() {
                     </div>
 
                     {/* Strategy-Aware Stage Pipeline */}
-                    <div className={`grid ${sm.gridColsClass} gap-2.5 sm:gap-3`}>
+                    <div className={`grid ${sm.gridColsClass} gap-2 sm:gap-3`}>
                       {sm.pipeline.map((st, idx) => {
                         const isCurrent = st.key === sm.activeKey;
                         const isPassed = idx < sm.activeIdx;
                         return (
                           <div
                             key={`${sm.strategyType}-${st.key}`}
-                            className={`relative rounded-2xl px-3 py-2.5 border transition-all flex items-center gap-2.5 min-w-0 ${
+                            className={`relative rounded-2xl px-2.5 sm:px-3 py-2.5 border transition-all flex flex-col sm:flex-row sm:items-center gap-1.5 sm:gap-2.5 min-w-0 ${
                               isCurrent
                                 ? 'bg-[#0f1419] dark:bg-sky-500/15 text-white dark:text-sky-100 border-[#0f1419] dark:border-sky-400/60 shadow-md -translate-y-0.5'
                                 : isPassed
@@ -4087,19 +4093,33 @@ export default function App() {
                                 : 'surface-subtle interactive-subtle'
                             }`}
                           >
-                            <div
-                              className={`w-8 h-8 sm:w-9 sm:h-9 rounded-xl flex items-center justify-center font-mono text-[11px] font-bold shrink-0 transition ${
-                                isCurrent
-                                  ? 'bg-white/15 dark:bg-sky-400 text-white dark:text-slate-950'
-                                  : isPassed
-                                  ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-                                  : 'bg-[var(--bg-card)] text-sub border border-line'
-                              }`}
-                            >
-                              0{st.step}
+                            <div className="flex items-center gap-1.5 sm:contents min-w-0">
+                              <div
+                                className={`w-6 h-6 sm:w-9 sm:h-9 rounded-lg sm:rounded-xl flex items-center justify-center font-mono text-[10px] sm:text-[11px] font-bold shrink-0 transition ${
+                                  isCurrent
+                                    ? 'bg-white/15 dark:bg-sky-400 text-white dark:text-slate-950'
+                                    : isPassed
+                                    ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                                    : 'bg-[var(--bg-card)] text-sub border border-line'
+                                }`}
+                              >
+                                0{st.step}
+                              </div>
+                              <div className="sm:hidden flex items-center gap-1.5 min-w-0 flex-1">
+                                <span
+                                  className={`text-xs font-bold leading-snug break-words ${
+                                    isCurrent ? 'text-white dark:text-sky-100' : 'text-main'
+                                  }`}
+                                >
+                                  {st.label}
+                                </span>
+                                {isCurrent && (
+                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping shrink-0" />
+                                )}
+                              </div>
                             </div>
                             <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-1.5">
+                              <div className="hidden sm:flex items-center gap-1.5">
                                 <span
                                   className={`text-xs font-bold leading-snug break-words ${
                                     isCurrent ? 'text-white dark:text-sky-100' : 'text-main'
@@ -4112,7 +4132,7 @@ export default function App() {
                                 )}
                               </div>
                               <div
-                                className={`text-[10px] sm:text-[11px] leading-snug break-words mt-0.5 ${
+                                className={`text-[10px] sm:text-[11px] leading-snug break-words sm:mt-0.5 ${
                                   isCurrent ? 'text-white/75 dark:text-sky-200/80' : 'text-dim'
                                 }`}
                               >
@@ -4172,19 +4192,19 @@ export default function App() {
 
                   {/* Real-Time Unrealized Profit & Loss Total Summary Strip */}
                   <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 sm:gap-2.5">
-                    <div className="px-3 py-2 rounded-xl border border-emerald-500/25 bg-emerald-500/[0.06] flex flex-col gap-0.5 min-w-0">
+                    <div className="p-2.5 sm:px-3 sm:py-2 rounded-xl border border-emerald-500/25 bg-emerald-500/[0.06] flex flex-col gap-0.5 min-w-0">
                       <div className="flex flex-wrap items-baseline justify-between gap-x-1.5 gap-y-0.5 text-[11px] text-sub leading-snug">
                         <span>持仓实时盈利总和</span>
                         <span className="font-mono text-[10px] text-emerald-600 dark:text-emerald-400 shrink-0">
                           {positionPnlSummary.profit_count} 仓
                         </span>
                       </div>
-                      <div className="text-sm sm:text-base font-bold font-mono text-emerald-500 break-all leading-tight">
+                      <div className="text-sm sm:text-base font-bold font-mono tabular-nums text-emerald-500 break-words leading-tight">
                         {formatUsdtSigned(positionPnlSummary.total_profit_usdt)}
                       </div>
                     </div>
 
-                    <div className="px-3 py-2 rounded-xl border border-rose-500/25 bg-rose-500/[0.06] flex flex-col gap-0.5 min-w-0">
+                    <div className="p-2.5 sm:px-3 sm:py-2 rounded-xl border border-rose-500/25 bg-rose-500/[0.06] flex flex-col gap-0.5 min-w-0">
                       <div className="flex flex-wrap items-baseline justify-between gap-x-1.5 gap-y-0.5 text-[11px] text-sub leading-snug">
                         <span>持仓实时亏损总和</span>
                         <span className="font-mono text-[10px] text-rose-500 shrink-0">
@@ -4192,7 +4212,7 @@ export default function App() {
                         </span>
                       </div>
                       <div
-                        className={`text-sm sm:text-base font-bold font-mono break-all leading-tight ${
+                        className={`text-sm sm:text-base font-bold font-mono tabular-nums break-words leading-tight ${
                           positionPnlSummary.total_loss_usdt < 0 ? 'text-rose-500' : 'text-dim'
                         }`}
                       >
@@ -4200,7 +4220,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="px-3 py-2 surface-subtle flex flex-col gap-0.5 min-w-0">
+                    <div className="p-2.5 sm:px-3 sm:py-2 surface-subtle flex flex-col gap-0.5 min-w-0">
                       <div className="flex flex-wrap items-baseline justify-between gap-x-1.5 gap-y-0.5 text-[11px] text-sub leading-snug">
                         <span>持仓实时净浮盈亏</span>
                         <span
@@ -4213,7 +4233,7 @@ export default function App() {
                         </span>
                       </div>
                       <div
-                        className={`text-sm sm:text-base font-bold font-mono break-all leading-tight ${
+                        className={`text-sm sm:text-base font-bold font-mono tabular-nums break-words leading-tight ${
                           positionPnlSummary.net_unrealized_usdt >= 0 ? 'text-emerald-500' : 'text-rose-500'
                         }`}
                       >
@@ -4221,7 +4241,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="px-3 py-2 surface-subtle flex flex-col gap-0.5 min-w-0">
+                    <div className="p-2.5 sm:px-3 sm:py-2 surface-subtle flex flex-col gap-0.5 min-w-0">
                       <div className="flex flex-wrap items-baseline justify-between gap-x-1.5 gap-y-0.5 text-[11px] text-sub leading-snug">
                         <span>在途持仓总名义</span>
                         <span className="font-mono text-[10px] text-dim shrink-0">
@@ -4231,7 +4251,7 @@ export default function App() {
                             : ''}
                         </span>
                       </div>
-                      <div className="text-sm sm:text-base font-bold font-mono text-main break-all leading-tight">
+                      <div className="text-sm sm:text-base font-bold font-mono tabular-nums text-main break-words leading-tight">
                         ${Number(positionPnlSummary.total_notional_usdt || 0).toFixed(2)}
                       </div>
                     </div>
@@ -4278,91 +4298,95 @@ export default function App() {
                         return (
                           <div
                             key={rowKey}
-                            className="flex flex-col xl:flex-row xl:items-center justify-between gap-2.5 px-3 py-2.5 surface-subtle interactive-subtle text-xs font-mono"
+                            className="flex flex-col xl:flex-row xl:items-center justify-between gap-2.5 px-3 py-2.5 surface-subtle interactive-subtle text-xs font-mono min-w-0"
                           >
-                            <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-                              <button
-                                type="button"
-                                onClick={() => setSelectedSymbol(pos.symbol)}
-                                className={`px-2.5 py-1 rounded-full font-semibold font-sans cursor-pointer transition-opacity hover:opacity-85 ${
-                                  pos.side === 'LONG'
-                                    ? 'bg-emerald-600 text-white'
-                                    : 'bg-rose-600 text-white'
-                                }`}
-                                title="点击切换到该币种监控视图"
-                              >
-                                {pos.symbol} · {pos.side === 'LONG' ? '多' : '空'}
-                                {Number(pos.leverage || 0) > 0 ? ` ${Number(pos.leverage)}x` : ''}
-                              </button>
+                            <div className="flex flex-col gap-2 min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => setSelectedSymbol(pos.symbol)}
+                                  className={`px-2.5 py-1 rounded-full font-semibold font-sans cursor-pointer transition-opacity hover:opacity-85 max-w-full break-words ${
+                                    pos.side === 'LONG'
+                                      ? 'bg-emerald-600 text-white'
+                                      : 'bg-rose-600 text-white'
+                                  }`}
+                                  title="点击切换到该币种监控视图"
+                                >
+                                  {pos.symbol.replace(':USDT', '')} · {pos.side === 'LONG' ? '多' : '空'}
+                                  {Number(pos.leverage || 0) > 0 ? ` ${Number(pos.leverage)}x` : ''}
+                                </button>
 
-                              <span
-                                className={`px-2 py-0.5 rounded-md font-sans text-[11px] font-medium border ${
-                                  pos.managed_by_strategy
-                                    ? 'bg-sky-500/10 text-sky-600 dark:text-sky-300 border-sky-500/25'
-                                    : 'bg-amber-500/10 text-amber-600 dark:text-amber-300 border-amber-500/30'
-                                }`}
-                              >
-                                {stratLabel}
-                              </span>
-
-                              {pos.recovered && (
-                                <span className="px-2 py-0.5 rounded-md font-sans text-[11px] font-medium bg-indigo-500/10 text-indigo-600 dark:text-indigo-300 border border-indigo-500/25">
-                                  已恢复接管
+                                <span
+                                  className={`px-2 py-0.5 rounded-md font-sans text-[11px] font-medium border ${
+                                    pos.managed_by_strategy
+                                      ? 'bg-sky-500/10 text-sky-600 dark:text-sky-300 border-sky-500/25'
+                                      : 'bg-amber-500/10 text-amber-600 dark:text-amber-300 border-amber-500/30'
+                                  }`}
+                                >
+                                  {stratLabel}
                                 </span>
-                              )}
 
-                              {pos.maker_tp_live && (
-                                <span className="px-2 py-0.5 rounded-md font-sans text-[10px] font-semibold bg-emerald-500/12 text-emerald-600 dark:text-emerald-300 border border-emerald-500/25">
-                                  Maker挂单止盈
+                                {pos.recovered && (
+                                  <span className="px-2 py-0.5 rounded-md font-sans text-[11px] font-medium bg-indigo-500/10 text-indigo-600 dark:text-indigo-300 border border-indigo-500/25">
+                                    已恢复接管
+                                  </span>
+                                )}
+
+                                {pos.maker_tp_live && (
+                                  <span className="px-2 py-0.5 rounded-md font-sans text-[10px] font-semibold bg-emerald-500/12 text-emerald-600 dark:text-emerald-300 border border-emerald-500/25">
+                                    Maker挂单止盈
+                                  </span>
+                                )}
+
+                                {pos.cond_sl_live && (
+                                  <span className="px-2 py-0.5 rounded-md font-sans text-[10px] font-semibold bg-amber-500/12 text-amber-600 dark:text-amber-300 border border-amber-500/25">
+                                    OKX条件止损
+                                  </span>
+                                )}
+                              </div>
+
+                              <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-x-3 gap-y-1 text-[11px] sm:text-xs tabular-nums">
+                                <span className="text-main break-words">
+                                  均价: {formatPositionPrice(pos.entry_price, pos.symbol)}
                                 </span>
-                              )}
 
-                              {pos.cond_sl_live && (
-                                <span className="px-2 py-0.5 rounded-md font-sans text-[10px] font-semibold bg-amber-500/12 text-amber-600 dark:text-amber-300 border border-amber-500/25">
-                                  OKX条件止损
+                                {hasMark && (
+                                  <span className="text-slate-500 break-words">
+                                    现价: {formatPositionPrice(pos.mark_price, pos.symbol)}
+                                  </span>
+                                )}
+
+                                {hasNotional && (
+                                  <span className="text-main break-words">
+                                    名义: {Number(pos.notional_usdt).toFixed(2)}U
+                                    {Number(pos.contracts || 0) > 0 ? ` (${Number(pos.contracts)}张)` : ''}
+                                  </span>
+                                )}
+
+                                {hasTp ? (
+                                  <span className="text-emerald-500 font-semibold break-words">
+                                    止盈: {formatPositionPrice(pos.tp_price, pos.symbol)}
+                                  </span>
+                                ) : hasTrailStop ? (
+                                  <span className="text-teal-500 font-semibold break-words">
+                                    追踪止盈: {formatPositionPrice(pos.trail_stop_price, pos.symbol)}
+                                  </span>
+                                ) : null}
+
+                                {hasSl && (
+                                  <span className="text-rose-500 font-semibold break-words">
+                                    止损: {formatPositionPrice(pos.sl_price, pos.symbol)}
+                                  </span>
+                                )}
+
+                                <span className="text-main col-span-2 sm:col-span-1 break-words">
+                                  浮盈:{' '}
+                                  <strong className={isProfit ? 'text-emerald-500' : 'text-rose-500'}>
+                                    {hasUplUsdt ? `${uplUsdt >= 0 ? '+' : ''}${uplUsdt.toFixed(3)}U ` : ''}
+                                    ({netPct >= 0 ? '+' : ''}{(netPct * 100).toFixed(2)}%)
+                                  </strong>
                                 </span>
-                              )}
-
-                              <span className="text-main">
-                                均价: {formatPositionPrice(pos.entry_price, pos.symbol)}
-                              </span>
-
-                              {hasMark && (
-                                <span className="text-slate-500">
-                                  现价: {formatPositionPrice(pos.mark_price, pos.symbol)}
-                                </span>
-                              )}
-
-                              {hasNotional && (
-                                <span className="text-main">
-                                  名义: {Number(pos.notional_usdt).toFixed(2)}U
-                                  {Number(pos.contracts || 0) > 0 ? ` (${Number(pos.contracts)}张)` : ''}
-                                </span>
-                              )}
-
-                              {hasTp ? (
-                                <span className="text-emerald-500 font-semibold">
-                                  止盈: {formatPositionPrice(pos.tp_price, pos.symbol)}
-                                </span>
-                              ) : hasTrailStop ? (
-                                <span className="text-teal-500 font-semibold">
-                                  追踪止盈: {formatPositionPrice(pos.trail_stop_price, pos.symbol)}
-                                </span>
-                              ) : null}
-
-                              {hasSl && (
-                                <span className="text-rose-500 font-semibold">
-                                  止损: {formatPositionPrice(pos.sl_price, pos.symbol)}
-                                </span>
-                              )}
-
-                              <span className="text-main">
-                                浮盈:{' '}
-                                <strong className={isProfit ? 'text-emerald-500' : 'text-rose-500'}>
-                                  {hasUplUsdt ? `${uplUsdt >= 0 ? '+' : ''}${uplUsdt.toFixed(3)}U ` : ''}
-                                  ({netPct >= 0 ? '+' : ''}{(netPct * 100).toFixed(2)}%)
-                                </strong>
-                              </span>
+                              </div>
                             </div>
 
                             {currentUser && (
@@ -4587,12 +4611,12 @@ export default function App() {
                 return (
                   <>
                     <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5 items-end">
-                      <div>
+                      <div className="col-span-2 sm:col-span-1 min-w-0">
                         <label className="block text-[11px] font-semibold text-dim mb-1">作用范围</label>
                         <select
                           value={batchForm.strategy_filter}
                           onChange={(e) => setBatchForm((prev) => ({ ...prev, strategy_filter: e.target.value }))}
-                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
+                          className="w-full min-w-0 rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
                         >
                           <option value="ALL_GRID">全部网格策略</option>
                           <option value="LONG_SHORT_GRID">仅传统震荡网格</option>
@@ -4601,7 +4625,7 @@ export default function App() {
                           <option value="ADAPTIVE_GRID">仅 VCP 双模式</option>
                         </select>
                       </div>
-                      <div>
+                      <div className="min-w-0">
                         <label className="block text-[11px] font-semibold text-dim mb-1">名义金额 (USDT)</label>
                         <input
                           type="number"
@@ -4611,10 +4635,10 @@ export default function App() {
                           placeholder="留空不改 (如 20)"
                           value={batchForm.order_usdt_str}
                           onChange={(e) => setBatchForm((prev) => ({ ...prev, order_usdt_str: e.target.value }))}
-                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                          className="w-full min-w-0 rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
                         />
                       </div>
-                      <div>
+                      <div className="min-w-0">
                         <label className="block text-[11px] font-semibold text-dim mb-1">
                           {bFilter === 'TREND_GRID' ? '单边金字塔层数 (N)' : '单边层数 (N)'}
                         </label>
@@ -4626,10 +4650,10 @@ export default function App() {
                           placeholder="留空不改 (如 3 或 5)"
                           value={batchForm.grid_levels_str}
                           onChange={(e) => updateBatchFieldWithLinkage('grid_levels_str', e.target.value)}
-                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                          className="w-full min-w-0 rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
                         />
                       </div>
-                      <div>
+                      <div className="min-w-0">
                         <label className="block text-[11px] font-semibold text-dim mb-1">
                           {bFilter === 'TREND_GRID' ? '金字塔加仓间距 (%)' : '目标步长 (%)'}
                         </label>
@@ -4641,11 +4665,11 @@ export default function App() {
                           placeholder="留空不改"
                           value={batchForm.grid_step_pct_str}
                           onChange={(e) => updateBatchFieldWithLinkage('grid_step_pct_str', e.target.value)}
-                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                          className="w-full min-w-0 rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
                         />
                       </div>
                       {showBatchFixedTp && (
-                        <div>
+                        <div className="min-w-0">
                           <label className="block text-[11px] font-semibold text-dim mb-1">单格止盈目标 (%)</label>
                           <input
                             type="number"
@@ -4655,11 +4679,11 @@ export default function App() {
                             placeholder="留空不改"
                             value={batchForm.grid_take_profit_pct_str}
                             onChange={(e) => setBatchForm((prev) => ({ ...prev, grid_take_profit_pct_str: e.target.value }))}
-                            className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                            className="w-full min-w-0 rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
                           />
                         </div>
                       )}
-                      <div>
+                      <div className="min-w-0">
                         <label className="block text-[11px] font-semibold text-dim mb-1">
                           {bFilter === 'TREND_GRID' ? '空仓重锚跨度 ±(%)' : '区间总跨度 ±(%)'}
                         </label>
@@ -4671,11 +4695,11 @@ export default function App() {
                           placeholder="留空按层数自动匹配"
                           value={batchForm.grid_range_pct_str}
                           onChange={(e) => setBatchForm((prev) => ({ ...prev, grid_range_pct_str: e.target.value }))}
-                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                          className="w-full min-w-0 rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
                         />
                       </div>
-                      <div>
-                        <label className="block text-[11px] font-semibold text-dim mb-1">
+                      <div className="min-w-0">
+                        <label className="block text-[11px] font-semibold text-dim mb-1 leading-snug">
                           {bFilter === 'TREND_GRID' ? '首格硬止损 (%)' : bFilter === 'REVERSE_GRID' ? '单格价格止损 (%)' : '价格止损 (%)'}
                           {batchForm.grid_stop_loss_pct_str !== '' && Number(batchForm.grid_stop_loss_pct_str) > 0 && (
                             <span className="ml-1 text-amber-600 dark:text-amber-300 font-mono">
@@ -4691,12 +4715,12 @@ export default function App() {
                           placeholder="留空不改 (如 3.8)"
                           value={batchForm.grid_stop_loss_pct_str}
                           onChange={(e) => updateBatchFieldWithLinkage('grid_stop_loss_pct_str', e.target.value)}
-                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                          className="w-full min-w-0 rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
                         />
                       </div>
                       {showBatchTrendTrail && (
                         <>
-                          <div>
+                          <div className="min-w-0">
                             <label className="block text-[11px] font-semibold text-dim mb-1">顺势死区倍率 (x)</label>
                             <input
                               type="number"
@@ -4706,10 +4730,10 @@ export default function App() {
                               placeholder="留空不改 (建议 1.25)"
                               value={batchForm.trend_dead_zone_mult_str}
                               onChange={(e) => setBatchForm((prev) => ({ ...prev, trend_dead_zone_mult_str: e.target.value }))}
-                              className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                              className="w-full min-w-0 rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
                             />
                           </div>
-                          <div>
+                          <div className="min-w-0">
                             <label className="block text-[11px] font-semibold text-dim mb-1">顺势追踪倍率 (x)</label>
                             <input
                               type="number"
@@ -4719,18 +4743,18 @@ export default function App() {
                               placeholder="留空不改 (如 1.25)"
                               value={batchForm.trend_trailing_mult_str}
                               onChange={(e) => setBatchForm((prev) => ({ ...prev, trend_trailing_mult_str: e.target.value }))}
-                              className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
+                              className="w-full min-w-0 rounded-xl surface-subtle px-3 py-2 text-xs font-mono text-main outline-none"
                             />
                           </div>
                         </>
                       )}
                       {showBatchMakerPo && (
-                        <div>
+                        <div className="min-w-0">
                           <label className="block text-[11px] font-semibold text-dim mb-1">Maker挂单止盈</label>
                           <select
                             value={batchForm.use_post_only_tp_mode}
                             onChange={(e) => setBatchForm((prev) => ({ ...prev, use_post_only_tp_mode: e.target.value }))}
-                            className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
+                            className="w-full min-w-0 rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
                           >
                             <option value="keep">保持原状</option>
                             <option value="on">一键开启 (省费)</option>
@@ -4738,12 +4762,12 @@ export default function App() {
                           </select>
                         </div>
                       )}
-                      <div>
+                      <div className="min-w-0">
                         <label className="block text-[11px] font-semibold text-dim mb-1">条件止损触发价</label>
                         <select
                           value={batchForm.sl_trigger_px_type_mode}
                           onChange={(e) => setBatchForm((prev) => ({ ...prev, sl_trigger_px_type_mode: e.target.value }))}
-                          className="w-full rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
+                          className="w-full min-w-0 rounded-xl surface-subtle px-3 py-2 text-xs font-semibold text-main outline-none"
                         >
                           <option value="keep">保持原状</option>
                           <option value="mark">标记价 Mark (抗插针推荐)</option>
@@ -4902,8 +4926,8 @@ export default function App() {
                   <div className="shrink-0 space-y-3 sm:space-y-3.5">
                     {/* Exchange / Broker Selector for Picking Symbols */}
                     <div className="surface-subtle p-2.5 sm:p-3 rounded-2xl space-y-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-[11px] font-bold text-main">选择交易所 / 券商选标的</span>
+                      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1.5">
+                        <span className="text-[11px] font-bold text-main shrink-0">选择交易所 / 券商选标的</span>
                         <select
                           value={selectedExchangeFilter}
                           onChange={(e) => {
@@ -4913,7 +4937,7 @@ export default function App() {
                               setSelectedSector('标普500');
                             }
                           }}
-                          className="rounded-xl bg-[var(--bg-card)] border border-line px-2.5 py-1 text-xs font-semibold text-main outline-none"
+                          className="w-full sm:w-auto sm:max-w-[64%] min-w-0 rounded-xl bg-[var(--bg-card)] border border-line px-2.5 py-1.5 sm:py-1 text-xs font-semibold text-main outline-none"
                         >
                           <option value="ALL">全部交易所与券商</option>
                           <optgroup label="加密货币合约交易所">
@@ -5046,17 +5070,52 @@ export default function App() {
                           <div
                             key={item.symbol}
                             onClick={() => setSelectedSymbol(item.symbol)}
-                            className={`cursor-pointer p-3 sm:p-3.5 rounded-2xl transition flex items-center justify-between gap-2 ${
+                            className={`cursor-pointer p-3 sm:p-3.5 rounded-2xl transition flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 min-w-0 ${
                               active
                                 ? 'bg-[#0f1419] text-white shadow-sm'
                                 : 'surface-subtle text-main hover:opacity-90'
                             }`}
                           >
-                            <div className="min-w-0">
-                              <div className="flex flex-wrap items-center gap-1.5">
-                                <span className="font-mono font-bold text-sm truncate">
-                                  {itemIsUsdEquity ? itemNativeSym : item.symbol}
+                            <div className="min-w-0 flex-1 space-y-1">
+                              <div className="flex items-center justify-between gap-2 sm:block">
+                                <span className="font-mono font-bold text-sm leading-snug break-words">
+                                  {itemIsUsdEquity ? itemNativeSym : item.symbol.replace(':USDT', '')}
                                 </span>
+                                <div className="flex sm:hidden items-center gap-1 shrink-0">
+                                  <span
+                                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                      hasOpenPosition
+                                        ? active
+                                          ? 'bg-amber-500 text-white'
+                                          : 'bg-amber-500/15 text-amber-600'
+                                        : active
+                                        ? 'bg-white/15 text-white/80'
+                                        : 'bg-slate-500/15 text-dim'
+                                    }`}
+                                  >
+                                    {hasOpenPosition && (
+                                      <span
+                                        className={`w-1.5 h-1.5 rounded-full ${
+                                          active ? 'bg-white' : 'bg-amber-500'
+                                        } animate-pulse`}
+                                      />
+                                    )}
+                                    {hasOpenPosition ? '持仓中' : '空仓'}
+                                  </span>
+                                  <span
+                                    className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                      item.is_running
+                                        ? active
+                                          ? 'bg-emerald-500 text-white'
+                                          : 'bg-emerald-500/15 text-emerald-600'
+                                        : 'bg-slate-500/20 text-dim'
+                                    }`}
+                                  >
+                                    {item.is_running ? '运行中' : '已暂停'}
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-1.5">
                                 <span
                                   className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
                                     itemIsUsdEquity
@@ -5094,7 +5153,7 @@ export default function App() {
                                   {STRATEGY_LABEL_MAP[st] || st}
                                 </span>
                               </div>
-                              <div className={`text-[11px] mt-0.5 leading-snug break-words ${active ? 'text-white/75' : 'text-dim'}`}>
+                              <div className={`text-[11px] leading-snug break-words ${active ? 'text-white/75' : 'text-dim'}`}>
                                 {isGrid
                                   ? `${GRID_MODE_LABEL_MAP[item.grid_side_mode || 'LONG_SHORT']} · ${item.grid_levels ?? 3}层 · ${
                                       itemIsUsdEquity ? `$${item.order_usdt} USD` : `${item.order_usdt}U`
@@ -5104,7 +5163,7 @@ export default function App() {
                                     } · ${item.leverage}x`}
                               </div>
                             </div>
-                            <div className="flex items-center gap-1.5 shrink-0">
+                            <div className="hidden sm:flex items-center gap-1.5 shrink-0">
                               <span
                                 className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
                                   hasOpenPosition
@@ -5272,7 +5331,7 @@ export default function App() {
                           value={currentStrategy.exchange_id || 'okx'}
                           onChange={(e) => updateCurrentStrategyField({ exchange_id: e.target.value })}
                           title="选择该标的绑定的执行交易所或传统券商通道"
-                          className="input-field py-2 px-3 sm:px-3.5 text-sm sm:text-xs font-semibold sm:w-auto"
+                          className="col-span-2 sm:col-span-1 input-field min-w-0 py-2 px-3 sm:px-3.5 text-sm sm:text-xs font-semibold sm:w-auto"
                         >
                           <optgroup label="加密货币合约交易所">
                             {EXCHANGE_SELECT_OPTIONS.filter((o) => o.group === 'crypto').map((o) => (
@@ -5293,7 +5352,7 @@ export default function App() {
                           <select
                             value={currentStrategy.grid_side_mode || 'LONG_SHORT'}
                             onChange={(e) => updateCurrentStrategyField({ grid_side_mode: e.target.value })}
-                            className="input-field py-2 px-3 sm:px-3.5 text-sm sm:text-xs font-semibold sm:w-auto"
+                            className="input-field min-w-0 py-2 px-3 sm:px-3.5 text-sm sm:text-xs font-semibold sm:w-auto"
                           >
                             <option value="LONG_SHORT">多空双开网格</option>
                             <option value="LONG_ONLY">仅做多网格</option>
@@ -5303,7 +5362,7 @@ export default function App() {
                           <select
                             value={currentStrategy.direction || 'BOTH'}
                             onChange={(e) => updateCurrentStrategyField({ direction: e.target.value })}
-                            className="input-field py-2 px-3 sm:px-3.5 text-sm sm:text-xs font-semibold sm:w-auto"
+                            className="input-field min-w-0 py-2 px-3 sm:px-3.5 text-sm sm:text-xs font-semibold sm:w-auto"
                           >
                             <option value="BOTH">多空双向狙击</option>
                             <option value="LONG_ONLY">仅限做多</option>
@@ -6062,8 +6121,8 @@ export default function App() {
                                     const lvlNum = idx + 1;
                                     const isCappedTop = effMaxMode === 'CAP_TP' && lvlNum === revN && revN >= 2;
                                     return (
-                                      <div key={`rev-l-${lvlNum}`} className="surface-subtle p-2 rounded-xl">
-                                        <div className="flex items-center justify-between text-[10px] font-mono mb-1">
+                                      <div key={`rev-l-${lvlNum}`} className="surface-subtle p-2 rounded-xl min-w-0">
+                                        <div className="flex flex-wrap items-center justify-between gap-1 text-[10px] font-mono mb-1">
                                           <span className="font-bold text-main">
                                             {lvlNum === 1 ? 'L1(底Q)' : `L${lvlNum}`}
                                           </span>
@@ -6142,8 +6201,8 @@ export default function App() {
                                   {curSPcts.map((pctVal, idx) => {
                                     const lvlNum = idx + 1;
                                     return (
-                                      <div key={`rev-s-${lvlNum}`} className="surface-subtle p-2 rounded-xl">
-                                        <div className="flex items-center justify-between text-[10px] font-mono mb-1">
+                                      <div key={`rev-s-${lvlNum}`} className="surface-subtle p-2 rounded-xl min-w-0">
+                                        <div className="flex flex-wrap items-center justify-between gap-1 text-[10px] font-mono mb-1">
                                           <span className="font-bold text-main">S{lvlNum}</span>
                                           <span className="text-dim">
                                             {(((currentStrategy.order_usdt ?? 100) * pctVal) / 100).toFixed(0)}U
@@ -6478,30 +6537,30 @@ export default function App() {
                                       </span>
                                       <span>{lv.status}</span>
                                     </div>
-                                    <div className="text-[10px] mt-1 break-all">
+                                    <div className="text-[10px] mt-1 break-words tabular-nums">
                                       触发 {Number(lv.trigger_price).toFixed(gridPrec)}
                                     </div>
                                     {isTrendActive ? (
                                       <>
-                                        <div className="text-[10px] text-rose-500">
+                                        <div className="text-[10px] text-rose-500 break-words tabular-nums">
                                           止损 {Number(lv.sl_price || 0).toFixed(gridPrec)}
                                         </div>
-                                        <div className="text-[10px] text-dim">
+                                        <div className="text-[10px] text-dim break-words tabular-nums">
                                           仓位 {Number(lv.order_usdt || 0).toFixed(1)}U ({Number(lv.weight_pct || 0).toFixed(0)}%)
                                         </div>
                                       </>
                                     ) : isReverseOscActive ? (
                                       <>
-                                        <div className="text-[10px] text-emerald-600 dark:text-emerald-400">
+                                        <div className="text-[10px] text-emerald-600 dark:text-emerald-400 break-words tabular-nums">
                                           止盈{' '}
                                           {Number(lv.tp_price || 0) > 0
                                             ? Number(lv.tp_price).toFixed(gridPrec)
                                             : '组追踪/顶格'}
                                         </div>
-                                        <div className="text-[10px] text-rose-500">
+                                        <div className="text-[10px] text-rose-500 break-words tabular-nums">
                                           止损 {Number(lv.sl_price || 0).toFixed(gridPrec)}
                                         </div>
-                                        <div className="text-[10px] text-dim">
+                                        <div className="text-[10px] text-dim break-words tabular-nums">
                                           仓位 {Number(lv.order_usdt || 0).toFixed(1)}U ({Number(lv.weight_pct || 0).toFixed(0)}%)
                                         </div>
                                         {lv.status === 'IDLE' && lv.armed === false && (
@@ -6511,7 +6570,7 @@ export default function App() {
                                         )}
                                       </>
                                     ) : (
-                                      <div className="text-[10px] text-dim">
+                                      <div className="text-[10px] text-dim break-words tabular-nums">
                                         止盈 {Number(lv.tp_price).toFixed(gridPrec)}
                                       </div>
                                     )}
@@ -6958,8 +7017,8 @@ export default function App() {
 
                       <div className="space-y-3.5 text-xs">
                         <div className="grid grid-cols-2 gap-3">
-                          <div>
-                            <label className="font-bold text-main block mb-1.5">吃单费率 Taker (%)</label>
+                          <div className="min-w-0">
+                            <label className="font-bold text-main block mb-1.5 leading-snug">吃单费率 Taker (%)</label>
                             <PercentNumberInput
                               step="0.005"
                               decimals={3}
@@ -6973,8 +7032,8 @@ export default function App() {
                               className="input-field font-mono py-2.5"
                             />
                           </div>
-                          <div>
-                            <label className="font-bold text-main block mb-1.5">挂单费率 Maker (%)</label>
+                          <div className="min-w-0">
+                            <label className="font-bold text-main block mb-1.5 leading-snug">挂单费率 Maker (%)</label>
                             <PercentNumberInput
                               step="0.005"
                               decimals={3}
@@ -6991,9 +7050,9 @@ export default function App() {
                         </div>
 
                         <div>
-                          <div className="flex items-center justify-between mb-1.5">
-                            <label className="font-bold text-main">{keyLabel}</label>
-                            <span className="text-[11px] font-mono text-dim">
+                          <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 mb-1.5">
+                            <label className="font-bold text-main leading-snug">{keyLabel}</label>
+                            <span className="text-[11px] font-mono text-dim shrink-0">
                               {ex.has_api_key ? `已存 (${ex.api_key_masked})` : '必填'}
                             </span>
                           </div>
@@ -7017,10 +7076,10 @@ export default function App() {
                         </div>
 
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                          <div>
-                            <div className="flex items-center justify-between mb-1.5">
-                              <label className="font-bold text-main">{secLabel}</label>
-                              <span className="text-[11px] font-mono text-dim">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 mb-1.5">
+                              <label className="font-bold text-main leading-snug">{secLabel}</label>
+                              <span className="text-[11px] font-mono text-dim shrink-0">
                                 {ex.has_api_secret ? '已保存' : '未填'}
                               </span>
                             </div>
@@ -7036,10 +7095,10 @@ export default function App() {
                               className="input-field font-mono py-2.5"
                             />
                           </div>
-                          <div>
-                            <div className="flex items-center justify-between mb-1.5">
-                              <label className="font-bold text-main">{passLabel}</label>
-                              <span className="text-[11px] font-mono text-dim">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 mb-1.5">
+                              <label className="font-bold text-main leading-snug">{passLabel}</label>
+                              <span className="text-[11px] font-mono text-dim shrink-0">
                                 {ex.has_passphrase ? '已保存' : needsPass ? '必填 (OKX/Bitget)' : '选填'}
                               </span>
                             </div>
@@ -7180,8 +7239,8 @@ export default function App() {
                   </div>
                   <div>
                     <label className="font-bold text-main block mb-2">服务器后台常驻托管状态</label>
-                    <div className="input-field px-3.5 py-2.5 text-emerald-600 dark:text-emerald-400 font-semibold flex items-center gap-2">
-                      <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping" />
+                    <div className="input-field px-3.5 py-2.5 text-emerald-600 dark:text-emerald-400 font-semibold flex items-center gap-2 leading-snug">
+                      <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping shrink-0" />
                       <span>已开启 24h 脱机守护（关闭网页继续运行）</span>
                     </div>
                   </div>
@@ -7228,28 +7287,28 @@ export default function App() {
               </div>
 
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-4">
-                <div className="p-3 sm:p-4 rounded-2xl border border-emerald-500/25 bg-emerald-500/[0.06] min-w-0">
+                <div className="p-2.5 sm:p-4 rounded-2xl border border-emerald-500/25 bg-emerald-500/[0.06] min-w-0">
                   <div className="flex flex-wrap items-center justify-between gap-1 text-[11px] sm:text-xs text-sub leading-snug">
                     <span>实时盈利总和</span>
-                    <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 shrink-0">
+                    <span className="px-1.5 sm:px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 shrink-0">
                       {positionPnlSummary.profit_count} 仓盈利
                     </span>
                   </div>
-                  <div className="text-base sm:text-2xl font-bold font-mono text-emerald-500 mt-1.5 break-all leading-tight">
+                  <div className="text-[15px] sm:text-2xl font-bold font-mono tabular-nums text-emerald-500 mt-1.5 break-words leading-tight">
                     {formatUsdtSigned(positionPnlSummary.total_profit_usdt)}
                   </div>
                   <div className="text-[11px] text-dim mt-1 leading-snug break-words">所有浮盈为正的在途持仓合计</div>
                 </div>
 
-                <div className="p-3 sm:p-4 rounded-2xl border border-rose-500/25 bg-rose-500/[0.06] min-w-0">
+                <div className="p-2.5 sm:p-4 rounded-2xl border border-rose-500/25 bg-rose-500/[0.06] min-w-0">
                   <div className="flex flex-wrap items-center justify-between gap-1 text-[11px] sm:text-xs text-sub leading-snug">
                     <span>实时亏损总和</span>
-                    <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-rose-500/15 text-rose-500 shrink-0">
+                    <span className="px-1.5 sm:px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-rose-500/15 text-rose-500 shrink-0">
                       {positionPnlSummary.loss_count} 仓亏损
                     </span>
                   </div>
                   <div
-                    className={`text-base sm:text-2xl font-bold font-mono mt-1.5 break-all leading-tight ${
+                    className={`text-[15px] sm:text-2xl font-bold font-mono tabular-nums mt-1.5 break-words leading-tight ${
                       positionPnlSummary.total_loss_usdt < 0 ? 'text-rose-500' : 'text-dim'
                     }`}
                   >
@@ -7258,11 +7317,11 @@ export default function App() {
                   <div className="text-[11px] text-dim mt-1 leading-snug break-words">所有浮盈为负的在途持仓合计</div>
                 </div>
 
-                <div className="p-3 sm:p-4 rounded-2xl border border-line surface-subtle min-w-0">
+                <div className="p-2.5 sm:p-4 rounded-2xl border border-line surface-subtle min-w-0">
                   <div className="flex flex-wrap items-center justify-between gap-1 text-[11px] sm:text-xs text-sub leading-snug">
                     <span>实时净浮盈亏总和</span>
                     <span
-                      className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold shrink-0 ${
+                      className={`px-1.5 sm:px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold shrink-0 ${
                         positionPnlSummary.net_unrealized_usdt >= 0
                           ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
                           : 'bg-rose-500/15 text-rose-500'
@@ -7273,7 +7332,7 @@ export default function App() {
                     </span>
                   </div>
                   <div
-                    className={`text-base sm:text-2xl font-bold font-mono mt-1.5 break-all leading-tight ${
+                    className={`text-[15px] sm:text-2xl font-bold font-mono tabular-nums mt-1.5 break-words leading-tight ${
                       positionPnlSummary.net_unrealized_usdt >= 0 ? 'text-emerald-500' : 'text-rose-500'
                     }`}
                   >
@@ -7282,14 +7341,14 @@ export default function App() {
                   <div className="text-[11px] text-dim mt-1 leading-snug break-words">盈利总和 + 亏损总和实时净值</div>
                 </div>
 
-                <div className="p-3 sm:p-4 rounded-2xl border border-line surface-subtle min-w-0">
+                <div className="p-2.5 sm:p-4 rounded-2xl border border-line surface-subtle min-w-0">
                   <div className="flex flex-wrap items-center justify-between gap-1 text-[11px] sm:text-xs text-sub leading-snug">
                     <span>在途持仓总规模</span>
-                    <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-slate-500/10 text-sub shrink-0">
+                    <span className="px-1.5 sm:px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-slate-500/10 text-sub shrink-0">
                       共 {positionPnlSummary.total_positions} 仓
                     </span>
                   </div>
-                  <div className="text-base sm:text-2xl font-bold font-mono text-main mt-1.5 break-all leading-tight">
+                  <div className="text-[15px] sm:text-2xl font-bold font-mono tabular-nums text-main mt-1.5 break-words leading-tight">
                     ${Number(positionPnlSummary.total_notional_usdt || 0).toFixed(2)}
                   </div>
                   <div className="text-[11px] text-dim mt-1 leading-snug break-words">
@@ -7374,7 +7433,7 @@ export default function App() {
                             onClick={() =>
                               setAnalyticsSymbolFilter(isFiltered ? 'ALL' : item.symbol)
                             }
-                            className={`surface-subtle p-4 sm:p-5 cursor-pointer transition flex flex-col justify-between min-w-[82vw] max-w-[330px] snap-center shrink-0 sm:min-w-0 sm:max-w-none sm:snap-align-none ${
+                            className={`surface-subtle p-4 sm:p-5 cursor-pointer transition flex flex-col justify-between w-[85vw] max-w-[335px] snap-center shrink-0 sm:w-auto sm:max-w-none sm:snap-align-none ${
                               isFiltered
                                 ? 'ring-2 ring-slate-900 dark:ring-sky-400'
                                 : 'hover:opacity-95'
@@ -7427,7 +7486,7 @@ export default function App() {
                             <div className="min-w-0">
                               <div className="text-[11px] text-dim">累计已实现净收益 (USDT)</div>
                               <div
-                                className={`text-xl sm:text-2xl font-bold font-mono mt-0.5 break-all leading-tight ${
+                                className={`text-xl sm:text-2xl font-bold font-mono tabular-nums mt-0.5 break-words leading-tight ${
                                   netPositive ? 'text-emerald-500' : 'text-rose-500'
                                 }`}
                               >
@@ -7583,7 +7642,7 @@ export default function App() {
               <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3.5 sm:gap-4 text-xs">
                 <div className="surface-subtle p-4 sm:p-5">
                   <div className="text-dim">1. 抢单成交率衰减 (同机房竞争)</div>
-                  <div className="mt-2 flex items-baseline justify-between font-mono">
+                  <div className="mt-2 flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5 font-mono">
                     <span className="text-sub">模拟: {realityGap.shadow_fill_rate_pct}%</span>
                     <span className="text-main font-bold text-base">
                       实盘预计 ~{realityGap.projected_live_fill_rate_pct}%
@@ -7596,7 +7655,7 @@ export default function App() {
 
                 <div className="surface-subtle p-4 sm:p-5">
                   <div className="text-dim">2. 逆向选择与胜率衰减</div>
-                  <div className="mt-2 flex items-baseline justify-between font-mono">
+                  <div className="mt-2 flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5 font-mono">
                     <span className="text-sub">模拟: {realityGap.shadow_win_rate_pct}%</span>
                     <span className="text-main font-bold text-base">
                       实盘预计 ~{realityGap.projected_live_win_rate_pct}%
@@ -7609,7 +7668,7 @@ export default function App() {
 
                 <div className="surface-subtle p-4 sm:p-5">
                   <div className="text-dim">3. 盈亏平衡胜率红线 (含手续费)</div>
-                  <div className="mt-2 flex items-baseline justify-between font-mono">
+                  <div className="mt-2 flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5 font-mono">
                     <span className="text-sub">Post-Only止盈</span>
                     <span className="text-emerald-500 font-bold text-base">
                       需 ≥ {realityGap.breakeven_win_rate_pct}%
