@@ -300,18 +300,18 @@ export default function EquityChart({ equityCurve = [], stats = {}, activePositi
               : (activePositions || []).filter((p) => String(p?.side || '').toUpperCase() === 'SHORT').length;
           return (
             <div className="mt-3 pt-3 border-t border-line grid grid-cols-2 gap-2.5 text-xs font-mono">
-              <div className="p-2.5 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.05]">
-                <div className="text-dim text-[11px] font-sans">当前做多标的</div>
-                <div className="text-emerald-600 dark:text-emerald-400 font-bold text-sm mt-0.5 flex items-baseline gap-1.5">
+              <div className="p-2.5 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.05] min-w-0">
+                <div className="text-dim text-[11px] font-sans leading-snug">当前做多标的</div>
+                <div className="text-emerald-600 dark:text-emerald-400 font-bold text-sm mt-0.5 flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
                   <span>{activeLongSymbols} 个</span>
                   {activeLongSlots > activeLongSymbols && (
                     <span className="text-[10px] font-normal text-dim">({activeLongSlots} 槽位)</span>
                   )}
                 </div>
               </div>
-              <div className="p-2.5 rounded-lg border border-rose-500/20 bg-rose-500/[0.05]">
-                <div className="text-dim text-[11px] font-sans">当前做空标的</div>
-                <div className="text-rose-600 dark:text-rose-400 font-bold text-sm mt-0.5 flex items-baseline gap-1.5">
+              <div className="p-2.5 rounded-lg border border-rose-500/20 bg-rose-500/[0.05] min-w-0">
+                <div className="text-dim text-[11px] font-sans leading-snug">当前做空标的</div>
+                <div className="text-rose-600 dark:text-rose-400 font-bold text-sm mt-0.5 flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
                   <span>{activeShortSymbols} 个</span>
                   {activeShortSlots > activeShortSymbols && (
                     <span className="text-[10px] font-normal text-dim">({activeShortSlots} 槽位)</span>

@@ -289,7 +289,7 @@ export default function MarketSentimentChart({
               </span>
             )}
           </div>
-          <div className="text-[10px] text-dim font-mono mt-0.5 truncate">
+          <div className="text-[10px] text-dim font-mono mt-0.5 leading-snug break-words">
             {activeRaw?.btc_px ? `BTC $${Number(activeRaw.btc_px).toLocaleString()}` : 'BTC --'}
             {activeRaw?.taker_buy_pct !== null && activeRaw?.taker_buy_pct !== undefined
               ? ` · 买盘 ${activeRaw.taker_buy_pct}%`
@@ -323,7 +323,7 @@ export default function MarketSentimentChart({
               </span>
             )}
           </div>
-          <div className="text-[10px] text-dim font-mono mt-0.5 truncate">
+          <div className="text-[10px] text-dim font-mono mt-0.5 leading-snug break-words">
             {activeRaw?.es_px ? `ES ${Number(activeRaw.es_px).toLocaleString()}` : 'ES --'}
             {activeRaw?.vix ? ` · VIX ${Number(activeRaw.vix).toFixed(2)}` : ''}
           </div>
@@ -351,7 +351,7 @@ export default function MarketSentimentChart({
               </span>
             )}
           </div>
-          <div className="text-[10px] text-dim font-mono mt-0.5 truncate">
+          <div className="text-[10px] text-dim font-mono mt-0.5 leading-snug break-words">
             加密F&amp;G {summary.crypto_fng_anchor ?? '--'} · CNN恐贪 {summary.trad_fng_anchor ?? '--'}
           </div>
         </div>

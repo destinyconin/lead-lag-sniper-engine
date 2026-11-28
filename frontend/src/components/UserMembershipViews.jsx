@@ -935,7 +935,7 @@ export function MembershipCenterView({
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 mt-4 sm:mt-5">
           <div className="surface-subtle p-4 sm:p-5">
             <div className="text-xs text-dim font-medium">当前登录账号 / 邮箱</div>
-            <div className="text-sm sm:text-base font-bold text-main mt-1.5 truncate font-mono">
+            <div className="text-sm sm:text-base font-bold text-main mt-1.5 break-all leading-snug font-mono">
               {currentUser ? currentUser.email || currentUser.username : '未登录 (访客模式)'}
             </div>
           </div>
@@ -2042,8 +2042,8 @@ export function MembershipCenterView({
           ) : (
             orders.map((o) => (
               <div key={`mob-ord-${o.id}`} className="surface-subtle p-3.5 space-y-2 text-xs">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-mono font-bold text-main truncate">{o.order_no}</span>
+                <div className="flex flex-wrap items-center justify-between gap-1.5">
+                  <span className="font-mono font-bold text-main break-all leading-snug">{o.order_no}</span>
                   <span
                     className={`px-2 py-0.5 rounded-full text-[10px] font-semibold shrink-0 ${o.status === 'PAID'
                       ? 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400'
@@ -2063,8 +2063,8 @@ export function MembershipCenterView({
                             : '已拒绝'}
                   </span>
                 </div>
-                <div className="flex items-center justify-between text-sub">
-                  <span>
+                <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-sub">
+                  <span className="leading-snug break-words">
                     {o.plan_name} (
                     {o.duration_days > 0
                       ? `+${o.duration_days}天`
@@ -2073,13 +2073,13 @@ export function MembershipCenterView({
                         : '按小时授权'}
                     )
                   </span>
-                  <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">
+                  <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400 shrink-0">
                     {o.pay_method === 'POINTS_REDEEM'
                       ? '积分兑换'
                       : `$${o.pay_amount_str || Number(o.amount_usdt).toFixed(3)}`}
                   </span>
                 </div>
-                <div className="text-[11px] font-mono text-dim truncate" title={o.tx_hash}>
+                <div className="text-[11px] font-mono text-dim break-all leading-snug" title={o.tx_hash}>
                   {o.pay_method === 'POINTS_REDEEM'
                     ? '积分兑换'
                     : o.chain_network === 'MULTI_EVM'
@@ -2087,7 +2087,7 @@ export function MembershipCenterView({
                       : o.chain_network || o.pay_method}{' '}
                   · {o.tx_hash}
                 </div>
-                <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-line">
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-line">
                   <span className="text-[11px] font-mono text-dim">
                     {formatLocalDateTime(o.created_at_ts || o.created_at)}
                   </span>
@@ -2834,48 +2834,64 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
       )}
 
       {/* 2. 4 Stat Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
-        <div className="surface-card p-3.5 sm:p-5 lg:p-6 flex items-center gap-2.5 sm:gap-4">
-          <div className="icon-box w-10 h-10 sm:w-12 sm:h-12">
-            <Users className="w-4 h-4 sm:w-5 sm:h-5" strokeWidth={1.75} />
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-4">
+        <div className="surface-card p-3 sm:p-5 lg:p-6 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 min-w-0">
+          <div className="flex items-center gap-2 sm:contents min-w-0">
+            <div className="icon-box w-8 h-8 sm:w-12 sm:h-12 shrink-0">
+              <Users className="w-4 h-4 sm:w-5 sm:h-5" strokeWidth={1.75} />
+            </div>
+            <div className="sm:hidden text-base font-bold font-mono text-main leading-tight break-all">{st.total_users}</div>
           </div>
-          <div className="min-w-0">
-            <div className="text-lg sm:text-2xl font-bold font-mono text-main">{st.total_users}</div>
-            <div className="text-[11px] sm:text-xs text-dim mt-0.5 truncate">已注册用户总数</div>
-          </div>
-        </div>
-
-        <div className="surface-card p-3.5 sm:p-5 lg:p-6 flex items-center gap-2.5 sm:gap-4">
-          <div className="icon-box w-10 h-10 sm:w-12 sm:h-12">
-            <UserCheck className="w-4 h-4 sm:w-5 sm:h-5" strokeWidth={1.75} />
-          </div>
-          <div className="min-w-0">
-            <div className="text-lg sm:text-2xl font-bold font-mono text-main">{st.active_vip_users}</div>
-            <div className="text-[11px] sm:text-xs text-dim mt-0.5 truncate">有效 VIP 会员人数</div>
+          <div className="min-w-0 flex-1">
+            <div className="hidden sm:block text-2xl font-bold font-mono text-main">{st.total_users}</div>
+            <div className="text-[11px] sm:text-xs text-dim sm:mt-0.5 leading-snug break-words">已注册用户总数</div>
           </div>
         </div>
 
-        <div className="surface-card p-3.5 sm:p-5 lg:p-6 flex items-center gap-2.5 sm:gap-4">
-          <div className="icon-box w-10 h-10 sm:w-12 sm:h-12">
-            <Wallet className="w-4 h-4 sm:w-5 sm:h-5" strokeWidth={1.75} />
+        <div className="surface-card p-3 sm:p-5 lg:p-6 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 min-w-0">
+          <div className="flex items-center gap-2 sm:contents min-w-0">
+            <div className="icon-box w-8 h-8 sm:w-12 sm:h-12 shrink-0">
+              <UserCheck className="w-4 h-4 sm:w-5 sm:h-5" strokeWidth={1.75} />
+            </div>
+            <div className="sm:hidden text-base font-bold font-mono text-main leading-tight break-all">{st.active_vip_users}</div>
           </div>
-          <div className="min-w-0">
-            <div className="text-lg sm:text-2xl font-bold font-mono text-main truncate">
+          <div className="min-w-0 flex-1">
+            <div className="hidden sm:block text-2xl font-bold font-mono text-main">{st.active_vip_users}</div>
+            <div className="text-[11px] sm:text-xs text-dim sm:mt-0.5 leading-snug break-words">有效 VIP 会员人数</div>
+          </div>
+        </div>
+
+        <div className="surface-card p-3 sm:p-5 lg:p-6 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 min-w-0">
+          <div className="flex items-center gap-2 sm:contents min-w-0">
+            <div className="icon-box w-8 h-8 sm:w-12 sm:h-12 shrink-0">
+              <Wallet className="w-4 h-4 sm:w-5 sm:h-5" strokeWidth={1.75} />
+            </div>
+            <div className="sm:hidden text-base font-bold font-mono text-main leading-tight break-all">
               ${Number(st.total_revenue_usdt || 0).toFixed(2)}
             </div>
-            <div className="text-[11px] sm:text-xs text-dim mt-0.5 truncate">累计链上实收会员营收</div>
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="hidden sm:block text-2xl font-bold font-mono text-main break-all">
+              ${Number(st.total_revenue_usdt || 0).toFixed(2)}
+            </div>
+            <div className="text-[11px] sm:text-xs text-dim sm:mt-0.5 leading-snug break-words">累计链上实收会员营收</div>
           </div>
         </div>
 
-        <div className="surface-card p-3.5 sm:p-5 lg:p-6 flex items-center gap-2.5 sm:gap-4">
-          <div className="icon-box w-10 h-10 sm:w-12 sm:h-12">
-            <BarChart2 className="w-4 h-4 sm:w-5 sm:h-5" strokeWidth={1.75} />
-          </div>
-          <div className="min-w-0">
-            <div className="text-lg sm:text-2xl font-bold font-mono text-main">
+        <div className="surface-card p-3 sm:p-5 lg:p-6 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 min-w-0">
+          <div className="flex items-center gap-2 sm:contents min-w-0">
+            <div className="icon-box w-8 h-8 sm:w-12 sm:h-12 shrink-0">
+              <BarChart2 className="w-4 h-4 sm:w-5 sm:h-5" strokeWidth={1.75} />
+            </div>
+            <div className="sm:hidden text-base font-bold font-mono text-main leading-tight break-all">
               {st.unused_codes_count} / {st.total_codes_count}
             </div>
-            <div className="text-[11px] sm:text-xs text-dim mt-0.5 truncate">可用未兑换激活码</div>
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="hidden sm:block text-2xl font-bold font-mono text-main">
+              {st.unused_codes_count} / {st.total_codes_count}
+            </div>
+            <div className="text-[11px] sm:text-xs text-dim sm:mt-0.5 leading-snug break-words">可用未兑换激活码</div>
           </div>
         </div>
       </div>
@@ -4074,49 +4090,69 @@ export function AdminSystemView({ currentUser, authToken, onCurrentUserRefresh, 
       {subTab === 'referral' && (
         <div className="space-y-4 sm:space-y-5">
           {/* 4 Referral / Points KPIs */}
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
-            <div className="surface-card p-4 sm:p-5 flex items-center gap-3">
-              <div className="icon-box w-10 h-10">
-                <Coins className="w-4 h-4" strokeWidth={1.75} />
-              </div>
-              <div className="min-w-0">
-                <div className="text-lg sm:text-xl font-bold font-mono text-main">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-4">
+            <div className="surface-card p-3 sm:p-5 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 min-w-0">
+              <div className="flex items-center gap-2 sm:contents min-w-0">
+                <div className="icon-box w-8 h-8 sm:w-10 sm:h-10 shrink-0">
+                  <Coins className="w-4 h-4" strokeWidth={1.75} />
+                </div>
+                <div className="sm:hidden text-base font-bold font-mono text-main leading-tight break-all">
                   {Number(st.total_points_balance || 0)}
                 </div>
-                <div className="text-[11px] text-dim truncate">全站用户当前积分余额</div>
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="hidden sm:block text-xl font-bold font-mono text-main">
+                  {Number(st.total_points_balance || 0)}
+                </div>
+                <div className="text-[11px] text-dim leading-snug break-words">全站用户当前积分余额</div>
               </div>
             </div>
-            <div className="surface-card p-4 sm:p-5 flex items-center gap-3">
-              <div className="icon-box w-10 h-10">
-                <Gift className="w-4 h-4" strokeWidth={1.75} />
-              </div>
-              <div className="min-w-0">
-                <div className="text-lg sm:text-xl font-bold font-mono text-main">
+            <div className="surface-card p-3 sm:p-5 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 min-w-0">
+              <div className="flex items-center gap-2 sm:contents min-w-0">
+                <div className="icon-box w-8 h-8 sm:w-10 sm:h-10 shrink-0">
+                  <Gift className="w-4 h-4" strokeWidth={1.75} />
+                </div>
+                <div className="sm:hidden text-base font-bold font-mono text-main leading-tight break-all">
                   {Number(st.total_invites_count || 0)}
                 </div>
-                <div className="text-[11px] text-dim truncate">累计成功邀请人数</div>
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="hidden sm:block text-xl font-bold font-mono text-main">
+                  {Number(st.total_invites_count || 0)}
+                </div>
+                <div className="text-[11px] text-dim leading-snug break-words">累计成功邀请人数</div>
               </div>
             </div>
-            <div className="surface-card p-4 sm:p-5 flex items-center gap-3">
-              <div className="icon-box w-10 h-10">
-                <Award className="w-4 h-4" strokeWidth={1.75} />
-              </div>
-              <div className="min-w-0">
-                <div className="text-lg sm:text-xl font-bold font-mono text-main">
+            <div className="surface-card p-3 sm:p-5 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 min-w-0">
+              <div className="flex items-center gap-2 sm:contents min-w-0">
+                <div className="icon-box w-8 h-8 sm:w-10 sm:h-10 shrink-0">
+                  <Award className="w-4 h-4" strokeWidth={1.75} />
+                </div>
+                <div className="sm:hidden text-base font-bold font-mono text-main leading-tight break-all">
                   {Number(st.total_redeem_count || 0)}
                 </div>
-                <div className="text-[11px] text-dim truncate">积分兑换会员次数</div>
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="hidden sm:block text-xl font-bold font-mono text-main">
+                  {Number(st.total_redeem_count || 0)}
+                </div>
+                <div className="text-[11px] text-dim leading-snug break-words">积分兑换会员次数</div>
               </div>
             </div>
-            <div className="surface-card p-4 sm:p-5 flex items-center gap-3">
-              <div className="icon-box w-10 h-10">
-                <BarChart2 className="w-4 h-4" strokeWidth={1.75} />
-              </div>
-              <div className="min-w-0">
-                <div className="text-lg sm:text-xl font-bold font-mono text-main">
+            <div className="surface-card p-3 sm:p-5 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 min-w-0">
+              <div className="flex items-center gap-2 sm:contents min-w-0">
+                <div className="icon-box w-8 h-8 sm:w-10 sm:h-10 shrink-0">
+                  <BarChart2 className="w-4 h-4" strokeWidth={1.75} />
+                </div>
+                <div className="sm:hidden text-base font-bold font-mono text-main leading-tight break-all">
                   {Number(st.total_redeem_points || 0)}
                 </div>
-                <div className="text-[11px] text-dim truncate">累计兑换消耗积分</div>
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="hidden sm:block text-xl font-bold font-mono text-main">
+                  {Number(st.total_redeem_points || 0)}
+                </div>
+                <div className="text-[11px] text-dim leading-snug break-words">累计兑换消耗积分</div>
               </div>
             </div>
           </div>
